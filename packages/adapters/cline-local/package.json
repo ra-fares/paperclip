@@ -1,0 +1,28 @@
+{
+  "name": "@sensor/paperclip-adapter-cline-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "npm run typecheck && tsc -p tsconfig.json --noCheck --noResolve --rootDir src",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@paperclipai/adapter-utils": "0.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  }
+}
