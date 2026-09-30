@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { profileEnv } from "./profile-launcher.js";
 
 export function commandToken(command: string): string {
   const match = command.trim().match(/^(?:"([^"]+)"|'([^']+)'|([^\s]+))/);
@@ -66,6 +68,18 @@ export function configEnv(config: Record<string, unknown>): NodeJS.ProcessEnv {
 export async function buildClineAcpConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   const next = { ...config, agent: "cline" };
   for (const key of ["modelReasoningEffort", "reasoningEffort", "thinkingEffort", "effort"]) delete (next as Record<string, unknown>)[key];
+  if (typeof config.profileDir === "string" && config.profileDir.trim()) {
+    if (!path.isAbsolute(config.profileDir)) throw new Error("profileDir must be absolute");
+    if (config.agentCommand) throw new Error("Use profileDir without agentCommand; CLINE_BIN_PATH selects the native executable");
+    if (config.model) throw new Error("With profileDir, model is selected by the saved profile");
+    const cwd = typeof config.cwd === "string" && config.cwd.trim() ? config.cwd : process.cwd();
+    const binary = await resolveNativeCline(cwd, configEnv(config));
+    const env = await profileEnv(config.profileDir, configEnv(config));
+    const launcher = fileURLToPath(new URL("./profile-launcher.js", import.meta.url));
+    const args = [process.execPath, launcher, binary, config.profileDir];
+    if (args.some(value => /["\r\n]/.test(value))) throw new Error("Invalid launcher path");
+    return { ...next, model: env.CLINE_MODEL, agentCommand: args.map(value => `"${value}"`).join(" ") };
+  }
   if (typeof config.agentCommand === "string" && config.agentCommand.trim()) return next;
   const cwd = typeof config.cwd === "string" && config.cwd.trim() ? config.cwd : process.cwd();
   const binary = await resolveNativeCline(cwd, configEnv(config));
