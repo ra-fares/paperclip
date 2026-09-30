@@ -5,6 +5,60 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildClineAcpConfig, commandToken, resolveCommand, resolveNativeCline } from '../dist/config.js';
 import { createServerAdapter, execute, testEnvironment, getConfigSchema } from '../dist/index.js';
+import { profileEnv } from '../dist/profile-launcher.js';
+
+test('saved profile credentials stay child-only; conflicts and OAuth profiles fail closed', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cline-profile-'));
+  const fixture = { lastUsedProvider: 'openai-compatible', providers: { 'openai-compatible': { settings: {
+    provider: 'openai-compatible', apiKey: 'fixture-not-a-real-secret', model: 'fixture/nemotron', baseUrl: 'https://example.invalid/v1',
+  } } } };
+  try {
+    await fs.mkdir(path.join(dir, 'data', 'settings'), { recursive: true });
+    const file = path.join(dir, 'data', 'settings', 'providers.json');
+    await fs.writeFile(file, JSON.stringify(fixture));
+    await assert.rejects(profileEnv(dir, {}), /requires models.json/);
+    const catalogFile = path.join(dir, 'data', 'settings', 'models.json');
+    await fs.writeFile(catalogFile, JSON.stringify({ version: 1, providers: { 'openai-compatible': { models: {} } } }));
+    await assert.rejects(profileEnv(dir, {}), /refusing ACP fallback/);
+    await fs.writeFile(catalogFile, JSON.stringify({ version: 1, providers: { 'openai-compatible': { models: { 'fixture/nemotron': { name: 'Fixture' } } } } }));
+    const inherited = { PATH: 'fixture' };
+    const env = await profileEnv(dir, inherited);
+    assert.equal(env.CLINE_PROVIDER, 'openai-compatible');
+    assert.equal(env.CLINE_MODEL, 'fixture/nemotron');
+    assert.equal(env.CLINE_API_KEY, 'fixture-not-a-real-secret');
+    assert.equal(env.CLINE_SESSION_BACKEND_MODE, 'local');
+    await assert.rejects(profileEnv(dir, { CLINE_SESSION_BACKEND_MODE: 'hub' }), /session backend/);
+    assert.equal('CLINE_API_KEY' in inherited, false);
+    await assert.rejects(profileEnv(dir, { CLINE_PROVIDER: 'cline' }), /Conflicting CLINE_PROVIDER/);
+    await assert.rejects(profileEnv(dir, { CLINE_MODEL: 'paid-model' }), /Conflicting CLINE_MODEL/);
+    await assert.rejects(profileEnv(dir, { CLINE_API_KEY: 'different' }), /Conflicting CLINE_API_KEY/);
+    await assert.rejects(profileEnv(dir, { CLINE_DATA_DIR: dir }), /path override/);
+    fixture.lastUsedProvider = 'cline';
+    await fs.writeFile(file, JSON.stringify(fixture));
+    await assert.rejects(profileEnv(dir, {}), /saved openai-compatible/);
+    await fs.writeFile(file, '{invalid');
+    await assert.rejects(profileEnv(dir, {}), /Cannot read/);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+test('profile launcher argv contains only paths and rejects competing configuration', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cline-config-'));
+  await fs.mkdir(path.join(dir, 'data', 'settings'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'data', 'settings', 'providers.json'), JSON.stringify({ lastUsedProvider: 'openai-compatible', providers: { 'openai-compatible': { settings: { provider: 'openai-compatible', apiKey: 'fixture-secret', model: 'fixture/nemotron', baseUrl: 'https://example.invalid/v1' } } } }));
+  await fs.writeFile(path.join(dir, 'data', 'settings', 'models.json'), JSON.stringify({ version: 1, providers: { 'openai-compatible': { models: { 'fixture/nemotron': { name: 'Fixture' } } } } }));
+  const input = { profileDir: dir, env: { CLINE_BIN_PATH: process.execPath } };
+  try {
+  const output = await buildClineAcpConfig(input);
+  assert.match(output.agentCommand, /profile-launcher\.js/);
+  assert.equal(JSON.stringify(output).includes('CLINE_API_KEY'), false);
+  assert.equal(JSON.stringify(output).includes('fixture-secret'), false);
+  assert.equal(output.model, 'fixture/nemotron');
+  assert.equal(input.agentCommand, undefined);
+  await assert.rejects(buildClineAcpConfig({ ...input, model: 'other' }), /saved profile/);
+  await assert.rejects(buildClineAcpConfig({ ...input, agentCommand: 'other' }), /without agentCommand/);
+  await assert.rejects(buildClineAcpConfig({ profileDir: 'relative' }), /absolute/);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
 
 test('explicit command wins; model survives; all effort aliases removed without input mutation', async () => {
   const input = { agentCommand: '"C:\\custom path\\cline.exe" --acp', model: 'provider/model', agent: 'codex', modelReasoningEffort: 'high', reasoningEffort: 'low', thinkingEffort: 'medium', effort: 'high', env: { CLINE_BIN_PATH: 'missing.exe' } };

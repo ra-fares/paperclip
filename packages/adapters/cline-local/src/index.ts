@@ -27,6 +27,7 @@ export function getConfigSchema(): AdapterConfigSchema {
   return { fields: [
     { key: "cwd", label: "Working directory", type: "text", hint: "Existing absolute directory on the Paperclip host." },
     { key: "model", label: "Model", type: "text" },
+    { key: "profileDir", label: "Cline profile directory", type: "text", hint: "Use saved OpenAI-compatible provider and model; omit model and agentCommand." },
     { key: "agentCommand", label: "ACP server command", type: "text", hint: "Optional explicit command; otherwise resolves native cline.exe --acp." },
   ] };
 }
