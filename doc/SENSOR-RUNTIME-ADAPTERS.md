@@ -93,13 +93,38 @@ The smoke resolved Cline utilities to the clean copy's packages/adapter-utils
 and Antigravity utilities to its own clean-copy node_modules. Neither was
 resolved from D:\paperclip-sensor or an external adapter checkout.
 
-NOT_RUN: model/ACP E2E, credentials, agent launches, live sensor-pilot switch,
-server startup, full repository build/typecheck/test suite. Historical E2E
-results are context, not new acceptance evidence.
+Post-migration recheck on 2026-10-01: `sensor/runtime`, HEAD and local
+`origin/sensor/runtime` both `77413b2026bbe12c120c6e1313b900e6a5bf7913`;
+working tree clean before this documentation update. Frozen filtered pnpm
+install and standalone Antigravity npm ci PASS with unchanged lockfiles;
+Cline build/typecheck + 8/8 tests, Antigravity verify + 57/57 tests, actual
+plugin-loader smoke for both and loader unit tests 4/4 PASS again after install.
+Both registered localPath values and smoke dependency realpaths use runtime.
+No nested Git repositories or submodules were found; the root .git is the
+normal worktree pointer to D:/paperclip-sensor/.git/worktrees/runtime, not an
+adapter runtime dependency. Existing sensor-pilot /api/health reports ok,
+branch sensor/runtime and the same full commit. No server restart was needed.
 
-## Manual switch (not applied)
+Manual model/ACP E2E (performed by the user after migration; not rerun here),
+corroborated read-only through local issue descriptions, comments and activity:
+- Cline SEN-17: exact `PAPERCLIP_CLINE_RUNTIME_OK` through the new runtime
+  build, as confirmed by the user. Model/ACP response PASS; autonomous terminal
+  disposition was not demonstrated. The prompt only requested the reply and
+  omitted an instruction to finish the task, so Paperclip performed two
+  disposition-recovery attempts, then blocked it. The user subsequently marked
+  it Done. Old Cline smoke issues SEN-9, SEN-10 and SEN-11 are cancelled.
+- Antigravity SEN-18: exact `PAPERCLIP_ANTIGRAVITY_RUNTIME_OK` through runtime,
+  as confirmed by the user; the prompt also required Done. Response and terminal
+  disposition PASS: local activity records the agent itself marking it Done.
 
-After reviewing/saving these changes and completing the host's normal setup:
+No new model calls, model discovery, login or credential qualification were
+performed in this recheck. Full repository build/typecheck/test suite NOT_RUN;
+the earlier clean-archive qualification above was not repeated.
+
+## Manual switch (historical pre-migration procedure)
+
+The original qualification did not apply this switch. The post-migration
+state and manual E2E are recorded above; these steps are retained for reference:
 
 1. Stop the existing sensor-pilot server using its existing launch procedure.
 2. Back up `C:\Users\comp\.paperclip\adapter-plugins.json`. In its existing
@@ -114,8 +139,8 @@ After reviewing/saving these changes and completing the host's normal setup:
    is a separate authorized step. If startup fails, restore the saved registry
    and restart with the old checkout and existing launch procedure.
 
-No global registration/configuration, credentials, old adapter directories,
-ACLs or ownership were changed. No commit or push was performed. The local
-changes must be saved to Git through a separately authorized commit/push before
-a remote clone can contain this fix. This document does not claim the existing
-remote branch already contains the changes.
+The original adapter-only qualification did not change global registration,
+configuration, credentials, old adapter directories, ACLs or ownership.
+The reproducible adapter changes are now in the baseline commit verified above.
+This recheck changed only this document among tracked files; it did not modify
+instance configuration, user data, credentials or ACLs, and did not commit/push.
