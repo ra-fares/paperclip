@@ -1,6 +1,8 @@
 packages:
   - packages/*
   - packages/adapters/*
+  # External standalone plugin: install with its own npm lockfile.
+  - "!packages/adapters/antigravity-local"
   - packages/plugins/*
   # Keep sandbox-provider plugins installable as standalone packages without
   # forcing root pnpm-lock.yaml churn for their third-party deps.
