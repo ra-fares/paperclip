@@ -10,6 +10,20 @@ function assertLocal(target: AdapterExecutionContext["executionTarget"]): void {
   if (target && target.kind !== "local") throw new Error("cline_local v0.1 supports local execution only");
 }
 
+const CLINE_LIFECYCLE_INSTRUCTIONS = `Cline lifecycle completion rule:
+After a successful terminal PATCH that marks the Paperclip task done, do not invoke any more tools.
+Return one short final response and finish the ACP turn immediately.`;
+
+export function applyClineLifecycleInstructions(context: Record<string, unknown> = {}): Record<string, unknown> {
+  const existing = typeof context.paperclipSessionHandoffMarkdown === "string"
+    ? context.paperclipSessionHandoffMarkdown.trim()
+    : "";
+  return {
+    ...context,
+    paperclipSessionHandoffMarkdown: [existing, CLINE_LIFECYCLE_INSTRUCTIONS].filter(Boolean).join("\n\n"),
+  };
+}
+
 let executor: ServerAdapterModule["execute"] | undefined;
 export async function execute(ctx: AdapterExecutionContext) {
   assertLocal(ctx.executionTarget);
@@ -20,7 +34,7 @@ export async function execute(ctx: AdapterExecutionContext) {
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
     executor = createAcpxEngineExecutor({ adapterType: "cline_local", moduleDir, packageRootDir: path.resolve(moduleDir, "..") });
   }
-  return executor({ ...ctx, config });
+  return executor({ ...ctx, config, context: applyClineLifecycleInstructions(ctx.context as Record<string, unknown>) });
 }
 
 export function getConfigSchema(): AdapterConfigSchema {

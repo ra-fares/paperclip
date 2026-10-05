@@ -403,12 +403,15 @@ describe("ACPX engine turn characterization", () => {
     await fs.mkdir(cwd, { recursive: true });
 
     const cancelReasons: string[] = [];
+    let closes = 0;
+    const warmHandles = new Map();
     let releaseTurn: (() => void) | null = null;
     const turnCancelled = new Promise<void>((resolve) => {
       releaseTurn = resolve;
     });
 
     const execute = createAcpxEngineExecutor({
+      warmHandles,
       createRuntime: () =>
         turnRuntime({
           // The stream never yields on its own. Only the wall-clock timer's cancel
@@ -420,6 +423,9 @@ describe("ACPX engine turn characterization", () => {
           onCancel: (reason) => {
             cancelReasons.push(reason);
             releaseTurn?.();
+          },
+          onClose: () => {
+            closes += 1;
           },
         }) as never,
     });
@@ -443,6 +449,8 @@ describe("ACPX engine turn characterization", () => {
     expect(result.errorMessage).toBe(expectedMessage);
     // The cancel ran with the formatted timeout message.
     expect(cancelReasons).toContain(expectedMessage);
+    expect(closes).toBe(1);
+    expect(warmHandles.size).toBe(0);
   }, 15_000);
 
   it("cancels the turn before closing the runtime when the turn throws", async () => {
