@@ -126,6 +126,10 @@ import {
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { nativeSha256 } from "./canonical.js";
+import {
+  assertSensorAdmissionBeforeNativeSpawn,
+  SensorAdmissionDeniedError,
+} from "./sensor-admission.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { createAssignedMcpTools, getAssignedMcpGateway } from "./assigned-mcp-tools.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
@@ -6009,6 +6013,7 @@ export function nativeSessionFailureDisposition(
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
 ) {
   const permanentFailure =
+    sourceFailureCode === "sensor_admission_denied" ||
     sourceFailureCode === "native_provider_model_rejected" ||
     sourceFailureCode === "native_provider_approval_required" ||
     sourceFailureCode === "native_event_replay_conflict" ||
@@ -6061,6 +6066,7 @@ export function nativeSessionRecoveryProjection(input: {
 export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
+  | "sensor_admission_denied"
   | "native_provider_terminal_failed"
   | "native_provider_approval_required"
   | "native_provider_usage_limit"
@@ -6084,6 +6090,9 @@ export function nativeSessionFailureSourceCode(
   | "native_current_wake_comments_unread"
   | "native_current_wake_comments_changed_after_read"
   | "native_session_interrupted" {
+  if (error instanceof SensorAdmissionDeniedError) {
+    return "sensor_admission_denied";
+  }
   if (error instanceof NativeProviderTerminalFailure) {
     if (error.providerCode === "approval_required") return "native_provider_approval_required";
     // Failed terminals retain their security meaning across the provider facade.
@@ -8323,7 +8332,22 @@ async function executePaperclipNativeSessionWithinScope(
         const result = await trace.run(runnerSessionStartupScope, () =>
           executeNativeSession({
             onSessionAdmission: async () => {
-              // Invalidate prior stop evidence before a backend can spawn.
+              await assertSensorAdmissionBeforeNativeSpawn({
+                db: input.db,
+                binding: {
+                  companyId: input.execution.binding.companyId,
+                  issueId: input.execution.binding.issueId,
+                  agentId: input.execution.binding.agentId,
+                  runId: input.execution.binding.runId,
+                  executionWorkspaceId: input.execution.binding.executionWorkspaceId,
+                },
+                completionContract: {
+                  id: input.execution.completionContract.id,
+                  sha256: input.execution.completionContract.sha256,
+                },
+              });
+              // Invalidate prior stop evidence only after Sensor admission passes,
+              // still before a backend can spawn.
               await appendHeartbeatRunEvent(input.db, {
                 companyId: input.execution.binding.companyId,
                 runId: input.execution.binding.runId,
@@ -8819,8 +8843,10 @@ async function executePaperclipNativeSessionWithinScope(
               checkpointExists: recoveryEvidence.checkpointExists,
               recoveryOwner: recoveryProjection.recoveryOwner,
               nextAction:
-                sourceFailureCode === "native_provider_approval_required"
-                  ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
+                sourceFailureCode === "sensor_admission_denied"
+                  ? "Fix the Sensor admission contract, workspace baseline, or worker qualification, then explicitly retry. Automatic retries are stopped."
+                  : sourceFailureCode === "native_provider_approval_required"
+                    ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
                   : sourceFailureCode === "native_session_cleanup_quarantined"
                   ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
                   : sourceFailureCode === "native_provider_terminal_failed"

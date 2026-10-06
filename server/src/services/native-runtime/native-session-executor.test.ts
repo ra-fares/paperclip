@@ -4831,6 +4831,7 @@ function leaseDb(
       const query = {
         then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
         where: () => query,
+        innerJoin: () => query,
         orderBy: () => query,
         for: () => query,
         limit: () => Promise.resolve(rows),
