@@ -103,7 +103,7 @@ jobs:
           fi
 
       - name: Non-emitting server TypeScript check (includes integration test)
-        run: pnpm --filter @paperclipai/server exec tsc -p tsconfig.json --noEmit
+        run: pnpm --filter @paperclipai/server typecheck
 
       - name: Check tracked diff
         run: git diff --exit-code
