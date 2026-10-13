@@ -102,5 +102,8 @@ jobs:
             echo "P04 DB1-DB4: NOT_RUN — integration test not yet committed"
           fi
 
+      - name: Non-emitting server TypeScript check (includes integration test)
+        run: pnpm --filter @paperclipai/server exec tsc -p tsconfig.json --noEmit
+
       - name: Check tracked diff
         run: git diff --exit-code
