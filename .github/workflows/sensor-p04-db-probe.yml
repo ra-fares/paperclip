@@ -1,0 +1,106 @@
+# Isolated CI transport smoke for sensor-blog T-P04-DB-ACCEPTANCE-01.
+# NOT DB1-DB4 acceptance. Never runs models, workers, production DBs, or deploys.
+name: Sensor P04 isolated PostgreSQL probe
+
+on:
+  push:
+    branches:
+      - ci/T-P04-DB-ACCEPTANCE-01
+    paths:
+      - .github/workflows/sensor-p04-db-probe.yml
+      - server/src/services/native-runtime/sensor-admission.integration.test.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sensor-p04-db-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  db-probe:
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/ci/T-P04-DB-ACCEPTANCE-01'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      # Ephemeral credentials valid only in this disposable runner.
+      DATABASE_URL: postgres://p04_test:p04_ci_local_only@127.0.0.1:5432/paperclip_p04_db_acceptance_01_ci
+      PAPERCLIP_TEST_DATABASE_URL: postgres://p04_test:p04_ci_local_only@127.0.0.1:5432/paperclip_p04_db_acceptance_01_ci
+      CI: 'true'
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: p04_test
+          POSTGRES_PASSWORD: p04_ci_local_only
+          POSTGRES_DB: paperclip_p04_db_acceptance_01_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U p04_test -d paperclip_p04_db_acceptance_01_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout exact CI branch revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Record source identity (no secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CI run SHA: $(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "Source candidate pinned at ef0bf756ac038e75c63b93dc992238571d8ef46a; CI branch derived from it."
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Install project dependencies (no model execution)
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify isolated database identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec "${{ job.services.postgres.id }}" psql -U p04_test -d paperclip_p04_db_acceptance_01_ci -Atqc 'SELECT current_database()' | grep -Fx 'paperclip_p04_db_acceptance_01_ci'
+
+      - name: Apply real PostgreSQL migrations
+        run: pnpm --filter @paperclipai/db migrate
+
+      - name: Verify migrations are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec "${{ job.services.postgres.id }}" psql -U p04_test -d paperclip_p04_db_acceptance_01_ci -Atqc "SELECT count(*) > 0 FROM information_schema.tables WHERE table_schema = 'public'" | grep -Fx 't'
+          echo "DB_INFRA_PASS: temporary PostgreSQL is real and migrated (NOT P04 DB1-DB4)"
+
+      - name: Existing P04 native unit tests (mock DB; not DB acceptance)
+        run: pnpm --dir server exec vitest run src/services/native-runtime/sensor-admission.test.ts
+
+      - name: P04 DB integration tests (only when independently added)
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=server/src/services/native-runtime/sensor-admission.integration.test.ts
+          if test -f "$file"; then
+            pnpm --dir server exec vitest run src/services/native-runtime/sensor-admission.integration.test.ts
+          else
+            echo "P04 DB1-DB4: NOT_RUN — integration test not yet committed"
+          fi
+
+      - name: Check tracked diff
+        run: git diff --exit-code
