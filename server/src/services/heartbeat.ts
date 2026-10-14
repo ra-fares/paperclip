@@ -22529,6 +22529,7 @@ export function heartbeatService(
       }
       const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
         dispatch: (markDispatchStarted: () => void) => Promise<T>,
+        dispatchRuntimeKind: "native" | "legacy",
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
@@ -22564,7 +22565,7 @@ export function heartbeatService(
         // providers have independently verified, durable run/qualification/
         // workspace/completion bindings. Do not synthesize native bindings.
         // This is the common, server-owned last gate for direct adapters.
-        if (nativeRuntimeResolution.kind === "legacy" && issueId) {
+        if (dispatchRuntimeKind === "legacy" && issueId) {
           const [sensorDocument] = await db
             .select({ id: issueDocuments.id })
             .from(issueDocuments)
@@ -24637,6 +24638,7 @@ export function heartbeatService(
                       await persistRunProcessMetadata(run.id, meta);
                     },
                   }),
+                "native",
               );
             if (!guardedDispatch.dispatched) return;
             nativeDispatchStarted = true;
@@ -24803,6 +24805,7 @@ export function heartbeatService(
                     authToken: authToken ?? undefined,
                   });
                 },
+                "legacy",
               );
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
