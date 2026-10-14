@@ -78,6 +78,25 @@ jobs:
         run: |
           set -euo pipefail
           docker exec "${{ job.services.postgres.id }}" psql -U p04_direct_test -d paperclip_p04_direct_admission_01_ci -Atqc 'SELECT current_database()' | grep -Fx 'paperclip_p04_direct_admission_01_ci'
+      - name: Prepare real pre-0293 rows on schema 0292
+        shell: bash
+        env:
+          P04_BACKFILL_SEED: 'true'
+        run: |
+          set -euo pipefail
+          migration=packages/db/src/migrations/0293_sensor_issue_governance.sql
+          journal=packages/db/src/migrations/meta/_journal.json
+          cp "$migration" "$RUNNER_TEMP/p04-0293.sql"
+          cp "$journal" "$RUNNER_TEMP/p04-journal.json"
+          restore_migration() {
+            cp "$RUNNER_TEMP/p04-0293.sql" "$migration"
+            cp "$RUNNER_TEMP/p04-journal.json" "$journal"
+          }
+          trap restore_migration EXIT
+          rm "$migration"
+          node -e "const fs=require('node:fs'); const p='packages/db/src/migrations/meta/_journal.json'; const j=JSON.parse(fs.readFileSync(p,'utf8')); if(j.entries.at(-1)?.tag!=='0293_sensor_issue_governance')throw Error('P04 migration head differs'); j.entries.pop();fs.writeFileSync(p,JSON.stringify(j,null,2)+'\\n')"
+          pnpm --filter @paperclipai/db migrate
+          pnpm --dir packages/db exec vitest run src/sensor-issue-governance-migration.test.ts --reporter=verbose -t "P04 pre-0293 fixture seed"
       - name: Apply PostgreSQL migrations
         run: pnpm --filter @paperclipai/db migrate
       - name: Verify server TypeScript before RED tests
