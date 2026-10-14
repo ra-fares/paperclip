@@ -75,7 +75,6 @@ async function createFixture(adapterType: string, withMalformedAdmission: boolea
     name: "P04 disposable direct-admission RED fixture",
     issuePrefix: `DR${companyId.replace(/-/g, "").slice(0, 8)}`,
     requireBoardApprovalForNewAgents: false,
-    defaultResponsibleUserId: "direct-test-responsible-user",
   });
   await db.insert(agents).values({
     id: agentId,
@@ -198,7 +197,8 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       expect(linkedDocument?.key).toBe(SENSOR_ADMISSION_DOCUMENT_KEY);
       // This is a real RED assertion against the accepted source. The old
       // legacy dispatch calls execute despite the malformed document.
-      expect(execute).not.toHaveBeenCalled();
+      // Scope calls to the exact run: other issue wakeups can overlap tests.
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(0);
       expect(stored?.status).toBe("failed");
       expect(stored?.errorCode).toBe("sensor_admission_denied");
       expect(stored?.scheduledRetryAt).toBeNull();
@@ -224,7 +224,7 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
 
       const f = await createFixture(adapterType, false);
       const run = await runFixture(f.agentId, f.issueId);
-      expect(execute).toHaveBeenCalledTimes(1);
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(1);
       expect(run).toMatchObject({
         status: "succeeded",
         runtimeMode: "legacy",
