@@ -1837,7 +1837,9 @@ export interface IssueFilters {
   updatedSince?: string;
 }
 
-type IssueRow = typeof issues.$inferSelect & { externalConversationState?: "active" | "waiting" | null };
+// The public issue-list projection intentionally omits the server-only Sensor governance column.
+// Keep the shared enrichment input typed to the common issue fields without altering response JSON.
+type IssueRow = Omit<typeof issues.$inferSelect, "sensorGovernedAt"> & { externalConversationState?: "active" | "waiting" | null };
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
