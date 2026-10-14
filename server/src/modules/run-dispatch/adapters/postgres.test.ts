@@ -911,6 +911,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const adapter = createPostgresRunDispatchAdapter(db);
+    if (!adapter.claimLegacyDirectDispatch) throw new Error("P04 legacy claim adapter missing");
     const attempt = () => adapter.claimLegacyDirectDispatch({
       companyId, issueId, agentId, runId, ownerBootId: boot,
       attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
@@ -942,6 +943,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.insert(issueDocuments).values({ companyId, issueId, documentId, key: "sensor-admission" });
     await db.delete(issueDocuments).where(eq(issueDocuments.documentId, documentId));
     const adapter = createPostgresRunDispatchAdapter(db);
+    if (!adapter.claimLegacyDirectDispatch) throw new Error("P04 legacy claim adapter missing");
     const params = {
       companyId, issueId, agentId, runId, ownerBootId: boot,
       attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
