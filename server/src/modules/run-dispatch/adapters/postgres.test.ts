@@ -911,9 +911,9 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const adapter = createPostgresRunDispatchAdapter(db);
-    const claim = adapter.claimLegacyDirectDispatch;
-    if (!claim) throw new Error("P04 legacy claim adapter missing");
-    const attempt = () => claim({
+    const claimLegacyDispatch = adapter.claimLegacyDirectDispatch;
+    if (!claimLegacyDispatch) throw new Error("P04 legacy claim adapter missing");
+    const attempt = () => claimLegacyDispatch({
       companyId, issueId, agentId, runId, ownerBootId: boot,
       attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
     });
@@ -921,10 +921,10 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(outcomes.map(x => x.outcome).sort()).toEqual(["claimed_new", "duplicate"]);
     expect((await attempt()).outcome).toBe("duplicate");
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    const claim = (run.runnerProfileJson as Record<string, any>).sensorDirectDispatchClaim;
+    const claim = (run.runnerProfileJson as Record<string, unknown>).sensorDirectDispatchClaim;
     expect(claim).toMatchObject({ schema: "sensor-direct-dispatch-claim.v1", runId, issueId, ownerBootId: boot });
     expect((run.runnerProfileJson as Record<string, unknown>).ordinary).toBe("preserve");
-    expect(await adapter.claimLegacyDirectDispatch({
+    expect(await claimLegacyDispatch({
       companyId, issueId, agentId, runId, ownerBootId: randomUUID(),
       attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
     })).toMatchObject({ outcome: "stale" });
