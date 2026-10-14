@@ -513,6 +513,8 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "low_trust_boundary_mismatch",
   "low_trust_requires_sandbox_environment",
   "low_trust_runtime_services_denied",
+  // A Sensor admission refusal is a policy decision, not a provider failure.
+  "sensor_admission_denied",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -1919,6 +1921,9 @@ export function recoveryService(
           predecessor.status,
         )
       ) {
+        // Shared safety boundary: no recovery caller may queue or schedule a
+        // successor for a terminal Sensor admission refusal.
+        if (predecessor.errorCode === "sensor_admission_denied") return null;
         // Failure recovery shares the durable incident budget and delay. It
         // cannot fall through into the productive-work continuation queue.
         if (predecessor.runtimeMode === "native") return null;
@@ -4568,6 +4573,31 @@ export function recoveryService(
         issue.status === "in_review"
           ? participantLatestRunForRecovery
           : latestRun;
+      if (
+        executionRecoverySource?.errorCode === "sensor_admission_denied" &&
+        isUnsuccessfulTerminalIssueRun(executionRecoverySource)
+      ) {
+        // A late recovery sweep must never turn a fail-closed admission DENY
+        // into another provider attempt (todo, in_progress or review lane).
+        // Retain the issue and source run, and require manual intervention.
+        const blocked = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status as StrandedPreviousStatus,
+          latestRun: executionRecoverySource,
+          notice: {
+            title: "Sensor admission denied",
+            tone: "danger",
+            body: "Sensor admission denied this run. Automatic retry is forbidden until the issue and worker admission bindings are reviewed.",
+          },
+        });
+        if (blocked) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
       if (
         executionRecoverySource?.agentId === agentId &&
         (

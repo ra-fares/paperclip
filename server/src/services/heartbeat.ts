@@ -15289,6 +15289,16 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    // Fail closed at the bounded scheduler as well as at the issue sweeper:
+    // legacy/native retry callers must not replay a denied Sensor binding.
+    if (run.errorCode === "sensor_admission_denied") {
+      return {
+        outcome: "not_scheduled" as const,
+        reason: "Sensor admission denial requires operator review; automatic retry is forbidden",
+        errorCode: "sensor_admission_denied" as const,
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId),
+      };
+    }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
         run.contextSnapshot.chatCompletionDeliveryIds.some(id => typeof id === "string")) {
       return { outcome: "not_scheduled" as const, reason: "The completion outbox owns this reply's retry budget and publication identity.",

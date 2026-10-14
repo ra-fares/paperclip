@@ -315,6 +315,41 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
   );
 
   it.each(ADAPTERS)(
+    "RECOVERY: terminal Sensor denial on todo for %s blocks without requeue",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      execute.mockResolvedValue({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider,
+        model: "spy-only",
+        summary: "UNSAFE todo recovery execution after Sensor denial",
+      });
+      const f = await createFixture(adapterType, "malformed");
+      const run = await runFixture(f.agentId, f.issueId);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(run.status).toBe("failed");
+      expect(run.errorCode).toBe("sensor_admission_denied");
+      // Simulate a legitimate issue status return to todo after the run:
+      // the recovery sweep must still respect the persisted admission denial.
+      await db.update(issues)
+        .set({ status: "todo" })
+        .where(eq(issues.id, f.issueId));
+
+      await heartbeat.reconcileStrandedAssignedIssues();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const retries = await db.select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
+      expect(retries).toHaveLength(0);
+      const [current] = await db.select({ status: issues.status })
+        .from(issues).where(eq(issues.id, f.issueId));
+      expect(current?.status).toBe("blocked");
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(0);
+    },
+  );
+
+  it.each(ADAPTERS)(
     "REGRESSION: issue without sensor-admission executes legacy %s exactly once",
     async (adapterType, provider) => {
       execute.mockReset();
