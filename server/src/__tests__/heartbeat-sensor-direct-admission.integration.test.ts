@@ -1059,4 +1059,70 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
     25_000,
   );
 
+  it.each(ADAPTERS)(
+    "CLASSIFICATION: governed %s cancelled at final heartbeat gate remains stale, never sensor_admission_denied",
+    async (adapterType) => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "malformed");
+      const afterCheck = vi.fn(async ({ issueId }: { runId: string; issueId: string }) => {
+        expect(issueId).toBe(f.issueId);
+        await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      });
+      const orchestrator = heartbeatService(db, {
+        afterResolvedInteractionContinuationDispatchCheck: afterCheck,
+      });
+      const queued = await orchestrator.invoke(
+        f.agentId, "on_demand",
+        {
+          issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true,
+          interactionId: randomUUID(), interactionStatus: "accepted",
+          mutation: "interaction", wakeReason: "issue_commented",
+        }, "manual",
+      );
+      expect(queued).not.toBeNull();
+      const run = await waitForTerminalRun(queued!.id);
+      await drainHeartbeatRunsToQuiescence(db, orchestrator);
+      expect(afterCheck).toHaveBeenCalledTimes(1);
+      expect(execute).not.toHaveBeenCalled();
+      expect(run.errorCode).not.toBe("sensor_admission_denied");
+      const [issue] = await db.select({ status: issues.status }).from(issues)
+        .where(eq(issues.id, f.issueId));
+      expect(issue?.status).toBe("cancelled");
+    },
+    20_000,
+  );
+
+  it.each(ADAPTERS)(
+    "CLASSIFICATION: governed %s reassigned at final heartbeat gate remains stale, never sensor_admission_denied",
+    async (adapterType) => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "malformed");
+      const afterCheck = vi.fn(async ({ issueId }: { runId: string; issueId: string }) => {
+        expect(issueId).toBe(f.issueId);
+        await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, issueId));
+      });
+      const orchestrator = heartbeatService(db, {
+        afterResolvedInteractionContinuationDispatchCheck: afterCheck,
+      });
+      const queued = await orchestrator.invoke(
+        f.agentId, "on_demand",
+        {
+          issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true,
+          interactionId: randomUUID(), interactionStatus: "accepted",
+          mutation: "interaction", wakeReason: "issue_commented",
+        }, "manual",
+      );
+      expect(queued).not.toBeNull();
+      const run = await waitForTerminalRun(queued!.id);
+      await drainHeartbeatRunsToQuiescence(db, orchestrator);
+      expect(afterCheck).toHaveBeenCalledTimes(1);
+      expect(execute).not.toHaveBeenCalled();
+      expect(run.errorCode).not.toBe("sensor_admission_denied");
+      const [issue] = await db.select({ assignee: issues.assigneeAgentId }).from(issues)
+        .where(eq(issues.id, f.issueId));
+      expect(issue?.assignee).toBeNull();
+    },
+    20_000,
+  );
+
 });
