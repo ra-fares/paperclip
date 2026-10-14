@@ -701,4 +701,143 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
     expect(linked).toHaveLength(4);
   }, 20_000);
 
+  it.each(ADAPTERS)(
+    "RACE attach->enqueue: uncommitted Sensor link blocks %s enqueue until governance is committed",
+    async (adapterType, provider) => {
+      assertIsolatedTestDatabase(testUrl);
+      execute.mockReset();
+      execute.mockResolvedValue({
+        exitCode: 0, signal: null, timedOut: false, provider, model: "spy-only",
+        summary: "P04 unsafe enqueue execution",
+      });
+      const f = await createFixture(adapterType, "none");
+      const docId = randomUUID();
+      let prepared!: () => void;
+      const preparedPromise = new Promise<void>((resolve) => { prepared = resolve; });
+      let release!: () => void;
+      const permitCommit = new Promise<void>((resolve) => { release = resolve; });
+      const writerTx = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues)
+          .where(eq(issues.id, f.issueId)).for("update");
+        await tx.insert(documents).values({
+          id: docId, companyId: f.companyId, title: "sensor-admission", latestBody: "{}",
+        });
+        await tx.insert(issueDocuments).values({
+          companyId: f.companyId, issueId: f.issueId, documentId: docId,
+          key: SENSOR_ADMISSION_DOCUMENT_KEY,
+        });
+        prepared();
+        await permitCommit;
+      });
+      await preparedPromise;
+      const name = "p04-enqueue-wait-" + randomUUID().slice(0, 8);
+      const tagged = heartbeatService(createDb(testUrl, { applicationName: name }));
+      const invoked = tagged.invoke(
+        f.agentId, "on_demand", { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true }, "manual",
+      );
+      try {
+        await waitForPostgresLock(name);
+      } finally {
+        release();
+        await writerTx;
+      }
+      const queued = await invoked;
+      expect(queued).not.toBeNull();
+      const run = await waitForTerminalRun(queued!.id);
+      await drainHeartbeatRunsToQuiescence(db, tagged);
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === queued!.id)).toHaveLength(0);
+      expect(run).toMatchObject({
+        status: "failed", errorCode: "sensor_admission_denied", scheduledRetryAt: null,
+      });
+      const [current] = await db.select({ at: issues.sensorGovernedAt })
+        .from(issues).where(eq(issues.id, f.issueId));
+      expect(current?.at).not.toBeNull();
+    },
+    20_000,
+  );
+
+  it.each(ADAPTERS)(
+    "RACE enqueue->attach: %s queued run commits first, then document-service waits for issue lock before dispatch",
+    async (adapterType, provider) => {
+      assertIsolatedTestDatabase(testUrl);
+      execute.mockReset();
+      const f = await createFixture(adapterType, "none");
+      await db.update(agents)
+        .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+        .where(eq(agents.id, f.agentId));
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerIssueId, companyId: f.companyId, title: "P04 held safe spy",
+        assigneeAgentId: f.agentId, status: "in_progress",
+      });
+      let unblockAdapter!: () => void;
+      const adapterGate = new Promise<void>((resolve) => { unblockAdapter = resolve; });
+      const success = {
+        exitCode: 0, signal: null, timedOut: false, provider, model: "spy-only",
+        summary: "P04 safe blocker",
+      } as const;
+      execute.mockImplementationOnce(async () => { await adapterGate; return success; });
+      execute.mockResolvedValue(success);
+      let unlockIssue!: () => void;
+      let blockingTx: Promise<unknown> | null = null;
+      try {
+        const blocker = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: blockerIssueId, taskKey: blockerIssueId, skipIssueComment: true }, "manual",
+        );
+        expect(blocker).not.toBeNull();
+        for (let i = 0; i < 100 && execute.mock.calls.length === 0; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        expect(execute.mock.calls.length).toBe(1);
+        const pending = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true }, "manual",
+        );
+        expect(pending).not.toBeNull();
+        expect((await heartbeat.getRun(pending!.id))?.status).toBe("queued");
+
+        let locked!: () => void;
+        const lockHeld = new Promise<void>((resolve) => { locked = resolve; });
+        const releaseIssue = new Promise<void>((resolve) => { unlockIssue = resolve; });
+        blockingTx = db.transaction(async (tx) => {
+          await tx.select({ id: issues.id }).from(issues)
+            .where(eq(issues.id, f.issueId)).for("update");
+          locked();
+          await releaseIssue;
+        });
+        await lockHeld;
+        const name = "p04-doc-wait-" + randomUUID().slice(0, 8);
+        const service = documentService(createDb(testUrl, { applicationName: name }));
+        const attached = service.upsertIssueDocument({
+          issueId: f.issueId, key: SENSOR_ADMISSION_DOCUMENT_KEY,
+          format: "markdown", body: "{}",
+        });
+        try {
+          await waitForPostgresLock(name);
+        } finally {
+          unlockIssue();
+          await blockingTx;
+          blockingTx = null;
+        }
+        await attached;
+        unblockAdapter();
+        const run = await waitForTerminalRun(pending!.id);
+        await drainHeartbeatRunsToQuiescence(db, heartbeat);
+        expect(execute.mock.calls.filter(([ctx]) => ctx.runId === pending!.id)).toHaveLength(0);
+        expect(run).toMatchObject({
+          status: "failed", errorCode: "sensor_admission_denied", scheduledRetryAt: null,
+        });
+        const replacements = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+          .where(eq(heartbeatRuns.retryOfRunId, pending!.id));
+        expect(replacements).toHaveLength(0);
+      } finally {
+        unlockIssue?.();
+        if (blockingTx) await blockingTx;
+        unblockAdapter();
+      }
+    },
+    25_000,
+  );
+
 });
