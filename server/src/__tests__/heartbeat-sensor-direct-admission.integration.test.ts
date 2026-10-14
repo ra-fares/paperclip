@@ -30,6 +30,7 @@ import {
 } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { documentService } from "../services/documents.js";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import {
   SENSOR_ADMISSION_DOCUMENT_KEY,
   SENSOR_ADMISSION_CONTEXT_KEY,
@@ -838,6 +839,61 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       }
     },
     25_000,
+  );
+
+  it.each(ADAPTERS)(
+    "RECOVERY post-claim: %s crash before adapter entry suppresses bounded retry and issue sweeper",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      execute.mockResolvedValue({
+        exitCode: 0, signal: null, timedOut: false, provider, model: "spy-only",
+        summary: "Unsafe direct recovery after pre-provider crash",
+      });
+      const f = await createFixture(adapterType, "none");
+      const runId = randomUUID(), ownerBootId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.companyId, agentId: f.agentId,
+        status: "running", runtimeMode: "legacy",
+        controllerBootId: ownerBootId,
+        controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+        contextSnapshot: { issueId: f.issueId, taskKey: f.issueId },
+      });
+      await db.update(issues).set({ executionRunId: runId })
+        .where(eq(issues.id, f.issueId));
+      const dispatch = createPostgresRunDispatchAdapter(db);
+      if (!dispatch.claimLegacyDirectDispatch) throw new Error("P04 claim missing");
+      const outcome = await dispatch.claimLegacyDirectDispatch({
+        companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+        runId, ownerBootId, attemptId: randomUUID(),
+        checkContinuationStaleness: false, now: new Date(),
+      });
+      expect(outcome).toMatchObject({ outcome: "claimed_new" });
+      // A process dies after claim commit but BEFORE calling the spy.
+      // The persistent profile, not a retry counter, must suppress revival.
+      await db.update(heartbeatRuns).set({
+        status: "failed", errorCode: "adapter_failed",
+        finishedAt: new Date(), controllerLeaseExpiresAt: new Date(0),
+      }).where(eq(heartbeatRuns.id, runId));
+      const retry = await heartbeat.scheduleBoundedRetry(runId);
+      expect(retry).toMatchObject({
+        outcome: "not_scheduled",
+        errorCode: "legacy_direct_claim_pending_reconciliation",
+      });
+      await db.update(issues).set({
+        status: "todo", executionRunId: null,
+      }).where(eq(issues.id, f.issueId));
+      await heartbeat.reconcileStrandedAssignedIssues();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const attempts = await db.select({
+        id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId,
+      }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+      expect(attempts.filter((run) => run.retryOfRunId === runId)).toHaveLength(0);
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === runId)).toHaveLength(0);
+      const [persisted] = await db.select({ profile: heartbeatRuns.runnerProfileJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(persisted?.profile?.sensorDirectDispatchClaim).toMatchObject({ runId, issueId: f.issueId });
+    },
+    20_000,
   );
 
 });
