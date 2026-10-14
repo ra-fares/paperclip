@@ -904,13 +904,22 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       await db.update(issues).set({
         status: "todo", executionRunId: null,
       }).where(eq(issues.id, f.issueId));
-      await heartbeat.reconcileStrandedAssignedIssues();
+      const sweep = await heartbeat.reconcileStrandedAssignedIssues();
+      // Proof of an actual per-issue recovery decision, not a sweep that
+      // silently missed this candidate for unrelated reasons.
+      expect(sweep.issueIds).toContain(f.issueId);
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
-      const attempts = await db.select({
+      const issueRuns = await db.select({
         id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId,
-      }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
-      expect(attempts.filter((run) => run.retryOfRunId === runId)).toHaveLength(0);
-      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === runId)).toHaveLength(0);
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,
+      ));
+      expect(issueRuns.map((run) => run.id)).toEqual([runId]);
+      expect(issueRuns.some((run) => run.retryOfRunId === runId)).toBe(false);
+      // Include every invocation in this isolated test, including unlinked
+      // replacement runs or unexpected invocations for another runId.
+      expect(execute).not.toHaveBeenCalled();
       const [persisted] = await db.select({ profile: heartbeatRuns.runnerProfileJson })
         .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       expect(persisted?.profile?.sensorDirectDispatchClaim).toMatchObject({ runId, issueId: f.issueId });
