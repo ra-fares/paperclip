@@ -22585,7 +22585,11 @@ export function heartbeatService(
         // providers have independently verified, durable run/qualification/
         // workspace/completion bindings. Do not synthesize native bindings.
         // This is the common, server-owned last gate for direct adapters.
-        if (dispatchRuntimeKind === "legacy" && issueId) {
+        // cline_local / agy_local must not classify governance outside the
+        // issue->run transaction: a cancellation or lost owner takes STALE
+        // precedence over Sensor DENY. Retain legacy preflight for other paths.
+        if (dispatchRuntimeKind === "legacy" && issueId &&
+            agent.adapterType !== "cline_local" && agent.adapterType !== "agy_local") {
           const [currentIssueGovernance] = await db.select({ sensorGovernedAt: issues.sensorGovernedAt })
             .from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1);
           const [sensorDocument] = await db
