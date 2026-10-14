@@ -285,7 +285,7 @@ describe("P04 native Sensor admission — real isolated PostgreSQL", () => {
       status: "running",
       startedAt: new Date(),
       nativeSessionId: f.runId,
-      runnerInstanceId: "p04-db3-server-runner",
+      runnerInstanceId: f.runId,
     }).where(eq(heartbeatRuns.id, f.runId));
     await db.insert(nativeRunFinalizations).values({
       runId: f.runId,
@@ -374,7 +374,7 @@ describe("P04 native Sensor admission — real isolated PostgreSQL", () => {
     await expect(executePaperclipNativeSession({
       db,
       execution: serverExecutionInput(f),
-      runnerInstanceId: "p04-db3-server-runner",
+      runnerInstanceId: f.runId,
       useRunnerd: false,
       backend: serverBackend(openSession),
       onSpawn,
@@ -414,7 +414,7 @@ describe("P04 native Sensor admission — real isolated PostgreSQL", () => {
     await expect(executePaperclipNativeSession({
       db,
       execution: serverExecutionInput(f),
-      runnerInstanceId: "p04-db3-server-runner",
+      runnerInstanceId: f.runId,
       useRunnerd: false,
       backend: serverBackend(openSession),
       onSpawn,
