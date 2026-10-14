@@ -35,11 +35,11 @@ async function issueFixture() {
 }
 
 async function marker(issueId: string): Promise<string | null> {
-  const result = await db.execute(sql`
-    SELECT sensor_governed_at::text AS marked
-    FROM issues WHERE id = ${issueId}::uuid
-  `);
-  return (result.rows[0]?.marked as string | null | undefined) ?? null;
+  const [result] = await db.select({
+    marked: sql<string | null>`sensor_governed_at::text`,
+  }).from(issues).where(eq(issues.id, issueId));
+  if (!result) throw new Error("Missing issue in P04 migration test fixture");
+  return result.marked;
 }
 
 async function attach(companyId: string, issueId: string, key = "sensor-admission") {
@@ -60,7 +60,7 @@ describe("P04 durable Sensor issue-governance migration", () => {
   });
 
   afterAll(async () => {
-    await closeRegisteredClients();
+    await closeRegisteredClients(url);
   });
 
   it("marks issue at link insert and survives link deletion", async () => {
