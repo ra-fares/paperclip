@@ -277,6 +277,44 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
   );
 
   it.each(ADAPTERS)(
+    "RECOVERY: terminal Sensor denial for %s must not be automatically requeued by a later sweep",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      execute.mockResolvedValue({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider,
+        model: "spy-only",
+        summary: "UNSAFE recovery execution after Sensor denial",
+      });
+      const f = await createFixture(adapterType, "malformed");
+      const run = await runFixture(f.agentId, f.issueId);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(run.status).toBe("failed");
+      expect(run.errorCode).toBe("sensor_admission_denied");
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(0);
+
+      // A later recovery tick must not reinterpret a policy DENY as a
+      // retryable provider/continuation failure, even after the first run
+      // has released the issue execution lock.
+      await heartbeat.reconcileStrandedAssignedIssues();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      const retries = await db.select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+      }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, run.id));
+      expect(retries).toHaveLength(0);
+      const [reconciledIssue] = await db.select({ status: issues.status })
+        .from(issues).where(eq(issues.id, f.issueId));
+      expect(reconciledIssue?.status).toBe("blocked");
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(0);
+    },
+  );
+
+  it.each(ADAPTERS)(
     "REGRESSION: issue without sensor-admission executes legacy %s exactly once",
     async (adapterType, provider) => {
       execute.mockReset();
