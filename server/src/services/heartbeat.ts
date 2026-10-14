@@ -22585,7 +22585,11 @@ export function heartbeatService(
               eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
             ))
             .limit(1);
-          if (sensorDocument) {
+          // A previously governed queued run cannot lose admission policy
+          // merely because its link has been detached since enqueue. The
+          // server-generated runner profile is persisted across claims/restart.
+          const queuedGovernance = parseObject(run.runnerProfileJson).sensorGovernance;
+          if (sensorDocument || queuedGovernance != null) {
             throw new SensorAdmissionDeniedError(
               "binding_conflict",
               "governed issue requires a verified direct Sensor admission binding; legacy adapter dispatch is not authorized",
@@ -24180,7 +24184,11 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
-                else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'sensorGovernance'
+                then jsonb_build_object('sensorGovernance', ${heartbeatRuns.runnerProfileJson}->'sensorGovernance')
+                else '{}'::jsonb end)
+              || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -26630,6 +26638,33 @@ export function heartbeatService(
     }
   }
 
+  // This metadata is derived from the database inside the run-creation
+  // transaction, never from wake payload/contextSnapshot. A queued run must
+  // retain its governed provenance even if the document is later removed.
+  async function queuedSensorGovernanceProfile(
+    tx: Db,
+    companyId: string,
+    issueId: string | null | undefined,
+  ): Promise<Record<string, unknown> | null> {
+    if (!issueId) return null;
+    const [linked] = await tx
+      .select({ documentId: issueDocuments.documentId })
+      .from(issueDocuments)
+      .where(and(
+        eq(issueDocuments.companyId, companyId),
+        eq(issueDocuments.issueId, issueId),
+        eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+      ))
+      .limit(1);
+    return linked
+      ? { sensorGovernance: {
+          schema: "sensor-governance.queued.v1",
+          issueId,
+          documentId: linked.documentId,
+        } }
+      : null;
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -28499,6 +28534,9 @@ export function heartbeatService(
               status: "queued",
               responsibleUserId: await resolveQueuedResponsibleUserId(),
               wakeupRequestId: wakeupRequest.id,
+              runnerProfileJson: await queuedSensorGovernanceProfile(
+                tx as unknown as Db, agent.companyId, issue.id,
+              ),
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
                 : opts.failedRunId ?? automaticParentRunId,
@@ -28771,6 +28809,9 @@ export function heartbeatService(
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
+          runnerProfileJson: await queuedSensorGovernanceProfile(
+            tx as unknown as Db, agent.companyId, issueId,
+          ),
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,

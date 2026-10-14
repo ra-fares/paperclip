@@ -189,6 +189,9 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
+  // RED assertions can abort a test while a queued run is still finalizing.
+  // Drain tracked execution promises before closing disposable PostgreSQL.
+  await drainHeartbeatRunsToQuiescence(db, heartbeat);
   for (const [adapterType] of ADAPTERS) unregisterServerAdapter(adapterType);
   if (testUrl) await closeRegisteredClients(testUrl);
 });
@@ -408,6 +411,15 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         expect(queued).not.toBeNull();
         governedRunId = queued!.id;
         expect((await heartbeat.getRun(governedRunId))?.status).toBe("queued");
+        const [queuedProfile] = await db.select({
+          runnerProfileJson: heartbeatRuns.runnerProfileJson,
+        }).from(heartbeatRuns).where(eq(heartbeatRuns.id, governedRunId));
+        expect(queuedProfile?.runnerProfileJson).toMatchObject({
+          sensorGovernance: {
+            schema: "sensor-governance.queued.v1",
+            issueId: f.issueId,
+          },
+        });
         const [linkedBeforeDetach] = await db
           .select({ key: issueDocuments.key })
           .from(issueDocuments)
