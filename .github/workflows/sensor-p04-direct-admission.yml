@@ -13,6 +13,7 @@ on:
       - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
       - server/src/services/heartbeat.ts
       - server/src/services/documents.ts
+      - server/src/services/issues.ts
       - server/src/modules/run-dispatch/**
       - packages/db/src/schema/issues.ts
       - packages/db/src/migrations/0293_sensor_issue_governance.sql
