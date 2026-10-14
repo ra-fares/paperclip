@@ -1,0 +1,80 @@
+# T-P04-DIRECT-ADMISSION-01: isolated RED proof, no real providers or models.
+# Expected first run: RED fails on guarded direct-adapter assertions.
+name: Sensor P04 direct admission RED
+on:
+  push:
+    branches:
+      - ci/T-P04-DIRECT-ADMISSION-01
+    paths:
+      - .github/workflows/sensor-p04-direct-admission.yml
+      - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
+permissions:
+  contents: read
+concurrency:
+  group: sensor-p04-direct-admission-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  direct-db-test:
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      CI: 'true'
+      DATABASE_URL: postgres://p04_direct_test:p04_direct_ci_only@127.0.0.1:5432/paperclip_p04_direct_admission_01_ci
+      PAPERCLIP_TEST_DATABASE_URL: postgres://p04_direct_test:p04_direct_ci_only@127.0.0.1:5432/paperclip_p04_direct_admission_01_ci
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: p04_direct_test
+          POSTGRES_PASSWORD: p04_direct_ci_only
+          POSTGRES_DB: paperclip_p04_direct_admission_01_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U p04_direct_test -d paperclip_p04_direct_admission_01_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout exact isolated test commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Record immutable source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "P04 direct test SHA: $GITHUB_SHA"
+          echo "Based on accepted native DB3 source c9005f78294d6e6748517e8845cb360f0ab9d9ee"
+      - name: Setup Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Setup pnpm 9.15.4
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+      - name: Install declared dependencies only
+        run: pnpm install --frozen-lockfile
+      - name: Assert isolated database identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec "${{ job.services.postgres.id }}" psql -U p04_direct_test -d paperclip_p04_direct_admission_01_ci -Atqc 'SELECT current_database()' | grep -Fx 'paperclip_p04_direct_admission_01_ci'
+      - name: Apply PostgreSQL migrations
+        run: pnpm --filter @paperclipai/db migrate
+      - name: Verify server TypeScript before RED tests
+        run: pnpm --filter @paperclipai/server typecheck
+      - name: Assert direct tests exist (never skip)
+        run: test -s server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
+      - name: RED — governed direct denial + no-document legacy
+        run: pnpm --dir server exec vitest run src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts --reporter=verbose
+      - name: Check working tree integrity
+        if: always()
+        run: git diff --exit-code
