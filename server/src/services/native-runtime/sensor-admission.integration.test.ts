@@ -326,7 +326,7 @@ describe("P04 native Sensor admission — real isolated PostgreSQL", () => {
       },
       interactionResponses: [],
       credentialBindings: [],
-    } as NativeExecutionInput;
+    } as unknown as NativeExecutionInput;
   }
 
   async function serverRunEvidence(f: Awaited<ReturnType<typeof makeFixture>>) {
