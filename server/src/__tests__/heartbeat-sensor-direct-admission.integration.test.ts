@@ -12,6 +12,7 @@ import {
 
 import {
   agents,
+  agentWakeupRequests,
   authUsers,
   closeRegisteredClients,
   companies,
@@ -960,6 +961,69 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         expect(successors).toHaveLength(0);
       } finally {
         releaseBlocker();
+      }
+    },
+    25_000,
+  );
+
+  it.each(ADAPTERS)(
+    "DEFERRED WAKE: %s post-claim wake behind active issue cannot replay after transient Sensor governance",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "none");
+      let releaseFirst!: () => void;
+      const providerGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const success = {
+        exitCode: 0, signal: null, timedOut: false, provider, model: "spy-only",
+        summary: "P04 safe first entry",
+      } as const;
+      execute.mockImplementationOnce(async () => { await providerGate; return success; });
+      execute.mockResolvedValue(success);
+      try {
+        const first = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true }, "manual",
+        );
+        expect(first).not.toBeNull();
+        for (let i = 0; i < 100 &&
+          execute.mock.calls.filter(([ctx]) => ctx.runId === first!.id).length === 0; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        expect(execute.mock.calls.filter(([ctx]) => ctx.runId === first!.id)).toHaveLength(1);
+        const claim = (await heartbeat.getRun(first!.id))?.runnerProfileJson?.sensorDirectDispatchClaim;
+        expect(claim).toMatchObject({ runId: first!.id, issueId: f.issueId });
+        const docs = documentService(db);
+        await docs.upsertIssueDocument({
+          issueId: f.issueId, key: SENSOR_ADMISSION_DOCUMENT_KEY,
+          format: "markdown", body: "{}",
+        });
+        await docs.deleteIssueDocument(f.issueId, SENSOR_ADMISSION_DOCUMENT_KEY);
+        // Force a separately durable deferred receipt, not a live-run
+        // coalescing optimization or a second dispatch of the same run.
+        await heartbeat.wakeup(f.agentId, {
+          source: "on_demand", triggerDetail: "system",
+          allowRunCoalescing: false, reason: "P04_DEFERRED_GOVERNANCE_TEST",
+          contextSnapshot: { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true },
+        });
+        const deferred = await db.select({
+          id: agentWakeupRequests.id, status: agentWakeupRequests.status,
+        }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, f.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`,
+        ));
+        expect(deferred.length).toBeGreaterThan(0);
+        releaseFirst();
+        await waitForTerminalRun(first!.id);
+        await drainHeartbeatRunsToQuiescence(db, heartbeat);
+        // The original call was authorized before attach. The deferred
+        // re-wake must not turn the now-governed issue into a second call.
+        expect(execute.mock.calls.filter(([ctx]) => ctx.runId !== first!.id)).toHaveLength(0);
+        const [governed] = await db.select({ at: issues.sensorGovernedAt })
+          .from(issues).where(eq(issues.id, f.issueId));
+        expect(governed?.at).not.toBeNull();
+      } finally {
+        releaseFirst();
       }
     },
     25_000,
