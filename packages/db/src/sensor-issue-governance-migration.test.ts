@@ -162,4 +162,59 @@ describe("P04 durable Sensor issue-governance migration", () => {
       runnerProfileJson: null,
     }).where(eq(heartbeatRuns.id, runId))).rejects.toThrow();
   });
+  it("SQL claim guard distinguishes SQL NULL, JSON null, key deletion/replacement, and unrelated fields", async () => {
+    const { companyId, issueId } = await issueFixture();
+    const agentId = randomUUID(), runId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "P04 direct SQL claim guard",
+      role: "engineer", adapterType: "cline_local", adapterConfig: {},
+      runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running",
+      runnerProfileJson: null, contextSnapshot: { issueId },
+    });
+    // SQL NULL is not a committed claim; it may gain the server-owned receipt.
+    const receipt = {
+      schema: "sensor-direct-dispatch-claim.v1",
+      runId, issueId, attemptId: randomUUID(),
+      ownerBootId: randomUUID(), claimedAt: new Date().toISOString(),
+    };
+    await db.execute(sql`
+      UPDATE heartbeat_runs
+      SET runner_profile_json = jsonb_build_object('ordinary', 'initial')
+      WHERE id = ${runId}::uuid AND runner_profile_json IS NULL
+    `);
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { ordinary: "initial", sensorDirectDispatchClaim: receipt },
+    }).where(eq(heartbeatRuns.id, runId));
+
+    // These are different PostgreSQL JSON operations. None may erase or
+    // replace a committed receipt, even when JSON null is not SQL NULL.
+    await expect(db.execute(sql`UPDATE heartbeat_runs
+      SET runner_profile_json = NULL WHERE id = ${runId}::uuid`)).rejects.toThrow();
+    await expect(db.execute(sql`UPDATE heartbeat_runs
+      SET runner_profile_json = 'null'::jsonb WHERE id = ${runId}::uuid`)).rejects.toThrow();
+    await expect(db.execute(sql`UPDATE heartbeat_runs
+      SET runner_profile_json = runner_profile_json - 'sensorDirectDispatchClaim'
+      WHERE id = ${runId}::uuid`)).rejects.toThrow();
+    await expect(db.execute(sql`UPDATE heartbeat_runs
+      SET runner_profile_json = jsonb_set(runner_profile_json,
+        '{sensorDirectDispatchClaim}', 'null'::jsonb)
+      WHERE id = ${runId}::uuid`)).rejects.toThrow();
+    await expect(db.execute(sql`UPDATE heartbeat_runs
+      SET runner_profile_json = jsonb_set(runner_profile_json,
+        '{sensorDirectDispatchClaim}', ${JSON.stringify({ ...receipt, attemptId: randomUUID() })}::jsonb)
+      WHERE id = ${runId}::uuid`)).rejects.toThrow();
+
+    await db.execute(sql`UPDATE heartbeat_runs
+      SET runner_profile_json = jsonb_set(runner_profile_json,
+        '{ordinary}', '"permitted"'::jsonb)
+      WHERE id = ${runId}::uuid`);
+    const [stored] = await db.select({ profile: heartbeatRuns.runnerProfileJson })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(stored?.profile?.sensorDirectDispatchClaim).toEqual(receipt);
+    expect(stored?.profile?.ordinary).toBe("permitted");
+  });
+
 });
