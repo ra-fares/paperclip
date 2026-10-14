@@ -1837,9 +1837,7 @@ export interface IssueFilters {
   updatedSince?: string;
 }
 
-// The public issue-list projection intentionally omits the server-only Sensor governance column.
-// Keep the shared enrichment input typed to the common issue fields without altering response JSON.
-type IssueRow = Omit<typeof issues.$inferSelect, "sensorGovernedAt"> & { externalConversationState?: "active" | "waiting" | null };
+type IssueRow = typeof issues.$inferSelect & { externalConversationState?: "active" | "waiting" | null };
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
@@ -3256,12 +3254,19 @@ async function withIssueLabels(
   ]);
   return rows.map((row) => {
     const issueLabels = labelsByIssueId.get(row.id) ?? [];
-    return {
+    // Preserve the actual DB value for internal typed consumers, but do not
+    // expose this server-owned admission marker in serialized public issue JSON.
+    return Object.defineProperty({
       ...row,
       labels: issueLabels,
       labelIds: issueLabels.map((label) => label.id),
       watchdog: watchdogByIssueId.get(row.id) ?? null,
-    };
+    }, "sensorGovernedAt", {
+      value: row.sensorGovernedAt,
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
   });
 }
 
@@ -4846,6 +4851,8 @@ const issueListSelect = {
   conversationState: issues.conversationState,
   conversationSessionGeneration: issues.conversationSessionGeneration,
   conversationBoundaryCommentId: issues.conversationBoundaryCommentId,
+  // Required for internal IssueRow typing; stripped from JSON serialization below.
+  sensorGovernedAt: issues.sensorGovernedAt,
   id: issues.id,
   companyId: issues.companyId,
   projectId: issues.projectId,
