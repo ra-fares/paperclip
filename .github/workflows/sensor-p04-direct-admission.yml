@@ -7,10 +7,17 @@ on:
       - ci/T-P04-DIRECT-ADMISSION-01
       - ci/T-P04-DIRECT-ADMISSION-DETACH-RED
       - ci/T-P04-DIRECT-ADMISSION-RACE-RED
+      - ci/T-P04-ISSUE-GOVERNANCE-01
     paths:
       - .github/workflows/sensor-p04-direct-admission.yml
       - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
       - server/src/services/heartbeat.ts
+      - server/src/services/documents.ts
+      - server/src/modules/run-dispatch/**
+      - packages/db/src/schema/issues.ts
+      - packages/db/src/migrations/0293_sensor_issue_governance.sql
+      - packages/db/src/migrations/meta/**
+      - packages/db/src/sensor-issue-governance-migration.test.ts
 permissions:
   contents: read
 concurrency:
@@ -18,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   direct-db-test:
-    if: github.repository == 'ra-fares/paperclip' && (github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-DETACH-RED' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-RACE-RED')
+    if: github.repository == 'ra-fares/paperclip' && (github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-DETACH-RED' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-RACE-RED' || github.ref == 'refs/heads/ci/T-P04-ISSUE-GOVERNANCE-01')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
@@ -74,6 +81,17 @@ jobs:
         run: pnpm --filter @paperclipai/db migrate
       - name: Verify server TypeScript before RED tests
         run: pnpm --filter @paperclipai/server typecheck
+      - name: Assert three focused suites exist (never silently skip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s packages/db/src/sensor-issue-governance-migration.test.ts
+          test -s server/src/modules/run-dispatch/adapters/postgres.test.ts
+          test -s server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
+      - name: Verify durable Sensor migration and SQL guards
+        run: pnpm --dir packages/db exec vitest run src/sensor-issue-governance-migration.test.ts --reporter=verbose
+      - name: Verify run-dispatch Postgres adapter
+        run: pnpm --dir server exec vitest run src/modules/run-dispatch/adapters/postgres.test.ts --reporter=verbose
       - name: Assert direct tests exist (never skip)
         run: test -s server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
       - name: Verify governed direct denial + no-document legacy
