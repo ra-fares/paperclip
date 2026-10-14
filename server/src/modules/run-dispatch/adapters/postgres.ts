@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueDocuments,
   issues,
 } from "@paperclipai/db";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
@@ -51,6 +52,8 @@ import {
 } from "../domain/wake-context.js";
 import type {
   CancelStaleQueuedRunInput,
+  ClaimLegacyDirectInput,
+  ClaimLegacyDirectOutcome,
   DispatchResolvedInteractionInput,
   DispatchResolvedInteractionOutcome,
   DueRetryRun,
@@ -1077,7 +1080,97 @@ export function createPostgresRunDispatchAdapter(
 
   }
 
+
+  /**
+   * Legacy/direct P04 admission is a commit-first, at-most-once claim.
+   * Caller MUST NOT invoke a provider unless this returns claimed_new from
+   * an acknowledged commit. Rereading a stored claim grants no authority.
+   */
+  async function claimLegacyDirectDispatch(
+    input: ClaimLegacyDirectInput,
+  ): Promise<ClaimLegacyDirectOutcome> {
+    try {
+      return await withIssueThenRunLocks(input, () => ({
+        outcome: "stale" as const, errorCode: "run_not_found",
+      }), async (tx, run): Promise<ClaimLegacyDirectOutcome> => {
+        const storedIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        if (storedIssueId !== input.issueId || run.companyId !== input.companyId ||
+            run.agentId !== input.agentId || run.status !== "running" ||
+            run.runtimeMode !== "legacy" ||
+            run.controllerBootId !== input.ownerBootId ||
+            !run.controllerLeaseExpiresAt ||
+            run.controllerLeaseExpiresAt.getTime() <= Date.now()) {
+          return { outcome: "stale", errorCode: "legacy_controller_ownership_changed" };
+        }
+        const [issue] = await tx.select({
+          companyId: issues.companyId,
+          sensorGovernedAt: issues.sensorGovernedAt,
+          executionRunId: issues.executionRunId,
+          assigneeAgentId: issues.assigneeAgentId,
+          status: issues.status,
+        }).from(issues).where(and(
+          eq(issues.id, input.issueId),
+          eq(issues.companyId, input.companyId),
+        )).limit(1);
+        if (!issue || issue.executionRunId !== run.id ||
+            issue.assigneeAgentId !== input.agentId ||
+            issue.status === "cancelled" || issue.status === "done") {
+          return { outcome: "stale", errorCode: "issue_execution_lock_changed" };
+        }
+        const profile = parseObject(run.runnerProfileJson);
+        const [sensorLink] = await tx.select({ id: issueDocuments.id })
+          .from(issueDocuments).where(and(
+            eq(issueDocuments.companyId, input.companyId),
+            eq(issueDocuments.issueId, input.issueId),
+            eq(issueDocuments.key, "sensor-admission"),
+          )).limit(1);
+        if (issue.sensorGovernedAt != null || sensorLink || profile.sensorGovernance != null) {
+          return { outcome: "governed" };
+        }
+        if (Object.prototype.hasOwnProperty.call(profile, "sensorDirectDispatchClaim")) {
+          return { outcome: "duplicate" };
+        }
+        if (input.checkContinuationStaleness) {
+          const { decision } = await decideCurrentRunStaleness(tx, run, input.now);
+          if (decision.stale) {
+            return { outcome: "stale", errorCode: decision.errorCode };
+          }
+        }
+        const receipt = {
+          schema: "sensor-direct-dispatch-claim.v1",
+          runId: run.id,
+          issueId: input.issueId,
+          attemptId: input.attemptId,
+          ownerBootId: input.ownerBootId,
+          claimedAt: input.now.toISOString(),
+        };
+        const [claimed] = await tx.update(heartbeatRuns).set({
+          runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
+             then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end)
+             || ${JSON.stringify({ sensorDirectDispatchClaim: receipt })}::jsonb`,
+          updatedAt: input.now,
+        }).where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.controllerBootId, input.ownerBootId),
+          gte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+          sql`NOT coalesce((jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
+              AND ${heartbeatRuns.runnerProfileJson} ? 'sensorDirectDispatchClaim'), false)`,
+        )).returning({ id: heartbeatRuns.id });
+        return claimed
+          ? { outcome: "claimed_new" }
+          : { outcome: "stale", errorCode: "legacy_direct_claim_race_lost" };
+      });
+    } catch {
+      // A lost COMMIT acknowledgement might mean a claim committed. Never
+      // re-read it to recover permission, and NEVER dispatch on this outcome.
+      return { outcome: "indeterminate" };
+    }
+  }
+
   return {
+    claimLegacyDirectDispatch,
     evaluateScheduledRetryGate,
     listDueRetries,
     cancelStaleQueuedRun,

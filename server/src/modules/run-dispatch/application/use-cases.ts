@@ -69,3 +69,12 @@ export function createDispatchResolvedInteractionIfCurrent(deps: { writer: RunDi
     now: input.now ?? new Date(),
   });
 }
+
+export function createClaimLegacyDirectDispatch(deps: { writer: RunDispatchWriter }) {
+  return (input: Omit<import("./ports.js").ClaimLegacyDirectInput, "now"> & { now?: Date }) => {
+    if (!deps.writer.claimLegacyDirectDispatch) {
+      return Promise.resolve({ outcome: "indeterminate" as const });
+    }
+    return deps.writer.claimLegacyDirectDispatch({ ...input, now: input.now ?? new Date() });
+  };
+}
