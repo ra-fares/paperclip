@@ -614,6 +614,10 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         runtimeMode: "legacy",
         nativePhase: null,
       });
+      const claim = (run.runnerProfileJson as Record<string, unknown> | null)?.sensorDirectDispatchClaim;
+      expect(claim).toBeTruthy();
+      expect((claim as Record<string, unknown>).runId).toBe(run.id);
+
       expect((run.resultJson as Record<string, unknown> | null)?.proof)
         .toBe("direct-legacy-no-document");
     },

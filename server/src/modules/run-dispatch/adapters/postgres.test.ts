@@ -899,4 +899,57 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId: null, agentId: null });
   });
 
+
+  it("atomically authorizes only one direct dispatch for the same run, and never reuses it", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), runId = randomUUID(), boot = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
+      controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      contextSnapshot: { issueId }, runnerProfileJson: { ordinary: "preserve" },
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const attempt = () => adapter.claimLegacyDirectDispatch({
+      companyId, issueId, agentId, runId, ownerBootId: boot,
+      attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
+    });
+    const outcomes = await Promise.all([attempt(), attempt()]);
+    expect(outcomes.map(x => x.outcome).sort()).toEqual(["claimed_new", "duplicate"]);
+    expect((await attempt()).outcome).toBe("duplicate");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const claim = (run.runnerProfileJson as Record<string, any>).sensorDirectDispatchClaim;
+    expect(claim).toMatchObject({ schema: "sensor-direct-dispatch-claim.v1", runId, issueId, ownerBootId: boot });
+    expect((run.runnerProfileJson as Record<string, unknown>).ordinary).toBe("preserve");
+    expect(await adapter.claimLegacyDirectDispatch({
+      companyId, issueId, agentId, runId, ownerBootId: randomUUID(),
+      attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
+    })).toMatchObject({ outcome: "stale" });
+  });
+
+  it("retains issue governance after detach; cancellation is stale, not sensor-denied", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), runId = randomUUID(), boot = randomUUID(), documentId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
+      controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    await db.insert(documents).values({ id: documentId, companyId, title: "sensor-admission", latestBody: "{}" });
+    await db.insert(issueDocuments).values({ companyId, issueId, documentId, key: "sensor-admission" });
+    await db.delete(issueDocuments).where(eq(issueDocuments.documentId, documentId));
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const params = {
+      companyId, issueId, agentId, runId, ownerBootId: boot,
+      attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
+    };
+    expect(await adapter.claimLegacyDirectDispatch(params)).toMatchObject({ outcome: "governed" });
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+    expect(await adapter.claimLegacyDirectDispatch({ ...params, attemptId: randomUUID() }))
+      .toMatchObject({ outcome: "stale", errorCode: "issue_execution_lock_changed" });
+  });
+
 });

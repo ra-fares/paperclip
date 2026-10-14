@@ -4,6 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import {
   closeRegisteredClients,
   companies,
+  agents,
   createDb,
   documents,
   heartbeatRuns,
@@ -98,21 +99,67 @@ describe("P04 durable Sensor issue-governance migration", () => {
     expect(await marker(issueId)).toBeNull();
   });
 
-  it("preserves an existing direct claim but permits unrelated profile changes", async () => {
+  it("preserves a committed claim while allowing unrelated profile edits", async () => {
     const { companyId, issueId } = await issueFixture();
-    const runId = randomUUID();
-    // A valid owner is not required for the DB-level immutability invariant.
-    // Create a seeded agent in the extended dispatch tests; this fixture focuses on SQL NULL/JSON null.
-    const noClaim = await db.execute(sql`
-      SELECT NOT ('{}'::jsonb ? 'sensorDirectDispatchClaim') AS absent,
-             jsonb_typeof('{"sensorDirectDispatchClaim": null}'::jsonb -> 'sensorDirectDispatchClaim') AS null_type
-    `);
-    expect(noClaim.rows[0]?.absent).toBe(true);
-    expect(noClaim.rows[0]?.null_type).toBe("null");
-    // A marker requires a real persisted heartbeat row; the dispatch suite tests
-    // first-writer CAS and this suite asserts the database guard separately.
-    expect(issueId).toBeTruthy();
-    expect(companyId).toBeTruthy();
-    expect(runId).toBeTruthy();
+    const agentId = randomUUID(), runId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "P04 claim-guard DB spy",
+      role: "engineer", adapterType: "cline_local", adapterConfig: {},
+      runtimeConfig: {}, permissions: {},
+    });
+    const receipt = {
+      schema: "sensor-direct-dispatch-claim.v1",
+      runId, issueId, attemptId: randomUUID(),
+      ownerBootId: randomUUID(), claimedAt: new Date().toISOString(),
+    };
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running",
+      runnerProfileJson: null,
+      contextSnapshot: { issueId },
+    });
+    // SQL NULL and missing keys are not yet claimed.
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { unrelated: true },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { sensorDirectDispatchClaim: receipt, unrelated: true },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { sensorDirectDispatchClaim: receipt, unrelated: "changed" },
+    }).where(eq(heartbeatRuns.id, runId));
+    for (const forbidden of [null, {}, { sensorDirectDispatchClaim: null },
+      { sensorDirectDispatchClaim: { ...receipt, attemptId: randomUUID() } }]) {
+      await expect(db.update(heartbeatRuns).set({
+        runnerProfileJson: forbidden,
+      }).where(eq(heartbeatRuns.id, runId))).rejects.toThrow();
+    }
+    const [persisted] = await db.select({ profile: heartbeatRuns.runnerProfileJson })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(persisted.profile?.sensorDirectDispatchClaim).toEqual(receipt);
+    expect(persisted.profile?.unrelated).toBe("changed");
+  });
+
+  it("distinguishes JSON null claim key from missing key", async () => {
+    const { companyId, issueId } = await issueFixture();
+    const agentId = randomUUID(), runId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "P04 JSON null DB spy",
+      role: "engineer", adapterType: "agy_local", adapterConfig: {},
+      runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running",
+      runnerProfileJson: { sensorDirectDispatchClaim: null, ordinary: 1 },
+      contextSnapshot: { issueId },
+    });
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { sensorDirectDispatchClaim: null, ordinary: 2 },
+    }).where(eq(heartbeatRuns.id, runId));
+    await expect(db.update(heartbeatRuns).set({
+      runnerProfileJson: { ordinary: 3 },
+    }).where(eq(heartbeatRuns.id, runId))).rejects.toThrow();
+    await expect(db.update(heartbeatRuns).set({
+      runnerProfileJson: null,
+    }).where(eq(heartbeatRuns.id, runId))).rejects.toThrow();
   });
 });
