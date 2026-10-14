@@ -88,6 +88,8 @@ export const issues = pgTable(
     hiddenAt: timestamp("hidden_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    // Server-owned, monotonic issue-level Sensor governance (P04).
+    sensorGovernedAt: timestamp("sensor_governed_at", { withTimezone: true }),
   },
   (table) => ({
     conversationIdentityIdx: uniqueIndex("issues_conversation_identity_idx").on(table.companyId, table.conversationAgentId, table.conversationUserId),

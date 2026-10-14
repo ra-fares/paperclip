@@ -8,6 +8,26 @@ import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type { ImportIssueDocumentRow } from "./import-write-types.js";
 
+// Explicit issue-first lock acquisition. The DB trigger is a safety net for
+// direct SQL writers, not a substitute for lock ordering in supported services.
+async function lockIssueDocumentIssues(
+  tx: Db,
+  rows: Array<{ companyId: string; issueId: string }>,
+) {
+  const sorted = Array.from(
+    new Map(rows.map(row => [row.companyId + ":" + row.issueId, row])).values(),
+  ).sort((a, b) =>
+    a.companyId.localeCompare(b.companyId) || a.issueId.localeCompare(b.issueId),
+  );
+  for (const row of sorted) {
+    const locked = await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, row.companyId),
+      eq(issues.id, row.issueId),
+    )).for("update");
+    if (locked.length !== 1) throw notFound("Issue not found during document lock");
+  }
+}
+
 function normalizeDocumentKey(key: string) {
   const normalized = key.trim().toLowerCase();
   const parsed = issueDocumentKeySchema.safeParse(normalized);
@@ -220,6 +240,7 @@ export function documentService(db: Db) {
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
           return await db.transaction(async (tx) => {
+            await lockIssueDocumentIssues(tx as unknown as Db, [{ companyId: issue.companyId, issueId: issue.id }]);
           const now = new Date();
           const existing = await tx
             .select({
@@ -574,6 +595,7 @@ export function documentService(db: Db) {
         });
       }
       await db.transaction(async (tx) => {
+        await lockIssueDocumentIssues(tx as unknown as Db, rows.map(row => ({ companyId: row.companyId, issueId: row.issueId })));
         await insertRowsInChunks(tx, documents, documentRows);
         await insertRowsInChunks(tx, documentRevisions, revisionRows);
         await insertRowsInChunks(tx, issueDocuments, linkRows);
@@ -589,6 +611,10 @@ export function documentService(db: Db) {
     }) => {
       const key = normalizeDocumentKey(input.key);
       return db.transaction(async (tx) => {
+        const owner = await tx.select({ companyId: issues.companyId }).from(issues)
+          .where(eq(issues.id, issueId)).then(rows => rows[0] ?? null);
+        if (!owner) return null;
+        await lockIssueDocumentIssues(tx as unknown as Db, [{ companyId: owner.companyId, issueId }]);
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
