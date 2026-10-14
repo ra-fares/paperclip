@@ -196,6 +196,119 @@ afterAll(async () => {
   if (testUrl) await closeRegisteredClients(testUrl);
 });
 
+async function verifyQueuedDocumentTransition(
+  adapterType: string,
+  provider: string,
+  scenario: "rebind" | "attach_detach",
+) {
+  execute.mockReset();
+  const f = await createFixture(adapterType, scenario === "rebind" ? "malformed" : "none");
+  await db.update(agents)
+    .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+    .where(eq(agents.id, f.agentId));
+
+  const blockerIssueId = randomUUID();
+  await db.insert(issues).values({
+    id: blockerIssueId,
+    companyId: f.companyId,
+    title: "Disposable queue blocker for rebind/attach race (spy only)",
+    assigneeAgentId: f.agentId,
+    status: "in_progress",
+  });
+  let releaseBlocker: (() => void) | undefined;
+  const blockerWait = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+  const spyResult = {
+    exitCode: 0, signal: null, timedOut: false,
+    provider, model: "spy-only", summary: "Simulated legacy execution",
+  } as const;
+  execute.mockImplementationOnce(async () => {
+    await blockerWait;
+    return spyResult;
+  });
+  execute.mockResolvedValue(spyResult);
+
+  let queuedId: string | null = null;
+  try {
+    const blocker = await heartbeat.invoke(
+      f.agentId, "on_demand",
+      { issueId: blockerIssueId, taskKey: blockerIssueId, skipIssueComment: true },
+      "manual",
+    );
+    expect(blocker).not.toBeNull();
+    for (let i = 0; i < 100 && execute.mock.calls.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    expect(execute.mock.calls.length).toBe(1);
+
+    const queued = await heartbeat.invoke(
+      f.agentId, "on_demand",
+      { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true },
+      "manual",
+    );
+    expect(queued).not.toBeNull();
+    queuedId = queued!.id;
+    expect((await heartbeat.getRun(queuedId))?.status).toBe("queued");
+
+    const [stored] = await db.select({
+      runnerProfileJson: heartbeatRuns.runnerProfileJson,
+    }).from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedId));
+    if (scenario === "rebind") {
+      expect(stored?.runnerProfileJson).toMatchObject({
+        sensorGovernance: { schema: "sensor-governance.queued.v1", issueId: f.issueId },
+      });
+    } else {
+      expect(stored?.runnerProfileJson?.sensorGovernance).toBeUndefined();
+    }
+
+    const svc = documentService(db);
+    if (scenario === "rebind") {
+      const [oldLink] = await db.select({ documentId: issueDocuments.documentId })
+        .from(issueDocuments).where(and(
+          eq(issueDocuments.companyId, f.companyId),
+          eq(issueDocuments.issueId, f.issueId),
+          eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+        ));
+      expect(oldLink?.documentId).toBeDefined();
+      await svc.deleteIssueDocument(f.issueId, SENSOR_ADMISSION_DOCUMENT_KEY);
+      const rebound = await svc.upsertIssueDocument({
+        issueId: f.issueId,
+        key: SENSOR_ADMISSION_DOCUMENT_KEY,
+        format: "markdown",
+        body: '{"schema":"sensor-admission.v1","rebind":true}',
+      });
+      expect(rebound.document.id).not.toBe(oldLink?.documentId);
+    } else {
+      // The run was queued when the issue was ungoverned. A document was
+      // attached AND removed before the final dispatch read: a queue-only
+      // sticky marker plus the current-link gate can both miss this history.
+      const attached = await svc.upsertIssueDocument({
+        issueId: f.issueId,
+        key: SENSOR_ADMISSION_DOCUMENT_KEY,
+        format: "markdown",
+        body: '{"schema":"sensor-admission.v1","intermediate":true}',
+      });
+      expect(attached.document.key).toBe(SENSOR_ADMISSION_DOCUMENT_KEY);
+      const removed = await svc.deleteIssueDocument(f.issueId, SENSOR_ADMISSION_DOCUMENT_KEY);
+      expect(removed?.id).toBe(attached.document.id);
+    }
+  } finally {
+    releaseBlocker?.();
+  }
+
+  expect(queuedId).not.toBeNull();
+  const run = await waitForTerminalRun(queuedId!);
+  await drainHeartbeatRunsToQuiescence(db, heartbeat);
+  // For the attach-and-detach case this is intentional RED: neither the
+  // enqueue-time marker nor the dispatch-time link witnesses governance.
+  expect(execute.mock.calls.filter(([ctx]) => ctx.runId === queuedId)).toHaveLength(0);
+  expect(run.status).toBe("failed");
+  expect(run.errorCode).toBe("sensor_admission_denied");
+  expect(run.scheduledRetryAt).toBeNull();
+  const successors = await db.select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, queuedId!));
+  expect(successors).toHaveLength(0);
+}
+
 describe("P04 direct-adapter governed admission — disposable real PostgreSQL", () => {
   it.each(ADAPTERS)(
     "RED: malformed sensor-admission denies %s before adapter.execute",
@@ -462,6 +575,20 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.retryOfRunId, governedRunId!));
       expect(successors).toHaveLength(0);
+    },
+  );
+
+  it.each(ADAPTERS)(
+    "REBIND: queued governed %s denies direct dispatch after document replacement",
+    async (adapterType, provider) => {
+      await verifyQueuedDocumentTransition(adapterType, provider, "rebind");
+    },
+  );
+
+  it.each(ADAPTERS)(
+    "RACE RED: transient Sensor link after enqueue and before dispatch must deny %s",
+    async (adapterType, provider) => {
+      await verifyQueuedDocumentTransition(adapterType, provider, "attach_detach");
     },
   );
 
