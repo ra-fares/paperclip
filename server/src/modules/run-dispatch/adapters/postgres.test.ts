@@ -955,4 +955,85 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       .toMatchObject({ outcome: "stale", errorCode: "issue_execution_lock_changed" });
   });
 
+  it("returns INDETERMINATE after a simulated lost commit acknowledgement; later delivery cannot execute", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), runId = randomUUID(), boot = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
+      controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+
+    // Fault at the exact semantic boundary: PostgreSQL has COMMITTED the
+    // newly inserted receipt, but the caller receives no commit confirmation.
+    const faultDb = Object.assign(Object.create(db) as typeof db, {
+      transaction: async (operation: (tx: typeof db) => Promise<unknown>) => {
+        await db.transaction(async (tx) => operation(tx as unknown as typeof db));
+        throw new Error("P04 simulated lost COMMIT acknowledgement");
+      },
+    });
+    const faulted = createPostgresRunDispatchAdapter(faultDb);
+    const healthy = createPostgresRunDispatchAdapter(db);
+    const executeSpy = vi.fn();
+    const input = {
+      companyId, issueId, agentId, runId, ownerBootId: boot,
+      attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
+    };
+    if (!faulted.claimLegacyDirectDispatch || !healthy.claimLegacyDirectDispatch) {
+      throw new Error("P04 direct claim adapter missing");
+    }
+    const ambiguous = await faulted.claimLegacyDirectDispatch(input);
+    if (ambiguous.outcome === "claimed_new") executeSpy();
+    expect(ambiguous).toMatchObject({ outcome: "indeterminate" });
+    expect(executeSpy).not.toHaveBeenCalled();
+    const [run] = await db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toMatchObject({
+      runId, issueId, attemptId: input.attemptId, ownerBootId: boot,
+    });
+    const redelivered = await healthy.claimLegacyDirectDispatch(input);
+    if (redelivered.outcome === "claimed_new") executeSpy();
+    expect(redelivered).toMatchObject({ outcome: "duplicate" });
+    expect(executeSpy).not.toHaveBeenCalled();
+  });
+
+  it("committed claim survives crash-before-adapter and cancellation/reassignment cannot authorize another call", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), runId = randomUUID(), boot = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
+      controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const adapter = createPostgresRunDispatchAdapter(db);
+    if (!adapter.claimLegacyDirectDispatch) throw new Error("P04 direct claim adapter missing");
+    const input = {
+      companyId, issueId, agentId, runId, ownerBootId: boot,
+      attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
+    };
+    const first = await adapter.claimLegacyDirectDispatch(input);
+    expect(first).toMatchObject({ outcome: "claimed_new" });
+    // Simulated process loss before invoking any server adapter callback.
+    const executeSpy = vi.fn();
+    expect(await adapter.claimLegacyDirectDispatch({ ...input, attemptId: randomUUID() }))
+      .toMatchObject({ outcome: "duplicate" });
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+    const cancelled = await adapter.claimLegacyDirectDispatch({ ...input, attemptId: randomUUID() });
+    expect(cancelled).toMatchObject({ outcome: "stale" });
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: null })
+      .where(eq(issues.id, issueId));
+    const reassigned = await adapter.claimLegacyDirectDispatch({ ...input, attemptId: randomUUID() });
+    expect(reassigned).toMatchObject({ outcome: "stale" });
+    const [run] = await db.select({ profile: heartbeatRuns.runnerProfileJson })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.profile?.sensorDirectDispatchClaim).toMatchObject({
+      runId, issueId, attemptId: input.attemptId, ownerBootId: boot,
+    });
+    expect(executeSpy).not.toHaveBeenCalled();
+  });
+
 });
