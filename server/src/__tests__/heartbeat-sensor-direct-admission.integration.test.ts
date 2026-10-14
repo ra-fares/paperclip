@@ -11,6 +11,7 @@ import {
 
 import {
   agents,
+  authUsers,
   closeRegisteredClients,
   companies,
   createDb,
@@ -69,12 +70,26 @@ async function createFixture(adapterType: string, withMalformedAdmission: boolea
   const companyId = randomUUID();
   const agentId = randomUUID();
   const issueId = randomUUID();
+  const responsibleUserId = randomUUID();
+  const timestamp = new Date();
+
+  // Real auth user: the heartbeat issue/comment path has an FK to "user".
+  // An invented defaultResponsibleUserId can reach dispatch, but corrupts
+  // the fixture with a foreign-key error during issue comment handling.
+  await db.insert(authUsers).values({
+    id: responsibleUserId,
+    name: "P04 disposable CI responsible user",
+    email: `p04-direct-${responsibleUserId}@example.invalid`,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
 
   await db.insert(companies).values({
     id: companyId,
     name: "P04 disposable direct-admission RED fixture",
     issuePrefix: `DR${companyId.replace(/-/g, "").slice(0, 8)}`,
     requireBoardApprovalForNewAgents: false,
+    defaultResponsibleUserId: responsibleUserId,
   });
   await db.insert(agents).values({
     id: agentId,
