@@ -9569,6 +9569,9 @@ export function heartbeatService(
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   });
   const runDispatch = createRunDispatch(db);
+  // Committed legacy direct claims can never be replayed by automatic recovery.
+  const hasLegacyDirectDispatchClaim = (run: { runnerProfileJson: unknown } | null | undefined) =>
+    Object.prototype.hasOwnProperty.call(parseObject(run?.runnerProfileJson), "sensorDirectDispatchClaim");
 
   // Applies the post-commit effects a run-dispatch operation returns, on a
   // best-effort basis, exactly as this service publishes them for every
@@ -14403,6 +14406,7 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
+    if (hasLegacyDirectDispatchClaim(run)) return null;
     // Completion deliveries own their durable bounded retry and reply identity.
     // A second process-loss retry would compete for the same outbox input.
     if (run.contextSnapshot?.wakeReason === CHAT_COMPLETION_WAKE_REASON &&
@@ -15291,6 +15295,12 @@ export function heartbeatService(
   ) {
     // Fail closed at the bounded scheduler as well as at the issue sweeper:
     // legacy/native retry callers must not replay a denied Sensor binding.
+    if (hasLegacyDirectDispatchClaim(run)) {
+      return { outcome: "not_scheduled" as const,
+        reason: "A committed legacy direct claim requires explicit reconciliation; no automatic replay",
+        errorCode: "legacy_direct_claim_pending_reconciliation" as const,
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (run.errorCode === "sensor_admission_denied") {
       return {
         outcome: "not_scheduled" as const,
@@ -22576,6 +22586,8 @@ export function heartbeatService(
         // workspace/completion bindings. Do not synthesize native bindings.
         // This is the common, server-owned last gate for direct adapters.
         if (dispatchRuntimeKind === "legacy" && issueId) {
+          const [currentIssueGovernance] = await db.select({ sensorGovernedAt: issues.sensorGovernedAt })
+            .from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1);
           const [sensorDocument] = await db
             .select({ id: issueDocuments.id })
             .from(issueDocuments)
@@ -22589,12 +22601,42 @@ export function heartbeatService(
           // merely because its link has been detached since enqueue. The
           // server-generated runner profile is persisted across claims/restart.
           const queuedGovernance = parseObject(run.runnerProfileJson).sensorGovernance;
-          if (sensorDocument || queuedGovernance != null) {
+          if (sensorDocument || queuedGovernance != null || currentIssueGovernance?.sensorGovernedAt != null) {
             throw new SensorAdmissionDeniedError(
               "binding_conflict",
               "governed issue requires a verified direct Sensor admission binding; legacy adapter dispatch is not authorized",
             );
           }
+        }
+        // Only the two governed direct adapters enter the commit-first, one-use
+        // legacy admission protocol. Native DB3 retains its existing gate.
+        if (dispatchRuntimeKind === "legacy" && issueId &&
+            (agent.adapterType === "cline_local" || agent.adapterType === "agy_local")) {
+          const continuation = isResolvedInteractionContinuationWakeContext(context) ||
+            run.scheduledRetryReason === "native_safe_replacement";
+          if (continuation) {
+            await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+            await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+          }
+          const admission = await runDispatch.claimLegacyDirectDispatch({
+            companyId: run.companyId, issueId, runId: run.id, agentId: agent.id,
+            ownerBootId: legacyControllerBootId, attemptId: randomUUID(),
+            checkContinuationStaleness: continuation,
+          });
+          if (admission.outcome === "governed") {
+            throw new SensorAdmissionDeniedError(
+              "binding_conflict",
+              "durable issue Sensor governance blocks unverified direct adapter dispatch",
+            );
+          }
+          if (admission.outcome !== "claimed_new") {
+            // Stale/cancelled ownership is NOT a Sensor denial. Duplicate or
+            // indeterminate COMMIT can never be converted into a second call.
+            logger.warn({ runId: run.id, admission },
+              "legacy direct provider handoff suppressed; no confirmed new claim");
+            return { dispatched: false };
+          }
+          return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
         if (
           !issueId ||
@@ -24187,6 +24229,9 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'sensorGovernance'
                 then jsonb_build_object('sensorGovernance', ${heartbeatRuns.runnerProfileJson}->'sensorGovernance')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'sensorDirectDispatchClaim'
+                then jsonb_build_object('sensorDirectDispatchClaim', ${heartbeatRuns.runnerProfileJson}->'sensorDirectDispatchClaim')
                 else '{}'::jsonb end)
               || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
@@ -26614,7 +26659,7 @@ export function heartbeatService(
         now: new Date(),
         // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
-        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
+        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source) || hasLegacyDirectDispatchClaim(source),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
       const completed = await getRun(run.id);
