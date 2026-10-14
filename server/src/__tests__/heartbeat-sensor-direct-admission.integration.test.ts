@@ -29,6 +29,7 @@ import {
   unregisterServerAdapter,
 } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { documentService } from "../services/documents.js";
 import {
   SENSOR_ADMISSION_DOCUMENT_KEY,
   SENSOR_ADMISSION_CONTEXT_KEY,
@@ -346,6 +347,109 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         .from(issues).where(eq(issues.id, f.issueId));
       expect(current?.status).toBe("blocked");
       expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(0);
+    },
+  );
+
+  it.each(ADAPTERS)(
+    "RED: queued governed %s remains denied after its Sensor document is detached",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "malformed");
+      // Force a genuine queued run: the first no-document run holds this
+      // agent's only execution slot while the governed run is enqueued.
+      await db.update(agents)
+        .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+        .where(eq(agents.id, f.agentId));
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerIssueId,
+        companyId: f.companyId,
+        title: "P04 disposable queue blocker (no Sensor document)",
+        assigneeAgentId: f.agentId,
+        status: "in_progress",
+      });
+
+      let releaseBlocker: (() => void) | undefined;
+      const holdBlocker = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const spyResult = {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider,
+        model: "spy-only",
+        summary: "Safe fake legacy execution",
+      } as const;
+      execute.mockImplementationOnce(async () => {
+        await holdBlocker;
+        return spyResult;
+      });
+      execute.mockResolvedValue(spyResult);
+
+      let governedRunId: string | null = null;
+      try {
+        const blocker = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: blockerIssueId, taskKey: blockerIssueId, skipIssueComment: true },
+          "manual",
+        );
+        expect(blocker).not.toBeNull();
+        // A bounded poll avoids relying on arbitrary sleeps or an assumed
+        // scheduling order. The spy holds the real first run in-flight.
+        for (let i = 0; i < 100 && execute.mock.calls.length === 0; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+        expect(execute.mock.calls.length).toBe(1);
+
+        const queued = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true },
+          "manual",
+        );
+        expect(queued).not.toBeNull();
+        governedRunId = queued!.id;
+        expect((await heartbeat.getRun(governedRunId))?.status).toBe("queued");
+        const [linkedBeforeDetach] = await db
+          .select({ key: issueDocuments.key })
+          .from(issueDocuments)
+          .where(and(
+            eq(issueDocuments.companyId, f.companyId),
+            eq(issueDocuments.issueId, f.issueId),
+            eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+          ));
+        expect(linkedBeforeDetach?.key).toBe(SENSOR_ADMISSION_DOCUMENT_KEY);
+
+        // Use the actual service path, not a synthetic change to the run:
+        // Board-style document deletion removes the current link. A queued
+        // Sensor run must not thereby become an unrestricted legacy run.
+        const removed = await documentService(db)
+          .deleteIssueDocument(f.issueId, SENSOR_ADMISSION_DOCUMENT_KEY);
+        expect(removed?.key).toBe(SENSOR_ADMISSION_DOCUMENT_KEY);
+        const [linkedAfterDetach] = await db
+          .select({ id: issueDocuments.id })
+          .from(issueDocuments)
+          .where(and(
+            eq(issueDocuments.companyId, f.companyId),
+            eq(issueDocuments.issueId, f.issueId),
+            eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+          ));
+        expect(linkedAfterDetach).toBeUndefined();
+      } finally {
+        // Never strand the first safe spy even if a queue assertion fails.
+        releaseBlocker?.();
+      }
+
+      expect(governedRunId).not.toBeNull();
+      const run = await waitForTerminalRun(governedRunId!);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === governedRunId)).toHaveLength(0);
+      expect(run.status).toBe("failed");
+      expect(run.errorCode).toBe("sensor_admission_denied");
+      expect(run.scheduledRetryAt).toBeNull();
+      const successors = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, governedRunId!));
+      expect(successors).toHaveLength(0);
     },
   );
 
