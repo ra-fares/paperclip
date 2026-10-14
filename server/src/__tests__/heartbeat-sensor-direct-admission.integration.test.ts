@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   afterAll,
@@ -307,6 +307,23 @@ async function verifyQueuedDocumentTransition(
   const successors = await db.select({ id: heartbeatRuns.id })
     .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, queuedId!));
   expect(successors).toHaveLength(0);
+}
+
+
+/** Prove a real PostgreSQL backend is waiting for an issue row lock, not just that two promises exist. */
+async function waitForPostgresLock(label: string) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const [observed] = await db.select({
+      waiters: sql<number>`count(*)::int`,
+    }).from(sql`pg_stat_activity`).where(sql`
+      application_name = ${label}
+      AND wait_event_type = 'Lock'
+      AND cardinality(pg_blocking_pids(pid)) > 0
+    `);
+    if ((observed?.waiters ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  throw new Error(`P04 expected PostgreSQL lock wait not observed: ${label}`);
 }
 
 describe("P04 direct-adapter governed admission — disposable real PostgreSQL", () => {
@@ -622,4 +639,66 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         .toBe("direct-legacy-no-document");
     },
   );
+  it("BATCH RACE: opposite import issue orders wait for the same first lock and both commit without deadlock", async () => {
+    assertIsolatedTestDatabase(testUrl);
+    const companyId = randomUUID();
+    const issueA = randomUUID(), issueB = randomUUID();
+    const [first, second] = [issueA, issueB].sort();
+    await db.insert(companies).values({
+      id: companyId, name: "P04 reversed parallel batch import",
+      issuePrefix: "PB" + companyId.replace(/-/g, "").slice(0, 8),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: first, companyId, title: "P04 import first" },
+      { id: second, companyId, title: "P04 import second" },
+    ]);
+
+    let announceLock!: () => void;
+    const lockHeld = new Promise<void>((resolve) => { announceLock = resolve; });
+    let releaseLock!: () => void;
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const held = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues)
+        .where(eq(issues.id, first)).for("update");
+      announceLock();
+      await release;
+    });
+    await lockHeld;
+
+    const nameA = "p04-import-asc-" + randomUUID().slice(0, 8);
+    const nameB = "p04-import-desc-" + randomUUID().slice(0, 8);
+    const forward = documentService(createDb(testUrl, { applicationName: nameA }));
+    const reverse = documentService(createDb(testUrl, { applicationName: nameB }));
+    const row = (issueId: string, key: string) => ({
+      companyId, issueId, key, title: "P04 batch lock order",
+      format: "markdown", body: "P04 disposable document",
+      createdByAgentId: null, createdByUserId: null,
+      createdByRunId: null, sourceTrust: null,
+    });
+    const pendingA = forward.createIssueDocumentsForImport([
+      row(first, "sensor-admission"), row(second, "p04-ordinary-a"),
+    ]);
+    const pendingB = reverse.createIssueDocumentsForImport([
+      row(second, "sensor-admission"), row(first, "p04-ordinary-b"),
+    ]);
+
+    try {
+      await Promise.all([waitForPostgresLock(nameA), waitForPostgresLock(nameB)]);
+    } finally {
+      releaseLock();
+      await held;
+    }
+    // The full transactions must settle; a deadlock is a test failure, never dispatch authority.
+    await Promise.all([pendingA, pendingB]);
+    const stamped = await db.select({ id: issues.id, governedAt: issues.sensorGovernedAt })
+      .from(issues).where(eq(issues.companyId, companyId));
+    expect(stamped.filter((item) =>
+      [first, second].includes(item.id) && item.governedAt !== null,
+    )).toHaveLength(2);
+    const linked = await db.select({ issueId: issueDocuments.issueId, key: issueDocuments.key })
+      .from(issueDocuments).where(eq(issueDocuments.companyId, companyId));
+    expect(linked).toHaveLength(4);
+  }, 20_000);
+
 });
