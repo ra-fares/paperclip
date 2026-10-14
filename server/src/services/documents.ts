@@ -611,10 +611,6 @@ export function documentService(db: Db) {
     }) => {
       const key = normalizeDocumentKey(input.key);
       return db.transaction(async (tx) => {
-        const owner = await tx.select({ companyId: issues.companyId }).from(issues)
-          .where(eq(issues.id, issueId)).then(rows => rows[0] ?? null);
-        if (!owner) return null;
-        await lockIssueDocumentIssues(tx as unknown as Db, [{ companyId: owner.companyId, issueId }]);
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
@@ -809,6 +805,10 @@ export function documentService(db: Db) {
     deleteIssueDocument: async (issueId: string, rawKey: string) => {
       const key = normalizeDocumentKey(rawKey);
       return db.transaction(async (tx) => {
+        const owner = await tx.select({ companyId: issues.companyId }).from(issues)
+          .where(eq(issues.id, issueId)).then(rows => rows[0] ?? null);
+        if (!owner) return null;
+        await lockIssueDocumentIssues(tx as unknown as Db, [{ companyId: owner.companyId, issueId }]);
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
