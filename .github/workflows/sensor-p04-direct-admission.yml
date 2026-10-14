@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - ci/T-P04-DIRECT-ADMISSION-01
+      - ci/T-P04-DIRECT-ADMISSION-DETACH-RED
     paths:
       - .github/workflows/sensor-p04-direct-admission.yml
       - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
@@ -16,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   direct-db-test:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01'
+    if: github.repository == 'ra-fares/paperclip' && (github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-DETACH-RED')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
