@@ -758,18 +758,19 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
     20_000,
   );
 
+
   it.each(ADAPTERS)(
-    "RACE enqueue->attach: %s queued run commits first, then document-service waits for issue lock before dispatch",
+    "RACE enqueue->attach: %s queued transaction commits before waiting document writer, then dispatch denies",
     async (adapterType, provider) => {
       assertIsolatedTestDatabase(testUrl);
       execute.mockReset();
       const f = await createFixture(adapterType, "none");
-      await db.update(agents)
-        .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
         .where(eq(agents.id, f.agentId));
       const blockerIssueId = randomUUID();
       await db.insert(issues).values({
-        id: blockerIssueId, companyId: f.companyId, title: "P04 held safe spy",
+        id: blockerIssueId, companyId: f.companyId,
+        title: "P04 held safe spy before gated enqueue",
         assigneeAgentId: f.agentId, status: "in_progress",
       });
       let unblockAdapter!: () => void;
@@ -780,8 +781,11 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       } as const;
       execute.mockImplementationOnce(async () => { await adapterGate; return success; });
       execute.mockResolvedValue(success);
-      let unlockIssue!: () => void;
-      let blockingTx: Promise<unknown> | null = null;
+
+      let releaseQueueCommit!: () => void;
+      const queueCommitGate = new Promise<void>((resolve) => { releaseQueueCommit = resolve; });
+      let queuedInsideTransaction!: () => void;
+      const enqueuedPrecommit = new Promise<void>((resolve) => { queuedInsideTransaction = resolve; });
       try {
         const blocker = await heartbeat.invoke(
           f.agentId, "on_demand",
@@ -792,50 +796,67 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
           await new Promise((resolve) => setTimeout(resolve, 30));
         }
         expect(execute.mock.calls.length).toBe(1);
-        const pending = await heartbeat.invoke(
+
+        // Intercept ONLY the real queued-run transaction's after-write,
+        // before-COMMIT boundary. Its issue row lock remains held while the
+        // document service blocks behind it. No fake queue/DB transaction.
+        const source = createDb(testUrl, {
+          applicationName: "p04-enqueue-first-" + randomUUID().slice(0, 8),
+        });
+        const intercepted = Object.assign(Object.create(source) as Db, {
+          transaction: async (operation: (tx: Db) => Promise<unknown>) =>
+            source.transaction(async (tx) => {
+              const result = await operation(tx as unknown as Db);
+              const value = result as {
+                kind?: string; run?: { contextSnapshot?: Record<string, unknown> };
+              };
+              if (value?.kind === "queued" && value.run?.contextSnapshot?.issueId === f.issueId) {
+                queuedInsideTransaction();
+                await queueCommitGate;
+              }
+              return result;
+            }),
+        });
+        const gatedHeartbeat = heartbeatService(intercepted);
+        const pendingPromise = gatedHeartbeat.invoke(
           f.agentId, "on_demand",
           { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true }, "manual",
         );
-        expect(pending).not.toBeNull();
-        expect((await heartbeat.getRun(pending!.id))?.status).toBe("queued");
-
-        let locked!: () => void;
-        const lockHeld = new Promise<void>((resolve) => { locked = resolve; });
-        const releaseIssue = new Promise<void>((resolve) => { unlockIssue = resolve; });
-        blockingTx = db.transaction(async (tx) => {
-          await tx.select({ id: issues.id }).from(issues)
-            .where(eq(issues.id, f.issueId)).for("update");
-          locked();
-          await releaseIssue;
-        });
-        await lockHeld;
-        const name = "p04-doc-wait-" + randomUUID().slice(0, 8);
-        const service = documentService(createDb(testUrl, { applicationName: name }));
-        const attached = service.upsertIssueDocument({
+        await Promise.race([
+          enqueuedPrecommit,
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error("P04 queued transaction precommit gate not reached")), 5_000,
+          )),
+        ]);
+        const name = "p04-attach-after-enqueue-" + randomUUID().slice(0, 8);
+        const writer = documentService(createDb(testUrl, { applicationName: name }));
+        const attachedPromise = writer.upsertIssueDocument({
           issueId: f.issueId, key: SENSOR_ADMISSION_DOCUMENT_KEY,
           format: "markdown", body: "{}",
         });
         try {
+          // This explicitly proves attachment is blocked by the genuine
+          // not-yet-committed enqueue transaction (not by a third holder).
           await waitForPostgresLock(name);
         } finally {
-          unlockIssue();
-          await blockingTx;
-          blockingTx = null;
+          releaseQueueCommit();
         }
-        await attached;
+        const queued = await pendingPromise;
+        expect(queued).not.toBeNull();
+        await attachedPromise;
         unblockAdapter();
-        const run = await waitForTerminalRun(pending!.id);
+        const run = await waitForTerminalRun(queued!.id);
+        await drainHeartbeatRunsToQuiescence(db, gatedHeartbeat);
         await drainHeartbeatRunsToQuiescence(db, heartbeat);
-        expect(execute.mock.calls.filter(([ctx]) => ctx.runId === pending!.id)).toHaveLength(0);
+        expect(execute.mock.calls.filter(([ctx]) => ctx.runId === queued!.id)).toHaveLength(0);
         expect(run).toMatchObject({
           status: "failed", errorCode: "sensor_admission_denied", scheduledRetryAt: null,
         });
-        const replacements = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-          .where(eq(heartbeatRuns.retryOfRunId, pending!.id));
-        expect(replacements).toHaveLength(0);
+        const successors = await db.select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, queued!.id));
+        expect(successors).toHaveLength(0);
       } finally {
-        unlockIssue?.();
-        if (blockingTx) await blockingTx;
+        releaseQueueCommit();
         unblockAdapter();
       }
     },
