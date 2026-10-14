@@ -4,6 +4,7 @@ import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./age
 
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
+import { SENSOR_ADMISSION_DOCUMENT_KEY, SensorAdmissionDeniedError } from "./native-runtime/sensor-admission.js";
 import {
   withNativeWorkspaceFinalizationOwnership,
   NativeWorkspaceFinalizationBusyError,
@@ -845,6 +846,7 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "low_trust_requires_sandbox_environment",
   "low_trust_runtime_services_denied",
   "chat_failed_run_retry_not_authorized",
+  "sensor_admission_denied",
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
 ]);
 // Error codes that mark a pre-dispatch setup failure. The adapter process never
@@ -858,6 +860,7 @@ const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
 ]);
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
+  if (error instanceof SensorAdmissionDeniedError) return error.code;
   if (error instanceof ChatControlRecoveryUnresolvedError)
     return CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;
   if (
@@ -22557,6 +22560,27 @@ export function heartbeatService(
           }
           return { dispatched: false };
         }
+        // Fail closed for any Sensor-governed legacy dispatch until direct
+        // providers have independently verified, durable run/qualification/
+        // workspace/completion bindings. Do not synthesize native bindings.
+        // This is the common, server-owned last gate for direct adapters.
+        if (nativeRuntimeResolution.kind === "legacy" && issueId) {
+          const [sensorDocument] = await db
+            .select({ id: issueDocuments.id })
+            .from(issueDocuments)
+            .where(and(
+              eq(issueDocuments.companyId, run.companyId),
+              eq(issueDocuments.issueId, issueId),
+              eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+            ))
+            .limit(1);
+          if (sensorDocument) {
+            throw new SensorAdmissionDeniedError(
+              "binding_conflict",
+              "governed issue requires a verified direct Sensor admission binding; legacy adapter dispatch is not authorized",
+            );
+          }
+        }
         if (
           !issueId ||
           (!isResolvedInteractionContinuationWakeContext(context) &&
@@ -26012,16 +26036,18 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
-          await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-            livenessRun,
-            agent,
-          );
+          if (!(err instanceof SensorAdmissionDeniedError)) {
+            await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+              livenessRun,
+              agent,
+            );
+          }
           await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a
             // terminal failure, generic issue recovery must not create a
             // replacement retryOfRunId chain for the same provider work.
-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
+            suppressImmediateRecovery: nativeTerminalFailureCode !== null || err instanceof SensorAdmissionDeniedError,
           });
           await handleIssueReviewPathDisposition(livenessRun);
 

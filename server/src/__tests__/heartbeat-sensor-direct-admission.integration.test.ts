@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   afterAll,
   beforeAll,
@@ -66,7 +67,7 @@ async function waitForTerminalRun(runId: string) {
   throw new Error(`Heartbeat run ${runId} failed to reach a terminal state`);
 }
 
-async function createFixture(adapterType: string, withMalformedAdmission: boolean) {
+async function createFixture(adapterType: string, admission: "malformed" | "unqualified" | "none") {
   const companyId = randomUUID();
   const agentId = randomUUID();
   const issueId = randomUUID();
@@ -110,10 +111,25 @@ async function createFixture(adapterType: string, withMalformedAdmission: boolea
     status: "in_progress",
   });
 
-  if (withMalformedAdmission) {
+  if (admission !== "none") {
     const documentId = randomUUID();
     const revisionId = randomUUID();
-    const body = '{"schema":"sensor-admission.v1",INVALID_JSON';
+    const body = admission === "malformed"
+      ? '{"schema":"sensor-admission.v1",INVALID_JSON'
+      : JSON.stringify({
+          schema: "sensor-admission.v1",
+          issueId,
+          requiredCapabilities: ["code"],
+          workerQualification: {
+            agentId,
+            qualificationRevision: "unqualified-v1",
+            agentConfigRevisionId: randomUUID(), // deliberately absent
+            qualifiedCapabilities: ["code"],
+          },
+          scope: { allowedPaths: ["server/src/**"], forbiddenPaths: [".github/**"] },
+          workspace: { id: randomUUID(), baselineSha: "b".repeat(40) },
+          minimumRiskClass: "standard",
+        });
     await db.insert(documents).values({
       id: documentId,
       companyId,
@@ -190,8 +206,9 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         summary: "UNSAFE — direct adapter executed despite invalid sensor admission",
       });
 
-      const f = await createFixture(adapterType, true);
+      const f = await createFixture(adapterType, "malformed");
       const run = await runFixture(f.agentId, f.issueId);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
       const [stored] = await db.select({
         status: heartbeatRuns.status,
         errorCode: heartbeatRuns.errorCode,
@@ -220,6 +237,42 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       expect(stored?.processPid).toBeNull();
       expect((stored?.contextSnapshot ?? {})[SENSOR_ADMISSION_CONTEXT_KEY]).toBeUndefined();
       expect(events.some(event => event.eventType === "native.process_start_requested")).toBe(false);
+      const replacements = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, run.id));
+      expect(replacements).toHaveLength(0);
+    },
+  );
+
+  it.each(ADAPTERS)(
+    "DENY: valid-format but unqualified Sensor issue refuses direct %s",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      execute.mockResolvedValue({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider,
+        model: "spy-only",
+        summary: "UNSAFE governed direct execution",
+      });
+      const f = await createFixture(adapterType, "unqualified");
+      const run = await runFixture(f.agentId, f.issueId);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(0);
+      expect(run.status).toBe("failed");
+      const [stored] = await db.select({
+        errorCode: heartbeatRuns.errorCode,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(stored?.errorCode).toBe("sensor_admission_denied");
+      expect(stored?.scheduledRetryAt).toBeNull();
+      expect((stored?.contextSnapshot ?? {})[SENSOR_ADMISSION_CONTEXT_KEY]).toBeUndefined();
+      const replacements = await db.select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
+      expect(replacements).toHaveLength(0);
     },
   );
 
@@ -237,7 +290,7 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
         resultJson: { proof: "direct-legacy-no-document" },
       });
 
-      const f = await createFixture(adapterType, false);
+      const f = await createFixture(adapterType, "none");
       const run = await runFixture(f.agentId, f.issueId);
       expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run.id)).toHaveLength(1);
       expect(run).toMatchObject({
