@@ -896,4 +896,73 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
     20_000,
   );
 
+  it.each(ADAPTERS)(
+    "COALESCING: transient Sensor history survives another %s wake merged into the same queued run",
+    async (adapterType, provider) => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "none");
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+        .where(eq(agents.id, f.agentId));
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerIssueId, companyId: f.companyId,
+        title: "P04 coalescing held fake adapter", assigneeAgentId: f.agentId,
+        status: "in_progress",
+      });
+      let releaseBlocker!: () => void;
+      const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+      const success = {
+        exitCode: 0, signal: null, timedOut: false, provider, model: "spy-only",
+        summary: "P04 safe blocker",
+      } as const;
+      execute.mockImplementationOnce(async () => { await blockerGate; return success; });
+      execute.mockResolvedValue(success);
+      try {
+        const blocker = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: blockerIssueId, taskKey: blockerIssueId, skipIssueComment: true }, "manual",
+        );
+        expect(blocker).not.toBeNull();
+        for (let i = 0; i < 100 && execute.mock.calls.length === 0; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        expect(execute.mock.calls.length).toBe(1);
+        const queued = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true }, "manual",
+        );
+        expect(queued).not.toBeNull();
+        expect((await heartbeat.getRun(queued!.id))?.status).toBe("queued");
+        const svc = documentService(db);
+        await svc.upsertIssueDocument({
+          issueId: f.issueId, key: SENSOR_ADMISSION_DOCUMENT_KEY,
+          format: "markdown", body: "{}",
+        });
+        await svc.deleteIssueDocument(f.issueId, SENSOR_ADMISSION_DOCUMENT_KEY);
+        const [sticky] = await db.select({ at: issues.sensorGovernedAt })
+          .from(issues).where(eq(issues.id, f.issueId));
+        expect(sticky?.at).not.toBeNull();
+        const merged = await heartbeat.invoke(
+          f.agentId, "on_demand",
+          { issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true,
+            sensorGovernance: null }, "manual",
+        );
+        expect(merged?.id).toBe(queued!.id);
+        releaseBlocker();
+        const run = await waitForTerminalRun(queued!.id);
+        await drainHeartbeatRunsToQuiescence(db, heartbeat);
+        expect(execute.mock.calls.filter(([ctx]) => ctx.runId === queued!.id)).toHaveLength(0);
+        expect(run).toMatchObject({
+          status: "failed", errorCode: "sensor_admission_denied", scheduledRetryAt: null,
+        });
+        const successors = await db.select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, queued!.id));
+        expect(successors).toHaveLength(0);
+      } finally {
+        releaseBlocker();
+      }
+    },
+    25_000,
+  );
+
 });
