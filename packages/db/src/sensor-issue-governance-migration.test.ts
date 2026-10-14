@@ -88,10 +88,15 @@ if (process.env.P04_BACKFILL_SEED === "true") {
       const kinds = ["document", "trusted", "malformed", "wrong-company", "absent",
         "wrong-schema", "invalid-id"] as const;
       const ids = Object.fromEntries(kinds.map(kind => [kind, randomUUID()])) as Record<typeof kinds[number], string>;
-      await db.insert(issues).values(kinds.map(kind => ({
-        id: ids[kind], companyId, title: "P04_PREFILL:" + kind,
-        assigneeAgentId: agentId, status: "todo" as const,
-      })));
+      // This suite runs on 0292, while the compiled Drizzle schema already
+      // includes the 0293-only sensor_governed_at column. Use legacy SQL here.
+      for (const kind of kinds) {
+        await db.execute(sql`
+          INSERT INTO issues (id, company_id, title, assignee_agent_id, status)
+          VALUES (${ids[kind]}::uuid, ${companyId}::uuid, ${"P04_PREFILL:" + kind},
+                  ${agentId}::uuid, 'todo')
+        `);
+      }
       const documentId = randomUUID();
       await db.insert(documents).values({
         id: documentId, companyId, title: "P04 pre-0293 Sensor", latestBody: "{}",
