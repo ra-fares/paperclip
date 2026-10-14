@@ -54,6 +54,76 @@ async function attach(companyId: string, issueId: string, key = "sensor-admissio
   return documentId;
 }
 
+
+/**
+ * CI executes this suite against the REAL 0292 schema before applying 0293.
+ * The second invocation, with P04_BACKFILL_SEED unset, verifies historical rows.
+ * Never fabricate backfill by inserting test data after migration.
+ */
+if (process.env.P04_BACKFILL_SEED === "true") {
+  describe("P04 pre-0293 fixture seed (schema 0292 only)", () => {
+    afterAll(async () => { await closeRegisteredClients(url); });
+    it("seeds pre-existing Sensor link and run provenance plus invalid / foreign / absent witnesses", async () => {
+      const column = await db.execute(sql`
+        SELECT count(*)::int AS count FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'issues'
+          AND column_name = 'sensor_governed_at'
+      `);
+      expect(column[0]?.count).toBe(0);
+
+      const companyId = randomUUID(), foreignCompanyId = randomUUID();
+      const agentId = randomUUID(), foreignAgentId = randomUUID();
+      await db.insert(companies).values([
+        { id: companyId, name: "P04 pre-0293 historical company",
+          issuePrefix: "B" + companyId.slice(0, 8), requireBoardApprovalForNewAgents: false },
+        { id: foreignCompanyId, name: "P04 pre-0293 mismatched run company",
+          issuePrefix: "B" + foreignCompanyId.slice(0, 8), requireBoardApprovalForNewAgents: false },
+      ]);
+      await db.insert(agents).values([
+        { id: agentId, companyId, name: "P04 pre-0293 owner",
+          role: "engineer", adapterType: "cline_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+        { id: foreignAgentId, companyId: foreignCompanyId, name: "P04 pre-0293 foreign owner",
+          role: "engineer", adapterType: "agy_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      ]);
+      const kinds = ["document", "trusted", "malformed", "wrong-company", "absent",
+        "wrong-schema", "invalid-id"] as const;
+      const ids = Object.fromEntries(kinds.map(kind => [kind, randomUUID()])) as Record<typeof kinds[number], string>;
+      await db.insert(issues).values(kinds.map(kind => ({
+        id: ids[kind], companyId, title: "P04_PREFILL:" + kind,
+        assigneeAgentId: agentId, status: "todo" as const,
+      })));
+      const documentId = randomUUID();
+      await db.insert(documents).values({
+        id: documentId, companyId, title: "P04 pre-0293 Sensor", latestBody: "{}",
+      });
+      await db.insert(issueDocuments).values({
+        issueId: ids.document, companyId, documentId, key: "sensor-admission",
+      });
+      const provenance = (kind: string, issueId: unknown) =>
+        ({ sensorGovernance: { schema: kind, issueId } });
+      const run = (
+        company: string, agent: string, issueId: string,
+        runnerProfileJson: Record<string, unknown>,
+      ) => ({
+        id: randomUUID(), companyId: company, agentId: agent,
+        status: "failed" as const, runtimeMode: "legacy" as const,
+        runnerProfileJson, contextSnapshot: { issueId },
+      });
+      await db.insert(heartbeatRuns).values([
+        run(companyId, agentId, ids.trusted, provenance("sensor-governance.queued.v1", ids.trusted)),
+        run(companyId, agentId, ids.malformed, { sensorGovernance: { issueId: ["invalid"], schema: 3 } }),
+        run(foreignCompanyId, foreignAgentId, ids["wrong-company"],
+          provenance("sensor-governance.queued.v1", ids["wrong-company"])),
+        run(companyId, agentId, ids["wrong-schema"], provenance("invalid-schema.v1", ids["wrong-schema"])),
+        run(companyId, agentId, ids["invalid-id"],
+          provenance("sensor-governance.queued.v1", { bogus: ids["invalid-id"] })),
+      ]);
+      const stored = await db.select({ title: issues.title }).from(issues)
+        .where(sql`${issues.title} like 'P04_PREFILL:%'`);
+      expect(stored).toHaveLength(kinds.length);
+    });
+  });
+} else {
 describe("P04 durable Sensor issue-governance migration", () => {
   beforeAll(() => {
     if (!url) throw new Error("P04 DB URL required");
@@ -217,4 +287,25 @@ describe("P04 durable Sensor issue-governance migration", () => {
     expect(stored?.profile?.ordinary).toBe("permitted");
   });
 
+  it("BACKFILL on real pre-0293 rows recognizes current link and trusted run evidence, ignores invalid or foreign evidence", async () => {
+    const rows = await db.select({
+      title: issues.title, companyId: issues.companyId, marked: issues.sensorGovernedAt,
+    }).from(issues).where(sql`${issues.title} like 'P04_PREFILL:%'`);
+    const observed = new Map(rows.map(row => [row.title.replace("P04_PREFILL:", ""), row.marked]));
+    expect(observed.size).toBe(7); // Fails if the CI pre-migration seed never happened.
+    expect(observed.get("document")).toBeInstanceOf(Date);
+    expect(observed.get("trusted")).toBeInstanceOf(Date);
+    for (const name of ["malformed", "wrong-company", "absent", "wrong-schema", "invalid-id"]) {
+      expect(observed.has(name)).toBe(true);
+      expect(observed.get(name), name).toBeNull();
+    }
+    const applied = await db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM information_schema.columns WHERE table_name = 'issues'
+        AND column_name = 'sensor_governed_at'
+    `);
+    expect(applied[0]?.count).toBe(1);
+  });
+
 });
+}
