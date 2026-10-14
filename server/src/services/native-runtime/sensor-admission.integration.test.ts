@@ -13,6 +13,8 @@ import {
   documents,
   executionWorkspaces,
   heartbeatRuns,
+  heartbeatRunEvents,
+  nativeRunFinalizations,
   issueDocuments,
   issues,
   projects,
@@ -31,6 +33,7 @@ import {
   parseSensorAdmissionContract,
 } from "./sensor-admission.js";
 import { nativeSha256 } from "./canonical.js";
+import { executePaperclipNativeSession } from "./native-session-executor.js";
 
 // The DB is provisioned and migrated by a dedicated CI job, not by this test.
 // Fail closed: no silent embedded DB fallback and never use application DB.
@@ -274,4 +277,156 @@ describe("P04 native Sensor admission — real isolated PostgreSQL", () => {
     await expect(f.admit()).resolves.toEqual({ governed: false, pin: null });
     expect(await f.persistedPin()).toBeNull();
   });
+
+  // The next two checks must use the actual server entrypoint, NOT a callback
+  // provided by the test to executeNativeSession. No real provider is available.
+  async function prepareServerAdmissionFixture(f: Awaited<ReturnType<typeof makeFixture>>) {
+    await db.update(heartbeatRuns).set({
+      status: "running",
+      startedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({
+      runId: f.runId,
+      companyId: f.companyId,
+      issueId: f.issueId,
+      phase: "pending",
+      attempt: 0,
+    });
+  }
+
+  function serverExecutionInput(f: Awaited<ReturnType<typeof makeFixture>>): NativeExecutionInput {
+    return {
+      schema: "paperclip.native-execution-input.v1",
+      binding: f.binding,
+      task: {
+        identifier: "P04-DB3-SERVER",
+        title: "Server admission path",
+        description: null,
+        prompt: "No external provider permitted",
+        workMode: "standard",
+      },
+      workspace: { cwd: "/isolated", repoUrl: null, repoRef: null, branchName: null },
+      session: {
+        normalizedSessionId: randomUUID(),
+        driverKind: "codex_app_server",
+        protocolVersion: 1,
+      },
+      provider: { kind: "codex", model: null },
+      completionContract: {
+        id: f.completionId,
+        sha256: completionSha,
+        schemaVersion: "paperclip.completion-contract.v1",
+        contract: {
+          revision: "1",
+          objective: "Test admission without a provider",
+          criteria: [{ id: "objective", requirement: "No model may be started" }],
+        },
+      },
+      interactionResponses: [],
+      credentialBindings: [],
+    } as NativeExecutionInput;
+  }
+
+  async function serverRunEvidence(f: Awaited<ReturnType<typeof makeFixture>>) {
+    const [run] = await db.select({
+      status: heartbeatRuns.status,
+      errorCode: heartbeatRuns.errorCode,
+    }).from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [finalization] = await db.select({
+      phase: nativeRunFinalizations.phase,
+      failureCode: nativeRunFinalizations.failureCode,
+      nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
+    }).from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    const events = await db.select({
+      eventType: heartbeatRunEvents.eventType,
+    }).from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    return {
+      run,
+      finalization,
+      processStartRequested: events.filter(e => e.eventType === "native.process_start_requested").length,
+    };
+  }
+
+  function serverBackend(openSession: ReturnType<typeof vi.fn>): NativeSessionBackend {
+    return {
+      async descriptor() {
+        return {
+          kind: "mock", name: "p04-server-entrypoint-spy", version: "1",
+          capabilities: { sessions: true },
+        };
+      },
+      openSession,
+    } as unknown as NativeSessionBackend;
+  }
+
+  it("DB3-server DENY: stale qualification fails in server-created guard before provider launch", async () => {
+    const f = await makeFixture();
+    await prepareServerAdmissionFixture(f);
+    await db.update(agents).set({ adapterConfig: { changedAfterQualification: true } })
+      .where(eq(agents.id, f.agentId));
+
+    const openSession = vi.fn(async () => {
+      throw new Error("P04_BACKEND_MUST_NOT_OPEN");
+    });
+    const onSpawn = vi.fn(async () => {});
+    await expect(executePaperclipNativeSession({
+      db,
+      execution: serverExecutionInput(f),
+      runnerInstanceId: "p04-db3-server-deny",
+      useRunnerd: false,
+      backend: serverBackend(openSession),
+      onSpawn,
+    })).rejects.toMatchObject({
+      code: "sensor_admission_denied",
+      reason: "qualification_config_stale",
+    } satisfies Partial<SensorAdmissionDeniedError>);
+
+    expect(openSession).not.toHaveBeenCalled();
+    expect(onSpawn).not.toHaveBeenCalled();
+    expect(await f.persistedPin()).toBeNull();
+    const evidence = await serverRunEvidence(f);
+    expect(evidence.processStartRequested).toBe(0);
+    expect(evidence.run).toMatchObject({
+      status: "failed",
+      errorCode: "sensor_admission_denied",
+    });
+    expect(evidence.finalization).toMatchObject({
+      phase: "terminal_failure",
+      failureCode: "sensor_admission_denied",
+      nextAttemptAt: null,
+    });
+  });
+
+  it("DB3-server ALLOW control: committed pin and start-request event precede safe backend spy", async () => {
+    const f = await makeFixture();
+    await prepareServerAdmissionFixture(f);
+    let pinAtBackend: unknown = null;
+    let eventCountAtBackend = -1;
+    const openSession = vi.fn(async () => {
+      pinAtBackend = await f.persistedPin();
+      eventCountAtBackend = (await serverRunEvidence(f)).processStartRequested;
+      // Stop at provider boundary without starting any provider or model.
+      throw new Error("P04_TEST_BACKEND_BOUNDARY_REACHED");
+    });
+    const onSpawn = vi.fn(async () => {});
+    await expect(executePaperclipNativeSession({
+      db,
+      execution: serverExecutionInput(f),
+      runnerInstanceId: "p04-db3-server-allow",
+      useRunnerd: false,
+      backend: serverBackend(openSession),
+      onSpawn,
+    })).rejects.toThrow("P04_TEST_BACKEND_BOUNDARY_REACHED");
+
+    expect(openSession).toHaveBeenCalledTimes(1);
+    expect(onSpawn).not.toHaveBeenCalled();
+    expect(pinAtBackend).toMatchObject({
+      revisionId: f.revisionId,
+      workspaceId: f.workspaceId,
+      completionContractId: f.completionId,
+    });
+    expect(eventCountAtBackend).toBe(1);
+    expect(await f.persistedPin()).toEqual(pinAtBackend);
+  });
+
 });
