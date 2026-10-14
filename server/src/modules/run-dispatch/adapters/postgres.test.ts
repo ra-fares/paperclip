@@ -24,6 +24,7 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { documentService } from "../../../services/documents.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -67,6 +68,41 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   afterAll(async () => {
     await tempDb?.cleanup();
   });
+
+
+  /** An observed blocked PostgreSQL backend is mandatory evidence for these race tests. */
+  async function expectIssueLockWait(applicationName: string) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const [row] = await db.select({ count: sql<number>`count(*)::int` })
+        .from(sql`pg_stat_activity`)
+        .where(sql`application_name = ${applicationName}
+          AND wait_event_type = 'Lock'
+          AND cardinality(pg_blocking_pids(pid)) > 0`);
+      if ((row?.count ?? 0) > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`P04 issue-lock wait not observed for ${applicationName}`);
+  }
+
+  async function seedClaimableDirectRun(adapterType: "cline_local" | "agy_local") {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ adapterType }).where(eq(agents.id, agentId));
+    const issueId = randomUUID(), runId = randomUUID(), boot = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
+      controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 90_000),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    return {
+      companyId, issueId, agentId, runId, boot,
+      claimInput: {
+        companyId, issueId, agentId, runId, ownerBootId: boot,
+        attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
+      },
+    };
+  }
 
   async function seedCompanyAndAgent(): Promise<{ companyId: string; agentId: string }> {
     const companyId = randomUUID();
@@ -1035,5 +1071,112 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     expect(executeSpy).not.toHaveBeenCalled();
   });
+
+  it.each(["cline_local", "agy_local"] as const)(
+    "RACE attach->dispatch: %s claim waits for uncommitted Sensor attachment and is denied",
+    async (adapterType) => {
+      const f = await seedClaimableDirectRun(adapterType);
+      const docId = randomUUID();
+      let attached!: () => void;
+      const attachmentPrepared = new Promise<void>((resolve) => { attached = resolve; });
+      let commit!: () => void;
+      const commitAllowed = new Promise<void>((resolve) => { commit = resolve; });
+      const attachment = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues)
+          .where(eq(issues.id, f.issueId)).for("update");
+        await tx.insert(documents).values({
+          id: docId, companyId: f.companyId, title: "sensor-admission", latestBody: "{}",
+        });
+        await tx.insert(issueDocuments).values({
+          companyId: f.companyId, issueId: f.issueId, documentId: docId, key: "sensor-admission",
+        });
+        attached();
+        await commitAllowed;
+      });
+      await attachmentPrepared;
+
+      const label = "p04-claim-wait-" + randomUUID().slice(0, 8);
+      const contenderDb = createDb(tempDb!.connectionString, { applicationName: label });
+      const contender = createPostgresRunDispatchAdapter(contenderDb);
+      if (!contender.claimLegacyDirectDispatch) throw new Error("P04 direct claim missing");
+      const claimPromise = contender.claimLegacyDirectDispatch(f.claimInput);
+      try {
+        await expectIssueLockWait(label);
+      } finally {
+        commit();
+        await attachment;
+      }
+      const outcome = await claimPromise;
+      const adapterExecute = vi.fn();
+      if (outcome.outcome === "claimed_new") adapterExecute();
+      expect(outcome).toMatchObject({ outcome: "governed" });
+      expect(adapterExecute).not.toHaveBeenCalled();
+      const [issue] = await db.select({ at: issues.sensorGovernedAt })
+        .from(issues).where(eq(issues.id, f.issueId));
+      expect(issue?.at).not.toBeNull();
+      const [run] = await db.select({ profile: heartbeatRuns.runnerProfileJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run?.profile?.sensorDirectDispatchClaim).toBeUndefined();
+    },
+    20_000,
+  );
+
+  it.each(["cline_local", "agy_local"] as const)(
+    "RACE dispatch->attach: %s commit-first claim holds issue lock until commit; later attach never permits replay",
+    async (adapterType) => {
+      const f = await seedClaimableDirectRun(adapterType);
+      let claimWritten!: () => void;
+      const reachedPrecommit = new Promise<void>((resolve) => { claimWritten = resolve; });
+      let allowClaimCommit!: () => void;
+      const allowCommit = new Promise<void>((resolve) => { allowClaimCommit = resolve; });
+
+      // Inject a transaction barrier only AFTER the real claim CAS succeeded,
+      // while its issue/run row locks remain held. The adapter still runs its
+      // own transaction and must await a successful commit to return claimed_new.
+      const pausedDb = Object.assign(Object.create(db) as typeof db, {
+        transaction: async (operation: (tx: typeof db) => Promise<unknown>) =>
+          db.transaction(async (tx) => {
+            const result = await operation(tx as unknown as typeof db);
+            claimWritten();
+            await allowCommit;
+            return result;
+          }),
+      });
+      const claimer = createPostgresRunDispatchAdapter(pausedDb);
+      if (!claimer.claimLegacyDirectDispatch) throw new Error("P04 direct claim missing");
+      const claimed = claimer.claimLegacyDirectDispatch(f.claimInput);
+      await reachedPrecommit;
+
+      const label = "p04-attach-wait-" + randomUUID().slice(0, 8);
+      const writer = documentService(createDb(tempDb!.connectionString, { applicationName: label }));
+      const attached = writer.upsertIssueDocument({
+        issueId: f.issueId, key: "sensor-admission", format: "markdown", body: "{}",
+      });
+      try {
+        await expectIssueLockWait(label);
+      } finally {
+        allowClaimCommit();
+      }
+      const claimOutcome = await claimed;
+      expect(claimOutcome).toMatchObject({ outcome: "claimed_new" });
+      await attached;
+      const [issue] = await db.select({ at: issues.sensorGovernedAt })
+        .from(issues).where(eq(issues.id, f.issueId));
+      expect(issue?.at).not.toBeNull();
+
+      // Simulate crash after confirmed claim and before provider entry. A
+      // re-delivery or ownership change cannot authorize another adapter call.
+      const adapterExecute = vi.fn();
+      const current = createPostgresRunDispatchAdapter(db);
+      if (!current.claimLegacyDirectDispatch) throw new Error("P04 direct claim missing");
+      const duplicate = await current.claimLegacyDirectDispatch({
+        ...f.claimInput, attemptId: randomUUID(),
+      });
+      if (duplicate.outcome === "claimed_new") adapterExecute();
+      expect(duplicate.outcome).not.toBe("claimed_new");
+      expect(adapterExecute).not.toHaveBeenCalled();
+    },
+    20_000,
+  );
 
 });
