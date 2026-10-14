@@ -1,6 +1,6 @@
-# T-P04-DIRECT-ADMISSION-01: isolated RED proof, no real providers or models.
-# Expected first run: RED fails on guarded direct-adapter assertions.
-name: Sensor P04 direct admission RED
+# T-P04-DIRECT-ADMISSION-01: RED/GREEN CI, no real providers or models.
+# This runner verifies test-only spies and blocks provider/model execution.
+name: Sensor P04 direct admission DB
 on:
   push:
     branches:
@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/sensor-p04-direct-admission.yml
       - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
+      - server/src/services/heartbeat.ts
 permissions:
   contents: read
 concurrency:
@@ -73,7 +74,7 @@ jobs:
         run: pnpm --filter @paperclipai/server typecheck
       - name: Assert direct tests exist (never skip)
         run: test -s server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
-      - name: RED — governed direct denial + no-document legacy
+      - name: Verify governed direct denial + no-document legacy
         run: pnpm --dir server exec vitest run src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts --reporter=verbose
       - name: Check working tree integrity
         if: always()
