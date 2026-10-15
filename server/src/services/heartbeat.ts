@@ -22633,6 +22633,12 @@ export function heartbeatService(
               "durable issue Sensor governance blocks unverified direct adapter dispatch",
             );
           }
+          if (admission.outcome === "denied") {
+            throw new SensorAdmissionDeniedError(
+              admission.reason,
+              "direct adapter Sensor admission denied by server-verified locked DB sources",
+            );
+          }
           if (admission.outcome !== "claimed_new") {
             // The locked claim gate, not the earlier unprotected governance
             // observation, owns stale/cancelled/reassigned classification.
@@ -22656,6 +22662,12 @@ export function heartbeatService(
             logger.warn({ runId: run.id, admission },
               "legacy direct provider handoff suppressed; no confirmed new claim");
             return { dispatched: false };
+          }
+          // The direct pin is the acknowledged transaction's protected receipt
+          // projection. Never authorize by reading mutable pre-claim context.
+          if (admission.pin) {
+            context.sensorAdmission = admission.pin;
+            context.executionWorkspaceId = admission.pin.workspaceId;
           }
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
