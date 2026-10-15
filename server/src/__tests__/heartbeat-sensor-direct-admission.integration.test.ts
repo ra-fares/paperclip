@@ -1229,7 +1229,7 @@ async function makeGovernedDirectAllowFixture(adapterType: "cline_local" | "agy_
   const input = {
     companyId: base.companyId, issueId: base.issueId, runId,
     agentId: base.agentId, ownerBootId: boot, attemptId: randomUUID(),
-    checkContinuationStaleness: false, now: new Date(),
+    checkContinuationStaleness: false, expectedAdapterType: adapterType, now: new Date(),
   };
   const native = () => ensureNativeCompletionContract({
     db, companyId: base.companyId,
@@ -1320,6 +1320,28 @@ describe("P04 positive direct v2 admission — real PostgreSQL, no providers", (
       expect(after.claim).toEqual(state.claim);
     }, 30_000);
   }
+
+  it("rejects stale selected direct adapter type BEFORE committing a completion receipt", async () => {
+    execute.mockClear();
+    const f = await makeGovernedDirectAllowFixture("cline_local");
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const denied = await adapter.claimLegacyDirectDispatch!({
+      ...f.input, expectedAdapterType: "agy_local",
+    });
+    expect(denied).toMatchObject({
+      outcome: "denied", reason: "qualification_config_stale",
+    });
+    const [before] = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, f.runId));
+    expect(before?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
+    expect(before?.completionContractId).toBeNull();
+    const contractRows = await db.select().from(completionContracts)
+      .where(eq(completionContracts.issueId, f.issueId));
+    expect(contractRows).toHaveLength(0);
+    expect((await f.direct()).outcome).toBe("claimed_new");
+    await expectCommittedDirectPin(f);
+    expect(execute).not.toHaveBeenCalled();
+  }, 30_000);
 
   it("v2 protected receipt survives unrelated profile rewrites; column tampering never grants replay", async () => {
     execute.mockClear();
