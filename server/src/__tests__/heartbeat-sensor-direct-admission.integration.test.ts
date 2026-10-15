@@ -1306,6 +1306,14 @@ describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe 
     it(`real heartbeat ${adapterType} enters adapter.execute exactly once only after v2 COMMIT`, async () => {
       execute.mockReset();
       const f = await createFixture(adapterType, "none");
+      // A project is required for the production workspace persistence path;
+      // without one, the runner can fall back to an untracked agent directory
+      // and no durable executionWorkspaces row exists to pin.
+      const projectId = randomUUID();
+      await db.insert(projects).values({
+        id: projectId, companyId: f.companyId, name: "P04 safe heartbeat spy workspace",
+      });
+      await db.update(issues).set({ projectId }).where(eq(issues.id, f.issueId));
       const previousHeartbeat = heartbeat;
       const baselineSha = "d".repeat(40);
       let admissionHookCalls = 0;
