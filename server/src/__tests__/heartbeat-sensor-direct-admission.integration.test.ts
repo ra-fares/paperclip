@@ -1316,15 +1316,34 @@ describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe 
       await db.update(issues).set({ projectId }).where(eq(issues.id, f.issueId));
       const previousHeartbeat = heartbeat;
       const baselineSha = "d".repeat(40);
-      let admissionHookCalls = 0;
+      const admissionHookRunIds: string[] = [];
       execute.mockResolvedValue({
         exitCode: 0, signal: null, timedOut: false,
         provider, model: "spy-only", summary: "P04 safe v2 heartbeat ALLOW",
       });
       const prepared = heartbeatService(db, {
         beforeDirectSensorAdmissionCheck: async ({ runId, issueId }) => {
-          admissionHookCalls += 1;
           expect(issueId).toBe(f.issueId);
+          // Multiple independent heartbeat runs may reach this test seam.
+          // A second pre-claim entry for the SAME run would violate the
+          // at-most-once boundary and must remain a test failure.
+          if (admissionHookRunIds.includes(runId)) {
+            throw new Error(`P04 direct pre-claim hook replay for run ${runId}`);
+          }
+          admissionHookRunIds.push(runId);
+          if (admissionHookRunIds.length > 1) {
+            // This is an additional run, not another dispatch of the first
+            // run. The trusted document belongs to the issue and persists;
+            // never attempt a duplicate issue_documents insert.
+            const [existing] = await db.select({ documentId: issueDocuments.documentId })
+              .from(issueDocuments).where(and(
+                eq(issueDocuments.companyId, f.companyId),
+                eq(issueDocuments.issueId, issueId),
+                eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+              ));
+            expect(existing?.documentId).toBeTruthy();
+            return;
+          }
           // The production heartbeat must have already provisioned, bound and
           // persisted the SAME workspace in both locked source references.
           // The test only supplies Sensor document and canonical baseline
@@ -1392,7 +1411,9 @@ describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe 
       try {
         const run = await runFixture(f.agentId, f.issueId);
         await drainHeartbeatRunsToQuiescence(db, prepared);
-        expect(admissionHookCalls).toBe(1);
+        // Observe the exact run under test instead of counting separate
+        // heartbeat runs; require a single hook entry for this run.
+        expect(admissionHookRunIds.filter((id) => id === run.id)).toEqual([run.id]);
         const hits = execute.mock.calls.filter(([context]) => context.runId === run.id);
         expect(hits).toHaveLength(1);
         const [persisted] = await db.select().from(heartbeatRuns)
