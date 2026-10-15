@@ -21,7 +21,6 @@ jobs:
     env:
       CI: 'true'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
-      PAPERCLIP_HOME: ${{ runner.temp }}/paperclip-p04-int2-first-red
       NO_COLOR: '1'
     steps:
       - name: Checkout exact test candidate
@@ -32,7 +31,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/p04-int2-evidence" "$PAPERCLIP_HOME"
+          mkdir -p "$RUNNER_TEMP/p04-int2-evidence" "$RUNNER_TEMP/paperclip-p04-int2-first-red"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/paperclip-p04-int2-first-red" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git merge-base --is-ancestor 237db6500b4f913271453a4070cb6a6e3f2779db HEAD
           git diff --name-only 237db6500b4f913271453a4070cb6a6e3f2779db HEAD > "$RUNNER_TEMP/p04-int2-evidence/changed-files.txt"
