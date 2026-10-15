@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { verifySensorAdmissionInTx } from "../sensor-admission-verifier.js";
 
 import {
   SensorAdmissionDeniedError,
@@ -151,5 +152,50 @@ describe("sensor admission contract", () => {
         },
       }),
     ).toThrowError(/scope_invalid/);
+  });
+});
+
+describe("shared Sensor verifier — native/direct parity without transaction ownership", () => {
+  const trusted = {
+    issueId: state.issueId, agentId: state.agentId,
+    documentId: "document-1", revisionId: "revision-1",
+    documentBody: JSON.stringify(contract),
+    workspaceId: state.workspaceId, baselineSha: state.baselineSha,
+    completionContractId: "completion-1",
+    completionContractSha256: "a".repeat(64),
+    completionRisk: "standard", qualificationConfigMatches: true,
+  };
+  const existingTx = {} as Parameters<typeof verifySensorAdmissionInTx>[0];
+
+  it("native shared validator returns the same document and qualification pin", async () => {
+    const result = await verifySensorAdmissionInTx(existingTx, trusted, {
+      mode: "native", sourceLockPolicy: "native-existing",
+    });
+    expect(result.contract).toEqual(contract);
+    expect(result.pin).toMatchObject({
+      schema: "sensor-admission.pin.v1",
+      documentId: trusted.documentId, revisionId: trusted.revisionId,
+      agentConfigRevisionId: contract.workerQualification.agentConfigRevisionId,
+      workspaceId: trusted.workspaceId, baselineSha: trusted.baselineSha,
+      completionContractId: trusted.completionContractId,
+      completionContractSha256: trusted.completionContractSha256,
+    });
+  });
+
+  it("direct and native shared paths produce identical qualification failure", async () => {
+    for (const mode of ["native", "direct"] as const) {
+      await expect(verifySensorAdmissionInTx(existingTx, {
+        ...trusted, qualificationConfigMatches: false,
+      }, { mode, sourceLockPolicy: mode === "direct" ? "direct-locked" : "native-existing" }))
+        .rejects.toMatchObject({
+          code: "sensor_admission_denied", reason: "qualification_config_stale",
+        });
+    }
+  });
+
+  it("never confuses direct locks with native transaction lock policy", async () => {
+    await expect(verifySensorAdmissionInTx(existingTx, trusted, {
+      mode: "direct", sourceLockPolicy: "native-existing",
+    })).rejects.toMatchObject({ reason: "binding_conflict" });
   });
 });
