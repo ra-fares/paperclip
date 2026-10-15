@@ -107,6 +107,7 @@ export async function ensureDirectCompletionContractInAdmissionTx(
  * On any failure no receipt is written and the adapter is not entered. */
 export async function verifyGovernedDirectAdmissionInTx(
   tx: Db, issue: DirectIssue, run: DirectRun,
+  expectedAdapterType: "cline_local" | "agy_local" | undefined,
 ): Promise<{ pin: SensorAdmissionPin; completion: typeof completionContracts.$inferSelect }> {
   if (issue.companyId !== run.companyId || issue.assigneeAgentId !== run.agentId ||
       issue.executionRunId !== run.id || issue.executionWorkspaceId == null) {
@@ -155,6 +156,10 @@ export async function verifyGovernedDirectAdmissionInTx(
   )).for("update").limit(1);
   if (!agent || (agent.adapterType !== "cline_local" && agent.adapterType !== "agy_local")) {
     throw new SensorAdmissionDeniedError("qualification_missing", "direct adapter/agent not eligible");
+  }
+  // Do not launch a previously selected adapter after DB agent type changes.
+  if (!expectedAdapterType || agent.adapterType !== expectedAdapterType) {
+    throw new SensorAdmissionDeniedError("qualification_config_stale", "selected direct adapter changed before admission");
   }
   const [config] = await tx.select().from(agentConfigRevisions).where(and(
     eq(agentConfigRevisions.id, contract.workerQualification.agentConfigRevisionId),
