@@ -21,7 +21,7 @@ jobs:
     env:
       CI: 'true'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
-      PAPERCLIP_HOME: \${{ runner.temp }}/paperclip-p04-int2-first-red
+      PAPERCLIP_HOME: ${{ runner.temp }}/paperclip-p04-int2-first-red
       NO_COLOR: '1'
     steps:
       - name: Checkout exact test candidate
@@ -131,7 +131,7 @@ jobs:
           path: |
             int2-preflight.json
             int2-red.json
-            \${{ runner.temp }}/p04-int2-evidence/*
+            ${{ runner.temp }}/p04-int2-evidence/*
       - name: Check worktree unchanged
         if: always()
         run: git diff --exit-code
