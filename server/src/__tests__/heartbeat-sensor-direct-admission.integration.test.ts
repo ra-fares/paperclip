@@ -1258,6 +1258,22 @@ async function observedLockWaiters(minimum: number) {
   throw new Error(`P04 expected >=${minimum} PostgreSQL lock waiters were not observed`);
 }
 
+/** The second contender must wait on the actual PostgreSQL advisory lock,
+ * not merely on a relation/tuple lock acquired elsewhere. */
+async function observedCompletionAdvisoryWait() {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    const [row] = await db.select({
+      holders: sql<number>`count(*) filter (where granted)::int`,
+      waiters: sql<number>`count(*) filter (where not granted)::int`,
+    }).from(sql`pg_locks`)
+      .where(sql`locktype = 'advisory'
+        AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`);
+    if ((row?.holders ?? 0) >= 1 && (row?.waiters ?? 0) >= 1) return row;
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+  }
+  throw new Error("P04 native/direct completion advisory holder + waiter not observed");
+}
+
 async function expectCommittedDirectPin(f: Awaited<ReturnType<typeof makeGovernedDirectAllowFixture>>) {
   const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
   const claim = (run?.runnerProfileJson ?? {}).sensorDirectDispatchClaim as
@@ -1333,6 +1349,9 @@ describe("P04 positive direct v2 admission — real PostgreSQL, no providers", (
         if (first === "native") directPromise = f.direct();
         else nativePromise = f.native();
         await observedLockWaiters(2);
+        const advisory = await observedCompletionAdvisoryWait();
+        expect(advisory.holders).toBeGreaterThanOrEqual(1);
+        expect(advisory.waiters).toBeGreaterThanOrEqual(1);
       } finally {
         release();
         await blocker;
