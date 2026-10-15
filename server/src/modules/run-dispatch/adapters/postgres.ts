@@ -1145,7 +1145,7 @@ export function createPostgresRunDispatchAdapter(
           }
         }
         const verified = governed
-          ? await verifyGovernedDirectAdmissionInTx(tx, issue, run)
+          ? await verifyGovernedDirectAdmissionInTx(tx, issue, run, input.expectedAdapterType)
           : null;
         const receipt = verified ? {
           schema: "sensor-direct-dispatch-claim.v2",
