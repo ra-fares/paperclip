@@ -9331,6 +9331,13 @@ export interface HeartbeatServiceOptions {
     runId: string;
     issueId: string;
   }) => Promise<void>;
+  /** Test-only seam at the last pre-claim direct gate, before any claim locks.
+   * Allows a disposable DB fixture to attach authoritative Sensor inputs after
+   * workspace provisioning, without mocking/entering a provider. */
+  beforeDirectSensorAdmissionCheck?: (input: {
+    runId: string;
+    issueId: string;
+  }) => Promise<void>;
   /** Test seam for racing an issue mutation immediately before the final dispatch gate. */
   afterResolvedInteractionContinuationDispatchCheck?: (input: {
     runId: string;
@@ -22622,6 +22629,7 @@ export function heartbeatService(
             await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
             await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
           }
+          await options.beforeDirectSensorAdmissionCheck?.({ runId: run.id, issueId });
           const admission = await runDispatch.claimLegacyDirectDispatch({
             companyId: run.companyId, issueId, runId: run.id, agentId: agent.id,
             ownerBootId: legacyControllerBootId, attemptId: randomUUID(),
