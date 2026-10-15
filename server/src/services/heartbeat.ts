@@ -4,7 +4,7 @@ import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./age
 
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
-import { SENSOR_ADMISSION_DOCUMENT_KEY, SensorAdmissionDeniedError } from "./native-runtime/sensor-admission.js";
+import { SENSOR_ADMISSION_DOCUMENT_KEY, SensorAdmissionDeniedError, type SensorAdmissionPin } from "./native-runtime/sensor-admission.js";
 import {
   withNativeWorkspaceFinalizationOwnership,
   NativeWorkspaceFinalizationBusyError,
@@ -22555,7 +22555,7 @@ export function heartbeatService(
         );
       }
       const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
-        dispatch: (markDispatchStarted: () => void) => Promise<T>,
+        dispatch: (markDispatchStarted: () => void, admittedDirectPin?: SensorAdmissionPin) => Promise<T>,
         dispatchRuntimeKind: "native" | "legacy",
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
@@ -22678,7 +22678,10 @@ export function heartbeatService(
             context.sensorAdmission = admission.pin;
             context.executionWorkspaceId = admission.pin.workspaceId;
           }
-          return { dispatched: true, resultPromise: dispatch(() => {}) };
+          // adapterContext is captured BEFORE the final admission gate.
+          // Pass ONLY the server-verified, acknowledged-commit pin into the
+          // invocation; mutable caller context is never dispatch authority.
+          return { dispatched: true, resultPromise: dispatch(() => {}, admission.pin) };
         }
         if (
           !issueId ||
@@ -24832,7 +24835,13 @@ export function heartbeatService(
             }
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
-                (markDispatchStarted) => {
+                (markDispatchStarted, admittedDirectPin) => {
+                  // This pin comes only from a confirmed v2 claim, not the
+                  // caller's pre-claim context or a mutable run column.
+                  if (admittedDirectPin) {
+                    adapterContext.sensorAdmission = admittedDirectPin;
+                    adapterContext.executionWorkspaceId = admittedDirectPin.workspaceId;
+                  }
                   legacyAdapterEntered = true;
                   return adapter.execute({
                     runId: run.id,
