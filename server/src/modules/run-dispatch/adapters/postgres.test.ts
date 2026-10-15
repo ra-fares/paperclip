@@ -985,7 +985,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       companyId, issueId, agentId, runId, ownerBootId: boot,
       attemptId: randomUUID(), checkContinuationStaleness: false, now: new Date(),
     };
-    expect(await adapter.claimLegacyDirectDispatch(params)).toMatchObject({ outcome: "governed" });
+    expect(await adapter.claimLegacyDirectDispatch(params)).toMatchObject({ outcome: "denied", reason: "binding_conflict" });
     await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
     expect(await adapter.claimLegacyDirectDispatch({ ...params, attemptId: randomUUID() }))
       .toMatchObject({ outcome: "stale", errorCode: "issue_execution_lock_changed" });
@@ -1109,7 +1109,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       const outcome = await claimPromise;
       const adapterExecute = vi.fn();
       if (outcome.outcome === "claimed_new") adapterExecute();
-      expect(outcome).toMatchObject({ outcome: "governed" });
+      expect(outcome).toMatchObject({ outcome: "denied", reason: "binding_conflict" });
       expect(adapterExecute).not.toHaveBeenCalled();
       const [issue] = await db.select({ at: issues.sensorGovernedAt })
         .from(issues).where(eq(issues.id, f.issueId));
