@@ -926,14 +926,14 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       expect(sweep.dispatchRequeued).toBe(0);
       expect(sweep.continuationRequeued).toBe(0);
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
-      const issueRuns = await db.select({
+      // The fixture owns an entire unique company. Query ALL its run rows,
+      // not only retry children or context.issueId: even an orphan replacement
+      // with no retryOfRunId, taskId or nativeIssueId must be detected.
+      const companyRuns = await db.select({
         id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId,
-      }).from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, f.companyId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,
-      ));
-      expect(issueRuns.map((run) => run.id)).toEqual([runId]);
-      expect(issueRuns.some((run) => run.retryOfRunId === runId)).toBe(false);
+      }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+      expect(companyRuns.map((run) => run.id)).toEqual([runId]);
+      expect(companyRuns.some((run) => run.retryOfRunId === runId)).toBe(false);
       // Include every invocation in this isolated test, including unlinked
       // replacement runs or unexpected invocations for another runId.
       expect(execute).not.toHaveBeenCalled();
