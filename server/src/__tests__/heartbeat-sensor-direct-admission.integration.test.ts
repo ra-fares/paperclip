@@ -1454,6 +1454,145 @@ describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe 
         await settings.updateExperimental({ enableIsolatedWorkspaces: previousIsolated });
       }
     }, 30_000);
+
+    it(`real heartbeat ${adapterType} DENIES prepared config A after DB qualified config B`, async () => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "none");
+      // A project is required for the production workspace persistence path;
+      // without one, the runner can fall back to an untracked agent directory
+      // and no durable executionWorkspaces row exists to pin.
+      const projectId = randomUUID();
+      await db.insert(projects).values({
+        id: projectId, companyId: f.companyId, name: "P04 safe heartbeat spy workspace",
+      });
+      await db.update(issues).set({ projectId }).where(eq(issues.id, f.issueId));
+      const previousHeartbeat = heartbeat;
+      const baselineSha = "d".repeat(40);
+      const admissionHookRunIds: string[] = [];
+      execute.mockResolvedValue({
+        exitCode: 0, signal: null, timedOut: false,
+        provider, model: "spy-only", summary: "P04 safe v2 heartbeat ALLOW",
+      });
+      const prepared = heartbeatService(db, {
+        beforeDirectSensorAdmissionCheck: async ({ runId, issueId }) => {
+          expect(issueId).toBe(f.issueId);
+          // Multiple independent heartbeat runs may reach this test seam.
+          // A second pre-claim entry for the SAME run would violate the
+          // at-most-once boundary and must remain a test failure.
+          if (admissionHookRunIds.includes(runId)) {
+            throw new Error(`P04 direct pre-claim hook replay for run ${runId}`);
+          }
+          admissionHookRunIds.push(runId);
+          if (admissionHookRunIds.length > 1) {
+            // This is an additional run, not another dispatch of the first
+            // run. The trusted document belongs to the issue and persists;
+            // never attempt a duplicate issue_documents insert.
+            const [existing] = await db.select({ documentId: issueDocuments.documentId })
+              .from(issueDocuments).where(and(
+                eq(issueDocuments.companyId, f.companyId),
+                eq(issueDocuments.issueId, issueId),
+                eq(issueDocuments.key, SENSOR_ADMISSION_DOCUMENT_KEY),
+              ));
+            expect(existing?.documentId).toBeTruthy();
+            return;
+          }
+          // The production heartbeat must have already provisioned, bound and
+          // persisted the SAME workspace in both locked source references.
+          // The test only supplies Sensor document and canonical baseline
+          // metadata; it does NOT fabricate native session/run provenance.
+          const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          const workspaceId = issue?.executionWorkspaceId;
+          expect(workspaceId).toBeTruthy();
+          expect(run?.contextSnapshot?.executionWorkspaceId).toBe(workspaceId);
+          const [workspace] = await db.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspaceId!));
+          expect(workspace?.status).toBe("active");
+          await db.update(executionWorkspaces).set({
+            metadata: {
+              ...(workspace?.metadata ?? {}),
+              baseRefSnapshot: { resolvedSha: baselineSha },
+            },
+          }).where(eq(executionWorkspaces.id, workspaceId!));
+          const [agent] = await db.select().from(agents)
+            .where(eq(agents.id, f.agentId));
+          expect(agent?.adapterType).toBe(adapterType);
+          // Heartbeat already selected and prepared configuration A.
+          // Change DB to B and pin its qualifying config before the last gate.
+          // A matching adapter type alone must not authorize execution of A.
+          const changedAdapterConfig = { ...agent!.adapterConfig, p04PreparedConfigRace: "B" };
+          await db.update(agents).set({ adapterConfig: changedAdapterConfig })
+            .where(eq(agents.id, f.agentId));
+          const configRevisionId = randomUUID();
+          await db.insert(agentConfigRevisions).values({
+            id: configRevisionId, agentId: f.agentId, companyId: f.companyId,
+            beforeConfig: {},
+            afterConfig: {
+              capabilities: agent!.capabilities,
+              adapterType: agent!.adapterType,
+              adapterConfig: changedAdapterConfig,
+              runtimeConfig: agent!.runtimeConfig,
+              defaultEnvironmentId: agent!.defaultEnvironmentId,
+            },
+          });
+          const documentId = randomUUID(), revisionId = randomUUID();
+          const body = JSON.stringify({
+            schema: "sensor-admission.v1", issueId: f.issueId,
+            requiredCapabilities: ["code"],
+            workerQualification: {
+              agentId: f.agentId,
+              qualificationRevision: "positive-hb-v1",
+              agentConfigRevisionId: configRevisionId,
+              qualifiedCapabilities: ["code"],
+            },
+            scope: { allowedPaths: ["server/src/**"], forbiddenPaths: [".github/**"] },
+            workspace: { id: workspaceId, baselineSha },
+            minimumRiskClass: "low",
+          });
+          await db.insert(documents).values({
+            id: documentId, companyId: f.companyId, title: "sensor-admission",
+            latestBody: body,
+          });
+          await db.insert(documentRevisions).values({
+            id: revisionId, companyId: f.companyId, documentId,
+            revisionNumber: 1, body,
+          });
+          await db.update(documents).set({ latestRevisionId: revisionId })
+            .where(eq(documents.id, documentId));
+          await db.insert(issueDocuments).values({
+            issueId: f.issueId, companyId: f.companyId, documentId,
+            key: SENSOR_ADMISSION_DOCUMENT_KEY,
+          });
+        },
+      });
+      // issuesSvc.update strips executionWorkspaceId when the existing
+      // isolated-workspaces feature gate is off. Test the supported
+      // opt-in production binding path, never a fabricated SQL binding.
+      const settings = instanceSettingsService(db);
+      const previousIsolated = (await settings.getExperimental()).enableIsolatedWorkspaces;
+      await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+      heartbeat = prepared;
+      try {
+        const run = await runFixture(f.agentId, f.issueId);
+        await drainHeartbeatRunsToQuiescence(db, prepared);
+        // Observe the exact run under test instead of counting separate
+        // heartbeat runs; require a single hook entry for this run.
+        expect(admissionHookRunIds.filter((id) => id === run.id)).toEqual([run.id]);
+        const hits = execute.mock.calls.filter(([context]) => context.runId === run.id);
+        expect(hits).toHaveLength(0);
+        const [persisted] = await db.select().from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id));
+        expect(persisted?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
+        expect(persisted?.completionContractId).toBeNull();
+        const contracts = await db.select().from(completionContracts)
+          .where(eq(completionContracts.issueId, f.issueId));
+        expect(contracts).toHaveLength(0);
+      } finally {
+        await drainHeartbeatRunsToQuiescence(db, prepared);
+        heartbeat = previousHeartbeat;
+        await settings.updateExperimental({ enableIsolatedWorkspaces: previousIsolated });
+      }
+    }, 30_000);
   }
 });
 
@@ -1497,6 +1636,181 @@ describe("P04 positive direct v2 admission — real PostgreSQL, no providers", (
     expect(contractRows).toHaveLength(0);
     expect((await f.direct()).outcome).toBe("claimed_new");
     await expectCommittedDirectPin(f);
+    expect(execute).not.toHaveBeenCalled();
+  }, 30_000);
+
+
+  for (const adapterType of ["cline_local", "agy_local"] as const) {
+    it(`prepared ${adapterType} config A is denied after committed qualified B transition`, async () => {
+      execute.mockClear();
+      const f = await makeGovernedDirectAllowFixture(adapterType);
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      const configB = { ...agent!.adapterConfig, qualifiedNewConfig: "B" };
+      const configBRevisionId = randomUUID();
+      // Serialize a real multi-row update ahead of direct's issue lock.
+      // No positive claim may invoke the previously prepared configuration A.
+      let release!: () => void, signal!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { signal = resolve; });
+      const change = db.transaction(async (tx) => {
+        await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+        signal();
+        await gate;
+        await tx.update(agents).set({ adapterConfig: configB }).where(eq(agents.id, f.agentId));
+        await tx.insert(agentConfigRevisions).values({
+          id: configBRevisionId, companyId: f.companyId, agentId: f.agentId,
+          beforeConfig: {},
+          afterConfig: {
+            capabilities: agent!.capabilities, adapterType,
+            adapterConfig: configB, runtimeConfig: agent!.runtimeConfig,
+            defaultEnvironmentId: agent!.defaultEnvironmentId,
+          },
+        });
+        const [old] = await tx.select().from(documentRevisions).where(eq(documentRevisions.id, f.revisionId));
+        const next = JSON.parse(old!.body);
+        next.workerQualification.agentConfigRevisionId = configBRevisionId;
+        next.workerQualification.qualificationRevision = "qualified-B";
+        const body = JSON.stringify(next), revisionId = randomUUID();
+        await tx.insert(documentRevisions).values({
+          id: revisionId, companyId: f.companyId, documentId: f.documentId,
+          revisionNumber: 2, body,
+        });
+        await tx.update(documents).set({
+          latestRevisionId: revisionId, latestRevisionNumber: 2, latestBody: body,
+        }).where(eq(documents.id, f.documentId));
+      });
+      await ready;
+      const pending = f.direct();
+      try {
+        await observedLockWaiters(1);
+      } finally {
+        release();
+        await change;
+      }
+      expect(await pending).toMatchObject({ outcome: "denied", reason: "qualification_config_stale" });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
+      expect(run?.completionContractId).toBeNull();
+      const rows = await db.select().from(completionContracts).where(eq(completionContracts.issueId, f.issueId));
+      expect(rows).toHaveLength(0);
+      // A fresh, separately prepared B can still pass; this does NOT replay A.
+      const [fresh] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      const preparedB = executionConfigFingerprintFromAgent(fresh!);
+      expect((await createPostgresRunDispatchAdapter(db).claimLegacyDirectDispatch!({
+        ...f.input, expectedExecutionConfigFingerprint: preparedB,
+      })).outcome).toBe("claimed_new");
+      await expectCommittedDirectPin(f, (await db.select().from(documents)
+        .where(eq(documents.id, f.documentId)))[0]!.latestRevisionId!);
+      expect(execute).not.toHaveBeenCalled();
+    }, 30_000);
+  }
+
+  for (const bound of [false, true] as const) {
+    it(`rejects corrupted persisted completion JSON with unchanged stored hash (${bound ? "bound" : "latest"})`, async () => {
+      execute.mockClear();
+      const f = await makeGovernedDirectAllowFixture("cline_local");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      const seeded = await ensureNativeCompletionContract({
+        db, companyId: f.companyId,
+        issue: { id: f.issueId, title: issue!.title,
+          description: issue!.description, reviewPolicy: issue!.reviewPolicy },
+        actorId: f.agentId,
+      });
+      if (bound) {
+        await db.update(heartbeatRuns).set({
+          completionContractId: seeded.row.id,
+          completionContractSha256: seeded.row.canonicalSha256,
+        }).where(eq(heartbeatRuns.id, f.runId));
+      }
+      // Keep canonicalSha256 unchanged on purpose. The actual JSON must be verified.
+      await db.update(completionContracts).set({
+        contractJson: { revision: "1", objective: "FORGED", criteria: [] },
+      }).where(eq(completionContracts.id, seeded.row.id));
+      expect(await f.direct()).toMatchObject({
+        outcome: "denied", reason: "completion_contract_mismatch",
+      });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
+      expect(run?.completionContractId).toBe(bound ? seeded.row.id : null);
+      const rows = await db.select().from(completionContracts).where(eq(completionContracts.issueId, f.issueId));
+      expect(rows).toHaveLength(1);
+      expect(execute).not.toHaveBeenCalled();
+    }, 30_000);
+  }
+
+  it("workspace baseline mutation committed before admission yields DENY and no v2 pin", async () => {
+    execute.mockClear();
+    const f = await makeGovernedDirectAllowFixture("cline_local");
+    let release!: () => void, signal!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { signal = resolve; });
+    const change = db.transaction(async (tx) => {
+      await tx.select().from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, f.workspaceId)).for("update");
+      signal();
+      await gate;
+      await tx.update(executionWorkspaces).set({
+        metadata: { baseRefSnapshot: { resolvedSha: "f".repeat(40) } },
+      }).where(eq(executionWorkspaces.id, f.workspaceId));
+    });
+    await ready;
+    const pending = f.direct();
+    try { await observedLockWaiters(1); }
+    finally { release(); await change; }
+    expect(await pending).toMatchObject({ outcome: "denied", reason: "baseline_mismatch" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
+    expect(run?.completionContractId).toBeNull();
+    expect(execute).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("issue brief update committed before claim is the sole completion objective", async () => {
+    execute.mockClear();
+    const f = await makeGovernedDirectAllowFixture("cline_local");
+    const newBrief = "P04 authoritative issue description after serialized issue update";
+    let release!: () => void, signal!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { signal = resolve; });
+    const change = db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      signal();
+      await gate;
+      await tx.update(issues).set({ description: newBrief }).where(eq(issues.id, f.issueId));
+    });
+    await ready;
+    const pending = f.direct();
+    try { await observedLockWaiters(1); }
+    finally { release(); await change; }
+    expect((await pending).outcome).toBe("claimed_new");
+    const committed = await expectCommittedDirectPin(f);
+    const [stored] = committed.rows.filter((row) => row.id === committed.run?.completionContractId);
+    const json = stored?.contractJson as { criteria?: { requirement: string }[] } | null;
+    expect(json?.criteria?.[0]?.requirement).toBe(newBrief);
+    expect(execute).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("v2 lost COMMIT acknowledgement is indeterminate and cannot grant replay", async () => {
+    execute.mockClear();
+    const f = await makeGovernedDirectAllowFixture("cline_local");
+    // Test-only wrapper: delegate actual transaction to disposable PostgreSQL;
+    // deliberately throw AFTER successful transaction resolution (COMMIT).
+    const lostAck = new Proxy(db, {
+      get(target, property) {
+        if (property === "transaction") {
+          return async (operation: Parameters<Db["transaction"]>[0]) => {
+            await target.transaction(operation);
+            throw new Error("test_simulated_lost_commit_ack");
+          };
+        }
+        return Reflect.get(target, property, target);
+      },
+    });
+    const ambiguous = await createPostgresRunDispatchAdapter(lostAck)
+      .claimLegacyDirectDispatch!(f.input);
+    expect(ambiguous).toEqual({ outcome: "indeterminate" });
+    // The receipt exists but may NOT be treated as a recovered dispatch permit.
+    await expectCommittedDirectPin(f);
+    expect((await f.direct()).outcome).toBe("duplicate");
     expect(execute).not.toHaveBeenCalled();
   }, 30_000);
 
