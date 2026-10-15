@@ -1321,6 +1321,34 @@ describe("P04 positive direct v2 admission — real PostgreSQL, no providers", (
     }, 30_000);
   }
 
+  it("v2 protected receipt survives unrelated profile rewrites; column tampering never grants replay", async () => {
+    execute.mockClear();
+    const f = await makeGovernedDirectAllowFixture("cline_local");
+    const admitted = await f.direct();
+    expect(admitted.outcome).toBe("claimed_new");
+    const before = await expectCommittedDirectPin(f);
+    const profile = before.run!.runnerProfileJson ?? {};
+    await expect(db.update(heartbeatRuns).set({
+      runnerProfileJson: { ...profile, sensorDirectDispatchClaim: { forged: true } },
+    }).where(eq(heartbeatRuns.id, f.runId))).rejects.toThrow();
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { ...profile, independentMarker: "allowed" },
+    }).where(eq(heartbeatRuns.id, f.runId));
+    const [safe] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(safe?.runnerProfileJson?.sensorDirectDispatchClaim).toEqual(before.claim);
+    // The protected v2 receipt is the sole frozen authority. Mutable run
+    // columns/context are not sufficient to reconstruct or replay it.
+    await db.update(heartbeatRuns).set({
+      completionContractSha256: "f".repeat(64),
+      contextSnapshot: { issueId: f.issueId, executionWorkspaceId: f.workspaceId },
+    }).where(eq(heartbeatRuns.id, f.runId));
+    expect((await f.direct()).outcome).toBe("duplicate");
+    const [tampered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(tampered?.runnerProfileJson?.sensorDirectDispatchClaim).toEqual(before.claim);
+    expect(tampered?.completionContractSha256).not.toEqual(before.claim?.completionContractSha256);
+    expect(execute).not.toHaveBeenCalled();
+  }, 30_000);
+
   for (const first of ["native", "direct"] as const) {
     it(`native allocator ↔ direct v2 completion revision: ${first} obtains advisory first`, async () => {
       execute.mockClear();
