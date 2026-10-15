@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 10 # include prepared 237db parent through isolated workflow commits
       - name: Verify SHA, ancestry and workflow-only diff
         shell: bash
         run: |
