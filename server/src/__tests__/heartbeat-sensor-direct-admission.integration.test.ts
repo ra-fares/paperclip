@@ -1300,6 +1300,121 @@ async function expectCommittedDirectPin(f: Awaited<ReturnType<typeof makeGoverne
   return { run, claim, pin, rows };
 }
 
+
+describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe spies only", () => {
+  for (const [adapterType, provider] of ADAPTERS) {
+    it(`real heartbeat ${adapterType} enters adapter.execute exactly once only after v2 COMMIT`, async () => {
+      execute.mockReset();
+      const f = await createFixture(adapterType, "none");
+      const previousHeartbeat = heartbeat;
+      const baselineSha = "d".repeat(40);
+      let admissionHookCalls = 0;
+      execute.mockResolvedValue({
+        exitCode: 0, signal: null, timedOut: false,
+        provider, model: "spy-only", summary: "P04 safe v2 heartbeat ALLOW",
+      });
+      const prepared = heartbeatService(db, {
+        beforeDirectSensorAdmissionCheck: async ({ runId, issueId }) => {
+          admissionHookCalls += 1;
+          expect(issueId).toBe(f.issueId);
+          // The production heartbeat must have already provisioned, bound and
+          // persisted the SAME workspace in both locked source references.
+          // The test only supplies Sensor document and canonical baseline
+          // metadata; it does NOT fabricate native session/run provenance.
+          const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          const workspaceId = issue?.executionWorkspaceId;
+          expect(workspaceId).toBeTruthy();
+          expect(run?.contextSnapshot?.executionWorkspaceId).toBe(workspaceId);
+          const [workspace] = await db.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspaceId!));
+          expect(workspace?.status).toBe("active");
+          await db.update(executionWorkspaces).set({
+            metadata: {
+              ...(workspace?.metadata ?? {}),
+              baseRefSnapshot: { resolvedSha: baselineSha },
+            },
+          }).where(eq(executionWorkspaces.id, workspaceId!));
+          const [agent] = await db.select().from(agents)
+            .where(eq(agents.id, f.agentId));
+          expect(agent?.adapterType).toBe(adapterType);
+          const configRevisionId = randomUUID();
+          await db.insert(agentConfigRevisions).values({
+            id: configRevisionId, agentId: f.agentId, companyId: f.companyId,
+            beforeConfig: {},
+            afterConfig: {
+              capabilities: agent!.capabilities,
+              adapterType: agent!.adapterType,
+              adapterConfig: agent!.adapterConfig,
+              runtimeConfig: agent!.runtimeConfig,
+              defaultEnvironmentId: agent!.defaultEnvironmentId,
+            },
+          });
+          const documentId = randomUUID(), revisionId = randomUUID();
+          const body = JSON.stringify({
+            schema: "sensor-admission.v1", issueId: f.issueId,
+            requiredCapabilities: ["code"],
+            workerQualification: {
+              agentId: f.agentId,
+              qualificationRevision: "positive-hb-v1",
+              agentConfigRevisionId: configRevisionId,
+              qualifiedCapabilities: ["code"],
+            },
+            scope: { allowedPaths: ["server/src/**"], forbiddenPaths: [".github/**"] },
+            workspace: { id: workspaceId, baselineSha },
+            minimumRiskClass: "low",
+          });
+          await db.insert(documents).values({
+            id: documentId, companyId: f.companyId, title: "sensor-admission",
+            latestBody: body,
+          });
+          await db.insert(documentRevisions).values({
+            id: revisionId, companyId: f.companyId, documentId,
+            revisionNumber: 1, body,
+          });
+          await db.update(documents).set({ latestRevisionId: revisionId })
+            .where(eq(documents.id, documentId));
+          await db.insert(issueDocuments).values({
+            issueId: f.issueId, companyId: f.companyId, documentId,
+            key: SENSOR_ADMISSION_DOCUMENT_KEY,
+          });
+        },
+      });
+      heartbeat = prepared;
+      try {
+        const run = await runFixture(f.agentId, f.issueId);
+        await drainHeartbeatRunsToQuiescence(db, prepared);
+        expect(admissionHookCalls).toBe(1);
+        const hits = execute.mock.calls.filter(([context]) => context.runId === run.id);
+        expect(hits).toHaveLength(1);
+        const [persisted] = await db.select().from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, run.id));
+        const claim = persisted?.runnerProfileJson?.sensorDirectDispatchClaim as
+          Record<string, unknown> | undefined;
+        expect(claim?.schema).toBe("sensor-direct-dispatch-claim.v2");
+        expect(claim?.completionContractId).toBe(persisted?.completionContractId);
+        expect(claim?.completionContractSha256).toBe(persisted?.completionContractSha256);
+        expect(hits[0]?.[0]?.context?.sensorAdmission).toEqual(claim?.sensorAdmission);
+        const [completion] = await db.select().from(completionContracts)
+          .where(eq(completionContracts.id, persisted!.completionContractId!));
+        expect(completion?.canonicalSha256).toBe(claim?.completionContractSha256);
+        const replay = await createPostgresRunDispatchAdapter(db).claimLegacyDirectDispatch!({
+          companyId: f.companyId, issueId: f.issueId,
+          runId: run.id, agentId: f.agentId,
+          ownerBootId: persisted!.controllerBootId ?? randomUUID(),
+          attemptId: randomUUID(), checkContinuationStaleness: false,
+          expectedAdapterType: adapterType, now: new Date(),
+        });
+        expect(replay.outcome).not.toBe("claimed_new");
+        expect(execute.mock.calls.filter(([context]) => context.runId === run.id)).toHaveLength(1);
+      } finally {
+        await drainHeartbeatRunsToQuiescence(db, prepared);
+        heartbeat = previousHeartbeat;
+      }
+    }, 30_000);
+  }
+});
+
 describe("P04 positive direct v2 admission — real PostgreSQL, no providers", () => {
   for (const [adapterType] of ADAPTERS) {
     it(`governed ${adapterType} commits exactly one direct v2 completion pin and never replays`, async () => {
