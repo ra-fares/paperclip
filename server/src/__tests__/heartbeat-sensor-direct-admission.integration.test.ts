@@ -1275,7 +1275,7 @@ async function observedCompletionAdvisoryWait() {
   throw new Error("P04 native/direct completion advisory holder + waiter not observed");
 }
 
-async function expectCommittedDirectPin(f: Awaited<ReturnType<typeof makeGovernedDirectAllowFixture>>) {
+async function expectCommittedDirectPin(f: Awaited<ReturnType<typeof makeGovernedDirectAllowFixture>>, expectedRevisionId = f.revisionId) {
   const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
   const claim = (run?.runnerProfileJson ?? {}).sensorDirectDispatchClaim as
     Record<string, unknown> | undefined;
@@ -1286,7 +1286,7 @@ async function expectCommittedDirectPin(f: Awaited<ReturnType<typeof makeGoverne
   expect(pin?.schema).toBe("sensor-admission.pin.v1");
   expect(pin?.workspaceId).toBe(f.workspaceId);
   expect(pin?.documentId).toBe(f.documentId);
-  expect(pin?.revisionId).toBe(f.revisionId);
+  expect(pin?.revisionId).toBe(expectedRevisionId);
   expect(pin?.completionContractId).toBe(run?.completionContractId);
   expect(pin?.completionContractSha256).toBe(run?.completionContractSha256);
   expect(run?.contextSnapshot?.sensorAdmission).toEqual(pin);
@@ -1598,7 +1598,7 @@ describe("P04 positive direct v2 admission — real PostgreSQL, no providers", (
         expect(beforeRetry?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
         expect((await f.direct()).outcome).toBe("claimed_new");
       }
-      const committed = await expectCommittedDirectPin(f);
+      const committed = await expectCommittedDirectPin(f, restored.document.latestRevisionId);
       expect(committed.pin?.revisionId).toBe(restored.document.latestRevisionId);
       expect(execute).not.toHaveBeenCalled();
     }, 30_000);
