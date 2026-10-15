@@ -2,6 +2,8 @@ import { hasConversationContinuationPolicy } from "../../../services/conversatio
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { SensorAdmissionDeniedError } from "../../../services/sensor-admission-verifier.js";
+import { verifyGovernedDirectAdmissionInTx } from "../../../services/sensor-direct-admission.js";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -194,6 +196,7 @@ export function createPostgresRunDispatchAdapter(
     input: { runId: string; companyId: string },
     onMissing: () => T,
     operation: (tx: Db, run: HeartbeatRun) => Promise<T>,
+    options?: { beforeIssueLock?: (tx: Db, hintedIssueId: string | null) => Promise<void> },
   ): Promise<T> {
     // Queue editing and claiming already use issue -> wake -> run. Read the
     // immutable issue reference without a lock first, then acquire issue ->
@@ -211,6 +214,9 @@ export function createPostgresRunDispatchAdapter(
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } =
         await db.transaction(async (tx) => {
           const typedTx = tx as unknown as Db;
+          // Only the governed direct claim supplies this hook: completion
+          // advisory must precede issues FOR UPDATE to avoid native FK deadlock.
+          await options?.beforeIssueLock?.(typedTx, hintedIssueId);
           if (hintedIssueId) {
             await typedTx
               .select({ id: issues.id })
@@ -1102,13 +1108,7 @@ export function createPostgresRunDispatchAdapter(
             run.controllerLeaseExpiresAt.getTime() <= Date.now()) {
           return { outcome: "stale", errorCode: "legacy_controller_ownership_changed" };
         }
-        const [issue] = await tx.select({
-          companyId: issues.companyId,
-          sensorGovernedAt: issues.sensorGovernedAt,
-          executionRunId: issues.executionRunId,
-          assigneeAgentId: issues.assigneeAgentId,
-          status: issues.status,
-        }).from(issues).where(and(
+        const [issue] = await tx.select().from(issues).where(and(
           eq(issues.id, input.issueId),
           eq(issues.companyId, input.companyId),
         )).limit(1);
@@ -1134,9 +1134,7 @@ export function createPostgresRunDispatchAdapter(
             eq(issueDocuments.issueId, input.issueId),
             eq(issueDocuments.key, "sensor-admission"),
           )).limit(1);
-        if (issue.sensorGovernedAt != null || sensorLink || profile.sensorGovernance != null) {
-          return { outcome: "governed" };
-        }
+        const governed = issue.sensorGovernedAt != null || Boolean(sensorLink) || profile.sensorGovernance != null;
         if (Object.prototype.hasOwnProperty.call(profile, "sensorDirectDispatchClaim")) {
           return { outcome: "duplicate" };
         }
@@ -1146,7 +1144,20 @@ export function createPostgresRunDispatchAdapter(
             return { outcome: "stale", errorCode: decision.errorCode };
           }
         }
-        const receipt = {
+        const verified = governed
+          ? await verifyGovernedDirectAdmissionInTx(tx, issue, run)
+          : null;
+        const receipt = verified ? {
+          schema: "sensor-direct-dispatch-claim.v2",
+          runId: run.id,
+          issueId: input.issueId,
+          attemptId: input.attemptId,
+          ownerBootId: input.ownerBootId,
+          claimedAt: input.now.toISOString(),
+          completionContractId: verified.completion.id,
+          completionContractSha256: verified.completion.canonicalSha256,
+          sensorAdmission: verified.pin,
+        } : {
           schema: "sensor-direct-dispatch-claim.v1",
           runId: run.id,
           issueId: input.issueId,
@@ -1155,6 +1166,14 @@ export function createPostgresRunDispatchAdapter(
           claimedAt: input.now.toISOString(),
         };
         const [claimed] = await tx.update(heartbeatRuns).set({
+          ...(verified ? {
+            completionContractId: verified.completion.id,
+            completionContractSha256: verified.completion.canonicalSha256,
+            contextSnapshot: {
+              ...parseObject(run.contextSnapshot),
+              sensorAdmission: verified.pin,
+            },
+          } : {}),
           runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
              then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end)
              || ${JSON.stringify({ sensorDirectDispatchClaim: receipt })}::jsonb`,
@@ -1168,11 +1187,26 @@ export function createPostgresRunDispatchAdapter(
           sql`NOT coalesce((jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
               AND ${heartbeatRuns.runnerProfileJson} ? 'sensorDirectDispatchClaim'), false)`,
         )).returning({ id: heartbeatRuns.id });
+        if (!claimed && verified) {
+          // Roll back a provisional completion revision if the v2 CAS fails.
+          throw new SensorAdmissionDeniedError("binding_conflict", "direct v2 claim CAS lost");
+        }
         return claimed
-          ? { outcome: "claimed_new" }
+          ? verified
+            ? { outcome: "claimed_new", pin: verified.pin }
+            : { outcome: "claimed_new" }
           : { outcome: "stale", errorCode: "legacy_direct_claim_race_lost" };
+      }, {
+        beforeIssueLock: async (tx, hintedIssueId) => {
+          if (!hintedIssueId || hintedIssueId !== input.issueId) return;
+          const key = ["paperclip:native-completion-contract", input.companyId, hintedIssueId].join(":");
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+        },
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof SensorAdmissionDeniedError) {
+        return { outcome: "denied", reason: error.reason };
+      }
       // A lost COMMIT acknowledgement might mean a claim committed. Never
       // re-read it to recover permission, and NEVER dispatch on this outcome.
       return { outcome: "indeterminate" };
