@@ -22634,8 +22634,25 @@ export function heartbeatService(
             );
           }
           if (admission.outcome !== "claimed_new") {
-            // Stale/cancelled ownership is NOT a Sensor denial. Duplicate or
-            // indeterminate COMMIT can never be converted into a second call.
+            // The locked claim gate, not the earlier unprotected governance
+            // observation, owns stale/cancelled/reassigned classification.
+            // Settle these recognizable issue transitions through the existing
+            // cancellation lifecycle: returning alone would strand a running
+            // heartbeat without the normal issue_cancelled / issue_reassigned
+            // reason and could leave it eligible for unrelated recovery.
+            // Never cancel here on changed controller boot/lease, ambiguous
+            // COMMIT or duplicate receipt: another controller/reconciliation
+            // authority may own that same run.
+            if (admission.outcome === "stale" &&
+                (admission.errorCode === "issue_cancelled" ||
+                 admission.errorCode === "issue_reassigned" ||
+                 admission.errorCode === "issue_terminal_status")) {
+              await cancelRunInternal(run.id, "Legacy direct admission suppressed: " + admission.errorCode, {
+                errorCode: admission.errorCode,
+                eventMessage: "direct adapter dispatch suppressed by current issue state",
+                suppressImmediateRecovery: true,
+              });
+            }
             logger.warn({ runId: run.id, admission },
               "legacy direct provider handoff suppressed; no confirmed new claim");
             return { dispatched: false };
