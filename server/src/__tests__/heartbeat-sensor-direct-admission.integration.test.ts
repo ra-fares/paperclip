@@ -11,18 +11,22 @@ import {
 } from "vitest";
 
 import {
+  agentConfigRevisions,
   agents,
   agentWakeupRequests,
   authUsers,
   closeRegisteredClients,
   companies,
+  completionContracts,
   createDb,
   documentRevisions,
   documents,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueDocuments,
   issues,
+  projects,
 } from "@paperclipai/db";
 import type { ServerAdapterModule } from "../adapters/index.js";
 import {
@@ -32,6 +36,7 @@ import {
 import { heartbeatService } from "../services/heartbeat.js";
 import { documentService } from "../services/documents.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { ensureNativeCompletionContract } from "../services/native-runtime/completion-contracts.js";
 import {
   SENSOR_ADMISSION_DOCUMENT_KEY,
   SENSOR_ADMISSION_CONTEXT_KEY,
@@ -1151,4 +1156,193 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
     20_000,
   );
 
+});
+
+
+/**
+ * Positive P04 admission is tested at the exact durable, commit-first gate.
+ * No real model/provider is registered or called by any of these DB cases.
+ */
+async function makeGovernedDirectAllowFixture(adapterType: "cline_local" | "agy_local") {
+  const base = await createFixture(adapterType, "none");
+  const projectId = randomUUID();
+  const workspaceId = randomUUID();
+  const runId = randomUUID();
+  const boot = randomUUID();
+  const configRevisionId = randomUUID();
+  const documentId = randomUUID();
+  const revisionId = randomUUID();
+  const baselineSha = "c".repeat(40);
+  const contextSnapshot = { issueId: base.issueId, executionWorkspaceId: workspaceId };
+  await db.insert(projects).values({
+    id: projectId, companyId: base.companyId, name: "P04 direct isolated test project",
+  });
+  await db.insert(executionWorkspaces).values({
+    id: workspaceId, companyId: base.companyId, projectId,
+    name: "P04 disposable native/direct race workspace", mode: "worktree",
+    strategyType: "isolated", metadata: { baseRefSnapshot: { resolvedSha: baselineSha } },
+  });
+  await db.insert(agentConfigRevisions).values({
+    id: configRevisionId, companyId: base.companyId, agentId: base.agentId,
+    beforeConfig: {},
+    afterConfig: {
+      capabilities: null, adapterType, adapterConfig: {}, runtimeConfig: {},
+      defaultEnvironmentId: null,
+    },
+  });
+  await db.insert(heartbeatRuns).values({
+    id: runId, companyId: base.companyId, agentId: base.agentId,
+    status: "running", runtimeMode: "legacy",
+    controllerBootId: boot,
+    controllerLeaseExpiresAt: new Date(Date.now() + 120_000),
+    contextSnapshot,
+  });
+  await db.update(issues).set({
+    executionRunId: runId, executionWorkspaceId: workspaceId,
+  }).where(eq(issues.id, base.issueId));
+  const sensor = {
+    schema: "sensor-admission.v1", issueId: base.issueId,
+    requiredCapabilities: ["code"],
+    workerQualification: {
+      agentId: base.agentId, qualificationRevision: "qualified-direct-test",
+      agentConfigRevisionId: configRevisionId, qualifiedCapabilities: ["code"],
+    },
+    scope: { allowedPaths: ["server/src/**"], forbiddenPaths: [".github/**"] },
+    workspace: { id: workspaceId, baselineSha },
+    minimumRiskClass: "low",
+  };
+  const body = JSON.stringify(sensor);
+  await db.insert(documents).values({
+    id: documentId, companyId: base.companyId,
+    title: "P04 governed direct admission", latestBody: body,
+  });
+  await db.insert(documentRevisions).values({
+    id: revisionId, documentId, companyId: base.companyId,
+    revisionNumber: 1, body,
+  });
+  await db.update(documents).set({ latestRevisionId: revisionId })
+    .where(eq(documents.id, documentId));
+  await db.insert(issueDocuments).values({
+    companyId: base.companyId, issueId: base.issueId,
+    documentId, key: SENSOR_ADMISSION_DOCUMENT_KEY,
+  });
+  const input = {
+    companyId: base.companyId, issueId: base.issueId, runId,
+    agentId: base.agentId, ownerBootId: boot, attemptId: randomUUID(),
+    checkContinuationStaleness: false, now: new Date(),
+  };
+  const native = () => ensureNativeCompletionContract({
+    db, companyId: base.companyId,
+    issue: {
+      id: base.issueId, title: "P04 governed direct launch fixture",
+      description: null, reviewPolicy: null,
+    },
+    actorId: base.agentId,
+    // A different server-defined criterion forces a new native revision.
+    immediateRequest: "Native revision from independent current user direction",
+  });
+  const direct = () => createPostgresRunDispatchAdapter(db).claimLegacyDirectDispatch!(input);
+  return { ...base, runId, workspaceId, boot, input, native, direct, documentId, revisionId };
+}
+
+async function observedLockWaiters(minimum: number) {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    const [row] = await db.select({ count: sql<number>`count(*)::int` })
+      .from(sql`pg_stat_activity`)
+      .where(sql`datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND query NOT LIKE '%pg_stat_activity%'`);
+    if ((row?.count ?? 0) >= minimum) return row!.count;
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+  }
+  throw new Error(`P04 expected >=${minimum} PostgreSQL lock waiters were not observed`);
+}
+
+async function expectCommittedDirectPin(f: Awaited<ReturnType<typeof makeGovernedDirectAllowFixture>>) {
+  const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+  const claim = (run?.runnerProfileJson ?? {}).sensorDirectDispatchClaim as
+    Record<string, unknown> | undefined;
+  expect(claim?.schema).toBe("sensor-direct-dispatch-claim.v2");
+  expect(claim?.completionContractId).toBe(run?.completionContractId);
+  expect(claim?.completionContractSha256).toBe(run?.completionContractSha256);
+  const pin = claim?.sensorAdmission as Record<string, unknown> | undefined;
+  expect(pin?.schema).toBe("sensor-admission.pin.v1");
+  expect(pin?.workspaceId).toBe(f.workspaceId);
+  expect(pin?.documentId).toBe(f.documentId);
+  expect(pin?.revisionId).toBe(f.revisionId);
+  expect(pin?.completionContractId).toBe(run?.completionContractId);
+  expect(pin?.completionContractSha256).toBe(run?.completionContractSha256);
+  expect(run?.contextSnapshot?.sensorAdmission).toEqual(pin);
+  const rows = await db.select().from(completionContracts)
+    .where(eq(completionContracts.issueId, f.issueId));
+  expect(rows.length).toBeGreaterThan(0);
+  expect(rows.some((c) => c.id === run?.completionContractId &&
+    c.canonicalSha256 === run?.completionContractSha256 &&
+    c.companyId === f.companyId)).toBe(true);
+  expect(new Set(rows.map((x) => x.revision)).size).toBe(rows.length);
+  expect(new Set(rows.map((x) => x.canonicalSha256)).size).toBe(rows.length);
+  return { run, claim, pin, rows };
+}
+
+describe("P04 positive direct v2 admission — real PostgreSQL, no providers", () => {
+  for (const [adapterType] of ADAPTERS) {
+    it(`governed ${adapterType} commits exactly one direct v2 completion pin and never replays`, async () => {
+      execute.mockClear();
+      const f = await makeGovernedDirectAllowFixture(adapterType);
+      const first = await f.direct();
+      expect(first.outcome).toBe("claimed_new");
+      const state = await expectCommittedDirectPin(f);
+      expect(first).toMatchObject({ outcome: "claimed_new", pin: state.pin });
+      expect((await f.direct()).outcome).toBe("duplicate");
+      expect(execute).not.toHaveBeenCalled();
+      // Later qualification/document changes do not rewrite the immutable
+      // receipt and cannot authorize a second provider entry for this run.
+      await db.update(agents).set({ adapterConfig: { revokedAfterCommit: true } })
+        .where(eq(agents.id, f.agentId));
+      expect((await f.direct()).outcome).toBe("duplicate");
+      const after = await expectCommittedDirectPin(f);
+      expect(after.claim).toEqual(state.claim);
+    }, 30_000);
+  }
+
+  for (const first of ["native", "direct"] as const) {
+    it(`native allocator ↔ direct v2 completion revision: ${first} obtains advisory first`, async () => {
+      execute.mockClear();
+      const f = await makeGovernedDirectAllowFixture("cline_local");
+      let release!: () => void;
+      let blockerReady!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { blockerReady = resolve; });
+      // An actual third connection owns issue FOR UPDATE. The two tested
+      // sessions must NOT deadlock when the issue is subsequently released.
+      const blocker = db.transaction(async (tx) => {
+        await tx.select().from(issues)
+          .where(eq(issues.id, f.issueId)).for("update");
+        blockerReady();
+        await gate;
+      });
+      await ready;
+      let nativePromise: ReturnType<typeof f.native> | undefined;
+      let directPromise: ReturnType<typeof f.direct> | undefined;
+      try {
+        if (first === "native") nativePromise = f.native();
+        else directPromise = f.direct();
+        await observedLockWaiters(1);
+        // The second contender must wait behind the same advisory key,
+        // not enter issue-first and recreate the old issue↔advisory cycle.
+        if (first === "native") directPromise = f.direct();
+        else nativePromise = f.native();
+        await observedLockWaiters(2);
+      } finally {
+        release();
+        await blocker;
+      }
+      const [nativeResult, directResult] = await Promise.all([nativePromise!, directPromise!]);
+      expect(nativeResult.row.revision).toBe(first === "native" ? 1 : 2);
+      expect(directResult.outcome).toBe("claimed_new");
+      const state = await expectCommittedDirectPin(f);
+      expect(state.rows).toHaveLength(2);
+      expect(execute).not.toHaveBeenCalled();
+    }, 30_000);
+  }
 });
