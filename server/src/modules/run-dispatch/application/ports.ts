@@ -1,4 +1,5 @@
 import type { GateDecision } from "../domain/policy.js";
+import type { SensorAdmissionPin, SensorAdmissionDenyReason } from "../../../services/sensor-admission-verifier.js";
 import type {
   CancelStaleQueuedRunOutcome,
   PromoteScheduledRetryOutcome,
@@ -62,7 +63,8 @@ export type ClaimLegacyDirectInput = {
   now: Date;
 };
 export type ClaimLegacyDirectOutcome =
-  | { outcome: "claimed_new" }
+  | { outcome: "claimed_new"; pin?: SensorAdmissionPin }
+  | { outcome: "denied"; reason: SensorAdmissionDenyReason }
   | { outcome: "governed" }
   | { outcome: "stale"; errorCode: string }
   | { outcome: "duplicate" }
