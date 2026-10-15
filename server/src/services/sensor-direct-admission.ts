@@ -182,7 +182,7 @@ export async function verifyGovernedDirectAdmissionInTx(
   const verified = await verifySensorAdmissionInTx(tx, {
     issueId: issue.id, agentId: run.agentId,
     documentId: document.id, revisionId: revision.id, documentBody: revision.body,
-    workspaceId: workspace.id, baselineSha,
+    workspaceId: issue.executionWorkspaceId, baselineSha,
     completionContractId: completion.id,
     completionContractSha256: completion.canonicalSha256,
     completionRisk: completion.risk,
