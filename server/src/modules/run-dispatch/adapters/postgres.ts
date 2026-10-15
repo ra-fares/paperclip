@@ -1112,10 +1112,20 @@ export function createPostgresRunDispatchAdapter(
           eq(issues.id, input.issueId),
           eq(issues.companyId, input.companyId),
         )).limit(1);
-        if (!issue || issue.executionRunId !== run.id ||
-            issue.assigneeAgentId !== input.agentId ||
-            issue.status === "cancelled" || issue.status === "done") {
+        if (!issue || issue.executionRunId !== run.id) {
           return { outcome: "stale", errorCode: "issue_execution_lock_changed" };
+        }
+        // Keep the exact existing cancellation/ownership reasons separate from
+        // Sensor governance. This classification is made under the issue/run
+        // locks, not by an unsafe owner SELECT after the claim transaction.
+        if (issue.status === "cancelled") {
+          return { outcome: "stale", errorCode: "issue_cancelled" };
+        }
+        if (issue.assigneeAgentId !== input.agentId) {
+          return { outcome: "stale", errorCode: "issue_reassigned" };
+        }
+        if (issue.status === "done") {
+          return { outcome: "stale", errorCode: "issue_terminal_status" };
         }
         const profile = parseObject(run.runnerProfileJson);
         const [sensorLink] = await tx.select({ id: issueDocuments.id })
