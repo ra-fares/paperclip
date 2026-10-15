@@ -1523,6 +1523,87 @@ describe("P04 positive direct v2 admission — real PostgreSQL, no providers", (
     expect(execute).not.toHaveBeenCalled();
   }, 30_000);
 
+  for (const first of ["restore", "direct"] as const) {
+    it(`document revision restore ↔ governed direct admission: ${first} commits first`, async () => {
+      execute.mockClear();
+      const f = await makeGovernedDirectAllowFixture("cline_local");
+      // Rev 1 was valid; a later server document revision changes baseline.
+      // Restoring rev 1 creates an actual third revision under documents UPDATE.
+      const [original] = await db.select({ body: documentRevisions.body })
+        .from(documentRevisions).where(eq(documentRevisions.id, f.revisionId));
+      expect(original?.body).toBeTruthy();
+      const stale = JSON.parse(original!.body);
+      stale.workspace.baselineSha = "e".repeat(40);
+      const invalidBody = JSON.stringify(stale);
+      const revision2Id = randomUUID();
+      await db.insert(documentRevisions).values({
+        id: revision2Id, companyId: f.companyId, documentId: f.documentId,
+        revisionNumber: 2, body: invalidBody,
+      });
+      await db.update(documents).set({
+        latestRevisionId: revision2Id, latestRevisionNumber: 2,
+        latestBody: invalidBody,
+      }).where(eq(documents.id, f.documentId));
+
+      let release!: () => void;
+      let signalReady!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { signalReady = resolve; });
+      // Restore-first: block direct on issue while REAL restore commits.
+      // Direct-first: hold agent row after direct has locked issue, document
+      // and link. REAL restore must wait behind direct's document lock.
+      const blocker = db.transaction(async (tx) => {
+        if (first === "restore") {
+          await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+        } else {
+          await tx.select().from(agents).where(eq(agents.id, f.agentId)).for("update");
+        }
+        signalReady();
+        await gate;
+      });
+      await ready;
+      let directPromise: ReturnType<typeof f.direct> | undefined;
+      let restorePromise: ReturnType<ReturnType<typeof documentService>["restoreIssueDocumentRevision"]> | undefined;
+      let restoredBeforeRelease: Awaited<NonNullable<typeof restorePromise>> | undefined;
+      try {
+        directPromise = f.direct();
+        await observedLockWaiters(1);
+        restorePromise = documentService(db).restoreIssueDocumentRevision({
+          issueId: f.issueId,
+          key: SENSOR_ADMISSION_DOCUMENT_KEY,
+          revisionId: f.revisionId,
+        });
+        if (first === "restore") {
+          // The restore has no issue-first lock; it must finish while direct
+          // is still blocked on issue. Direct subsequently reads rev 3.
+          restoredBeforeRelease = await restorePromise;
+        } else {
+          // The restore must wait on direct's document lock; accepting the
+          // old rev 2 would be unsafe and must fail closed before its commit.
+          await observedLockWaiters(2);
+        }
+      } finally {
+        release();
+        await blocker;
+      }
+      const [direct, restored] = await Promise.all([directPromise!, restorePromise!]);
+      expect(restored.document.latestRevisionNumber).toBe(3);
+      if (first === "restore") {
+        expect(restoredBeforeRelease?.document.latestRevisionId).toBe(restored.document.latestRevisionId);
+        expect(direct.outcome).toBe("claimed_new");
+      } else {
+        expect(direct).toMatchObject({ outcome: "denied", reason: "baseline_mismatch" });
+        const [beforeRetry] = await db.select().from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, f.runId));
+        expect(beforeRetry?.runnerProfileJson?.sensorDirectDispatchClaim).toBeUndefined();
+        expect((await f.direct()).outcome).toBe("claimed_new");
+      }
+      const committed = await expectCommittedDirectPin(f);
+      expect(committed.pin?.revisionId).toBe(restored.document.latestRevisionId);
+      expect(execute).not.toHaveBeenCalled();
+    }, 30_000);
+  }
+
   for (const first of ["native", "direct"] as const) {
     it(`native allocator ↔ direct v2 completion revision: ${first} obtains advisory first`, async () => {
       execute.mockClear();
