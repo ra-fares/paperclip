@@ -22626,6 +22626,7 @@ export function heartbeatService(
             companyId: run.companyId, issueId, runId: run.id, agentId: agent.id,
             ownerBootId: legacyControllerBootId, attemptId: randomUUID(),
             checkContinuationStaleness: continuation,
+            expectedAdapterType: agent.adapterType,
           });
           if (admission.outcome === "governed") {
             throw new SensorAdmissionDeniedError(
