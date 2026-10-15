@@ -37,6 +37,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { documentService } from "../services/documents.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { executionConfigFingerprintFromAgent } from "../services/sensor-admission-verifier.js";
 import { ensureNativeCompletionContract } from "../services/native-runtime/completion-contracts.js";
 import {
   SENSOR_ADMISSION_DOCUMENT_KEY,
@@ -1227,10 +1228,14 @@ async function makeGovernedDirectAllowFixture(adapterType: "cline_local" | "agy_
     companyId: base.companyId, issueId: base.issueId,
     documentId, key: SENSOR_ADMISSION_DOCUMENT_KEY,
   });
+  const [preparedAgent] = await db.select().from(agents).where(eq(agents.id, base.agentId));
+  expect(preparedAgent).toBeTruthy();
   const input = {
     companyId: base.companyId, issueId: base.issueId, runId,
     agentId: base.agentId, ownerBootId: boot, attemptId: randomUUID(),
-    checkContinuationStaleness: false, expectedAdapterType: adapterType, now: new Date(),
+    checkContinuationStaleness: false, expectedAdapterType: adapterType,
+    expectedExecutionConfigFingerprint: executionConfigFingerprintFromAgent(preparedAgent!),
+    now: new Date(),
   };
   const native = () => ensureNativeCompletionContract({
     db, companyId: base.companyId,

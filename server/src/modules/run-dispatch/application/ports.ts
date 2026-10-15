@@ -62,6 +62,8 @@ export type ClaimLegacyDirectInput = {
   checkContinuationStaleness: boolean;
   /** Server-selected adapter type; required for governed v2 admission. */
   expectedAdapterType?: "cline_local" | "agy_local";
+  /** Fingerprint of the agent source snapshot used to prepare the adapter invocation. */
+  expectedExecutionConfigFingerprint?: string;
   now: Date;
 };
 export type ClaimLegacyDirectOutcome =

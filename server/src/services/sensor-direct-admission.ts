@@ -50,12 +50,35 @@ export async function ensureDirectCompletionContractInAdmissionTx(
     throw new SensorAdmissionDeniedError("completion_contract_mismatch", "half-bound direct completion contract");
   }
 
+  // A stored hash column is not proof that persisted canonical JSON still matches.
+  // Hold each reused row and verify its actual contents before issuing a receipt.
+  const assertStoredIntegrity = (row: typeof completionContracts.$inferSelect) => {
+    const json = row.contractJson;
+    const validJson = typeof json === "object" && json !== null && !Array.isArray(json);
+    const actualSha256 = validJson ? nativeSha256({
+      schemaVersion: row.schemaVersion,
+      policyVersion: row.policyVersion,
+      risk: row.risk,
+      completionAuthority: row.completionAuthority,
+      contract: json,
+    }) : null;
+    if (!validJson || row.schemaVersion !== NATIVE_COMPLETION_CONTRACT_SCHEMA ||
+        row.policyVersion !== NATIVE_COMPLETION_POLICY_VERSION ||
+        row.incompleteCriteriaPolicy !== "preserve_non_terminal" ||
+        actualSha256 !== row.canonicalSha256) {
+      throw new SensorAdmissionDeniedError(
+        "completion_contract_mismatch", "persisted completion contract contents differ from canonical binding",
+      );
+    }
+  };
+
   const [latest] = await tx.select().from(completionContracts)
     .where(and(
       eq(completionContracts.companyId, issue.companyId),
       eq(completionContracts.issueId, issue.id),
     ))
-    .orderBy(desc(completionContracts.revision)).limit(1);
+    .orderBy(desc(completionContracts.revision)).limit(1).for("share");
+  if (latest) assertStoredIntegrity(latest);
 
   if (hasId) {
     const [bound] = await tx.select().from(completionContracts)
@@ -64,6 +87,7 @@ export async function ensureDirectCompletionContractInAdmissionTx(
         eq(completionContracts.companyId, issue.companyId),
         eq(completionContracts.issueId, issue.id),
       )).for("share").limit(1);
+    if (bound) assertStoredIntegrity(bound);
     if (!bound || bound.canonicalSha256 !== run.completionContractSha256 ||
         bound.schemaVersion !== NATIVE_COMPLETION_CONTRACT_SCHEMA ||
         bound.policyVersion !== NATIVE_COMPLETION_POLICY_VERSION ||
@@ -108,6 +132,7 @@ export async function ensureDirectCompletionContractInAdmissionTx(
 export async function verifyGovernedDirectAdmissionInTx(
   tx: Db, issue: DirectIssue, run: DirectRun,
   expectedAdapterType: "cline_local" | "agy_local" | undefined,
+  expectedExecutionConfigFingerprint: string | undefined,
 ): Promise<{ pin: SensorAdmissionPin; completion: typeof completionContracts.$inferSelect }> {
   if (issue.companyId !== run.companyId || issue.assigneeAgentId !== run.agentId ||
       issue.executionRunId !== run.id || issue.executionWorkspaceId == null) {
@@ -158,8 +183,12 @@ export async function verifyGovernedDirectAdmissionInTx(
     throw new SensorAdmissionDeniedError("qualification_missing", "direct adapter/agent not eligible");
   }
   // Do not launch a previously selected adapter after DB agent type changes.
-  if (!expectedAdapterType || agent.adapterType !== expectedAdapterType) {
-    throw new SensorAdmissionDeniedError("qualification_config_stale", "selected direct adapter changed before admission");
+  if (!expectedAdapterType || agent.adapterType !== expectedAdapterType ||
+      !expectedExecutionConfigFingerprint ||
+      executionConfigFingerprintFromAgent(agent) !== expectedExecutionConfigFingerprint) {
+    throw new SensorAdmissionDeniedError(
+      "qualification_config_stale", "prepared adapter configuration changed before admission",
+    );
   }
   const [config] = await tx.select().from(agentConfigRevisions).where(and(
     eq(agentConfigRevisions.id, contract.workerQualification.agentConfigRevisionId),

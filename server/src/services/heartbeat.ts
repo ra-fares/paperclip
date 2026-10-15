@@ -5,6 +5,7 @@ import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./age
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
 import { SENSOR_ADMISSION_DOCUMENT_KEY, SensorAdmissionDeniedError, type SensorAdmissionPin } from "./native-runtime/sensor-admission.js";
+import { executionConfigFingerprintFromAgent } from "./sensor-admission-verifier.js";
 import {
   withNativeWorkspaceFinalizationOwnership,
   NativeWorkspaceFinalizationBusyError,
@@ -21619,6 +21620,9 @@ export function heartbeatService(
       // Always replace this runtime-only field; caller wake data cannot supply skills.
       context.paperclipWake = { ...parseObject(context.paperclipWake), connectorSkillInstructions: connectorDelivery.instructions };
       let runtimeConfig: Record<string, unknown> = connectorDelivery.config;
+      // Freeze the source used to prepare this effective runtime invocation.
+      // Final direct admission compares it to the currently locked agent row.
+      const preparedAgentConfigFingerprint = executionConfigFingerprintFromAgent(agent);
       const resolvedFailureSecrets = readFailureReportSecrets();
       readFailureReportSecrets = () => [
         ...resolvedFailureSecrets,
@@ -22635,6 +22639,7 @@ export function heartbeatService(
             ownerBootId: legacyControllerBootId, attemptId: randomUUID(),
             checkContinuationStaleness: continuation,
             expectedAdapterType: agent.adapterType,
+            expectedExecutionConfigFingerprint: preparedAgentConfigFingerprint,
           });
           if (admission.outcome === "governed") {
             throw new SensorAdmissionDeniedError(
