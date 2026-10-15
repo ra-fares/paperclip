@@ -1071,14 +1071,18 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       const orchestrator = heartbeatService(db, {
         afterResolvedInteractionContinuationDispatchCheck: afterCheck,
       });
-      const queued = await orchestrator.invoke(
-        f.agentId, "on_demand",
-        {
+      // Interaction-resolution metadata is trusted only when the wake payload
+      // identifies the mutation. invoke() has no payload argument and strips
+      // interactionId/status before dispatch, making the gate hook unreachable.
+      const queued = await orchestrator.wakeup(f.agentId, {
+        source: "on_demand", triggerDetail: "manual",
+        payload: { mutation: "interaction", issueId: f.issueId },
+        contextSnapshot: {
           issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true,
           interactionId: randomUUID(), interactionStatus: "accepted",
           mutation: "interaction", wakeReason: "issue_commented",
-        }, "manual",
-      );
+        },
+      });
       expect(queued).not.toBeNull();
       const run = await waitForTerminalRun(queued!.id);
       await drainHeartbeatRunsToQuiescence(db, orchestrator);
@@ -1104,14 +1108,18 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       const orchestrator = heartbeatService(db, {
         afterResolvedInteractionContinuationDispatchCheck: afterCheck,
       });
-      const queued = await orchestrator.invoke(
-        f.agentId, "on_demand",
-        {
+      // Interaction-resolution metadata is trusted only when the wake payload
+      // identifies the mutation. invoke() has no payload argument and strips
+      // interactionId/status before dispatch, making the gate hook unreachable.
+      const queued = await orchestrator.wakeup(f.agentId, {
+        source: "on_demand", triggerDetail: "manual",
+        payload: { mutation: "interaction", issueId: f.issueId },
+        contextSnapshot: {
           issueId: f.issueId, taskKey: f.issueId, skipIssueComment: true,
           interactionId: randomUUID(), interactionStatus: "accepted",
           mutation: "interaction", wakeReason: "issue_commented",
-        }, "manual",
-      );
+        },
+      });
       expect(queued).not.toBeNull();
       const run = await waitForTerminalRun(queued!.id);
       await drainHeartbeatRunsToQuiescence(db, orchestrator);
