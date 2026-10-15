@@ -904,10 +904,27 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       await db.update(issues).set({
         status: "todo", executionRunId: null,
       }).where(eq(issues.id, f.issueId));
+      // This fixture shares its disposable DB with unrelated completed test
+      // cases. Make this committed-claim issue the ONLY eligible candidate,
+      // so the aggregate sweeper counters unambiguously describe its decision.
+      await db.update(issues).set({ status: "blocked" }).where(sql`
+        id <> ${f.issueId}::uuid AND status IN ('todo', 'in_progress', 'in_review')
+      `);
+      const eligible = await db.select({ id: issues.id }).from(issues).where(sql`
+        status IN ('todo', 'in_progress', 'in_review')
+        AND assignee_user_id IS NULL
+        AND (assignee_agent_id IS NOT NULL OR status = 'in_review')
+        AND hidden_at IS NULL
+      `);
+      expect(eligible.map((row) => row.id)).toEqual([f.issueId]);
       const sweep = await heartbeat.reconcileStrandedAssignedIssues();
-      // Proof of an actual per-issue recovery decision, not a sweep that
-      // silently missed this candidate for unrelated reasons.
-      expect(sweep.issueIds).toContain(f.issueId);
+      // The sweeper records issueIds only for state changes/requeues; a
+      // rejected replay is a "skipped" decision. With one eligible issue,
+      // exactly one skip proves the target was actually examined.
+      expect(sweep.skipped).toBe(1);
+      expect(sweep.issueIds).toHaveLength(0);
+      expect(sweep.dispatchRequeued).toBe(0);
+      expect(sweep.continuationRequeued).toBe(0);
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
       const issueRuns = await db.select({
         id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId,
