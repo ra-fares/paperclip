@@ -34,6 +34,7 @@ import {
   unregisterServerAdapter,
 } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { documentService } from "../services/documents.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { ensureNativeCompletionContract } from "../services/native-runtime/completion-contracts.js";
@@ -1407,6 +1408,12 @@ describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe 
           });
         },
       });
+      // issuesSvc.update strips executionWorkspaceId when the existing
+      // isolated-workspaces feature gate is off. Test the supported
+      // opt-in production binding path, never a fabricated SQL binding.
+      const settings = instanceSettingsService(db);
+      const previousIsolated = (await settings.getExperimental()).enableIsolatedWorkspaces;
+      await settings.updateExperimental({ enableIsolatedWorkspaces: true });
       heartbeat = prepared;
       try {
         const run = await runFixture(f.agentId, f.issueId);
@@ -1439,6 +1446,7 @@ describe("P04 direct governed ALLOW — actual heartbeat adapter boundary, safe 
       } finally {
         await drainHeartbeatRunsToQuiescence(db, prepared);
         heartbeat = previousHeartbeat;
+        await settings.updateExperimental({ enableIsolatedWorkspaces: previousIsolated });
       }
     }, 30_000);
   }
