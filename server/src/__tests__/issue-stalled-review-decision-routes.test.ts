@@ -1,24 +1,37 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentConfigRevisions,
   agentWakeupRequests,
   agents,
+  authUsers,
   approvals,
   companies,
+  completionContracts,
   companyMemberships,
   createDb,
+  documentRevisions,
+  documents,
+  executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueDocuments,
   issueInboxArchives,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
+  projects,
 } from "@paperclipai/db";
+import type { ServerAdapterModule } from "../adapters/index.js";
+import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import {
@@ -623,4 +636,174 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     ]);
     expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
   });
+});
+
+// Separate disposable cluster: the existing suite's row-by-row cleanup does
+// not own the workspace/document/contract rows of a real heartbeat lifecycle.
+describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
+  it("P04 INT2 RED: governed direct missing evidence must not close issue", async () => {
+    const cluster = await startEmbeddedPostgresTestDatabase("paperclip-stalled-review-int2-");
+    const db = createDb(cluster.connectionString);
+    let heartbeat: ReturnType<typeof heartbeatService> | undefined;
+    const execute = vi.fn<ServerAdapterModule["execute"]>();
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const requesterId = randomUUID(), reviewerId = randomUUID(), projectId = randomUUID();
+    let admittedRunId: string | undefined;
+    let receiptAtExecute: unknown;
+    try {
+      const [database] = await db.select({
+        name: sql<string>`current_database()`, version: sql<string>`version()`,
+      }).from(sql`(select 1) as probe`);
+      const stamp = new Date();
+      await db.insert(authUsers).values([requesterId, reviewerId].map((id) => ({
+        id, name: "INT2 isolated reviewer fixture", email: `int2-${id}@example.invalid`,
+        createdAt: stamp, updatedAt: stamp,
+      })));
+      await db.insert(companies).values({
+        id: companyId, name: "INT2 disposable missing-evidence reproduction",
+        issuePrefix: "INT2", defaultResponsibleUserId: requesterId,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(companyMemberships).values([requesterId, reviewerId].map((id) => ({
+        companyId, principalType: "user", principalId: id,
+        status: "active", membershipRole: "operator",
+      })));
+      await db.insert(agents).values({
+        id: agentId, companyId, name: "INT2 safe cline spy", role: "engineer",
+        status: "idle", adapterType: "cline_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await db.insert(projects).values({ id: projectId, companyId, name: "INT2 isolated workspace" });
+      await db.insert(issues).values({
+        id: issueId, companyId, projectId, title: "INT2 requires criterion evidence",
+        description: "Supply a verified artifact and its test result before acceptance.",
+        assigneeAgentId: agentId, status: "in_progress", reviewPolicy: "human_only",
+      });
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+      execute.mockImplementation(async (input) => {
+        // A fresh DB query at the actual adapter boundary observes the real
+        // committed receipt. Nothing in the test fabricates the claim/pin.
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+        expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toMatchObject({
+          schema: "sensor-direct-dispatch-claim.v2", runId: input.runId, issueId,
+        });
+        expect(input.context.sensorAdmission).toEqual(
+          (run!.runnerProfileJson!.sensorDirectDispatchClaim as Record<string, unknown>).sensorAdmission,
+        );
+        receiptAtExecute = run!.runnerProfileJson!.sensorDirectDispatchClaim;
+        return {
+          exitCode: 0, signal: null, timedOut: false, provider: "cline", model: "spy-only",
+          summary: "INT2 deliberately supplies no criterion evidence",
+          resultJson: { int2Fixture: "missing-criterion-evidence", evidence: [] },
+        };
+      });
+      registerServerAdapter({
+        type: "cline_local", supportsLocalAgentJwt: false, execute,
+        testEnvironment: async () => ({
+          adapterType: "cline_local", status: "pass", checks: [], testedAt: stamp.toISOString(),
+        }),
+      });
+      heartbeat = heartbeatService(db, {
+        beforeDirectSensorAdmissionCheck: async ({ runId, issueId: actualIssueId }) => {
+          expect(actualIssueId).toBe(issueId);
+          // A replacement is not permitted to masquerade as this fixture run.
+          expect(admittedRunId).toBeUndefined();
+          admittedRunId = runId;
+          const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          const workspaceId = issue?.executionWorkspaceId;
+          expect(workspaceId).toBeTruthy();
+          expect(run?.contextSnapshot?.executionWorkspaceId).toBe(workspaceId);
+          const [workspace] = await db.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspaceId!));
+          const baselineSha = "d".repeat(40);
+          await db.update(executionWorkspaces).set({
+            metadata: { ...workspace!.metadata, baseRefSnapshot: { resolvedSha: baselineSha } },
+          }).where(eq(executionWorkspaces.id, workspaceId!));
+          const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+          const configId = randomUUID(), documentId = randomUUID(), revisionId = randomUUID();
+          await db.insert(agentConfigRevisions).values({
+            id: configId, companyId, agentId, beforeConfig: {},
+            afterConfig: {
+              capabilities: agent!.capabilities, adapterType: agent!.adapterType,
+              adapterConfig: agent!.adapterConfig, runtimeConfig: agent!.runtimeConfig,
+              defaultEnvironmentId: agent!.defaultEnvironmentId,
+            },
+          });
+          const body = JSON.stringify({
+            schema: "sensor-admission.v1", issueId, requiredCapabilities: ["code"],
+            workerQualification: {
+              agentId, qualificationRevision: "int2-test-qualified", agentConfigRevisionId: configId,
+              qualifiedCapabilities: ["code"],
+            },
+            scope: { allowedPaths: ["server/src/**"], forbiddenPaths: [".github/**"] },
+            workspace: { id: workspaceId, baselineSha }, minimumRiskClass: "standard",
+          });
+          await db.insert(documents).values({ id: documentId, companyId, title: "Sensor INT2", latestBody: body });
+          await db.insert(documentRevisions).values({ id: revisionId, documentId, companyId, revisionNumber: 1, body });
+          await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+          await db.insert(issueDocuments).values({ companyId, issueId, documentId, key: "sensor-admission" });
+        },
+      });
+      const queued = await heartbeat.invoke(agentId, "on_demand", {
+        issueId, taskKey: issueId, skipIssueComment: true,
+      }, "manual");
+      expect(queued).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+      expect(admittedRunId).toBe(run!.id);
+      expect(execute.mock.calls.filter(([ctx]) => ctx.runId === run!.id)).toHaveLength(1);
+      expect(run?.status).toBe("succeeded");
+      expect(run?.resultJson).toMatchObject({ int2Fixture: "missing-criterion-evidence", evidence: [] });
+      expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toEqual(receiptAtExecute);
+      const receipt = run!.runnerProfileJson!.sensorDirectDispatchClaim as Record<string, unknown>;
+      expect(receipt.completionContractId).toBe(run!.completionContractId);
+      expect(receipt.completionContractSha256).toBe(run!.completionContractSha256);
+      const [completion] = await db.select().from(completionContracts)
+        .where(eq(completionContracts.id, run!.completionContractId!));
+      expect(completion).toMatchObject({
+        companyId, issueId, canonicalSha256: run!.completionContractSha256,
+        contractJson: { criteria: [{ id: "objective", requirement: "Supply a verified artifact and its test result before acceptance." }] },
+      });
+
+      const asBoard = (userId: string) => {
+        const http = express();
+        http.use(express.json());
+        http.use((req, _res, next) => {
+          (req as any).actor = {
+            type: "board", source: "session", userId, companyIds: [companyId], isInstanceAdmin: false,
+            memberships: [{ companyId, status: "active", membershipRole: "operator" }],
+          };
+          next();
+        });
+        http.use("/api", issueRoutes(db, {} as any, {
+          stalledReviewDecisionEnqueueWakeup: vi.fn(async () => undefined) as any,
+        }));
+        http.use(errorHandler);
+        return http;
+      };
+      // Legitimate independent human review, through the real HTTP handler.
+      const submitted = await request(asBoard(requesterId)).patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+      expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(before).toMatchObject({ status: "in_review", reviewPolicy: "human_only" });
+      const response = await request(asBoard(reviewerId)).patch(`/api/issues/${issueId}`)
+        .send({ status: "done" });
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const observation = {
+        phase: "INT2_REVIEW_ASSERTION", database, companyId, issueId, runId: run!.id,
+        reviewerId, completionId: run!.completionContractId, completionHash: run!.completionContractSha256,
+        receipt, missingEvidence: run!.resultJson!.evidence,
+        httpStatus: response.status, responseStatus: response.body.status, dbStatus: after?.status,
+      };
+      console.info("INT2_REVIEW_OBSERVATION " + JSON.stringify(observation));
+      // Keep the RED oracle intact. A setup failure above is not this finding.
+      expect({ controlledRejection: response.status >= 400 && response.status < 500, status: after?.status },
+        JSON.stringify(observation)).toEqual({ controlledRejection: true, status: "in_review" });
+    } finally {
+      if (heartbeat) await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      unregisterServerAdapter("cline_local");
+      await cluster.cleanup();
+    }
+  }, 90_000);
 });
