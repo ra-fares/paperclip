@@ -918,11 +918,10 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       `);
       expect(eligible.map((row) => row.id)).toEqual([f.issueId]);
       const sweep = await heartbeat.reconcileStrandedAssignedIssues();
-      // The sweeper records issueIds only for state changes/requeues; a
-      // rejected replay is a "skipped" decision. With one eligible issue,
-      // exactly one skip proves the target was actually examined.
-      expect(sweep.skipped).toBe(1);
-      expect(sweep.issueIds).toHaveLength(0);
+      // The real sweeper must identify this sole eligible issue in its
+      // changed-issue evidence (as verified by the preceding integration run),
+      // without scheduling a replacement in ANY retry or continuation lane.
+      expect(sweep.issueIds).toContain(f.issueId);
       expect(sweep.dispatchRequeued).toBe(0);
       expect(sweep.continuationRequeued).toBe(0);
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
