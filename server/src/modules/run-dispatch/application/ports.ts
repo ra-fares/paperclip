@@ -60,6 +60,8 @@ export type ClaimLegacyDirectInput = {
   ownerBootId: string;
   attemptId: string;
   checkContinuationStaleness: boolean;
+  /** Server-selected adapter type; required for governed v2 admission. */
+  expectedAdapterType?: "cline_local" | "agy_local";
   now: Date;
 };
 export type ClaimLegacyDirectOutcome =
