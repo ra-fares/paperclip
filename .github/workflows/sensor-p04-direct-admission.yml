@@ -8,10 +8,16 @@ on:
       - ci/T-P04-DIRECT-ADMISSION-DETACH-RED
       - ci/T-P04-DIRECT-ADMISSION-RACE-RED
       - ci/T-P04-ISSUE-GOVERNANCE-01
+      - impl/T-P04-DIRECT-ALLOW-01
     paths:
       - .github/workflows/sensor-p04-direct-admission.yml
       - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
       - server/src/services/heartbeat.ts
+      - server/src/services/sensor-direct-admission.ts
+      - server/src/services/sensor-admission-verifier.ts
+      - server/src/services/native-runtime/sensor-admission.ts
+      - server/src/services/native-runtime/sensor-admission.test.ts
+      - server/src/services/native-runtime/sensor-admission.integration.test.ts
       - server/src/services/documents.ts
       - server/src/services/issues.ts
       - server/src/modules/run-dispatch/**
@@ -26,7 +32,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   direct-db-test:
-    if: github.repository == 'ra-fares/paperclip' && (github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-DETACH-RED' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-RACE-RED' || github.ref == 'refs/heads/ci/T-P04-ISSUE-GOVERNANCE-01')
+    if: github.repository == 'ra-fares/paperclip' && (github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-01' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-DETACH-RED' || github.ref == 'refs/heads/ci/T-P04-DIRECT-ADMISSION-RACE-RED' || github.ref == 'refs/heads/ci/T-P04-ISSUE-GOVERNANCE-01' || github.ref == 'refs/heads/impl/T-P04-DIRECT-ALLOW-01')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
@@ -116,6 +122,18 @@ jobs:
         run: test -s server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
       - name: Verify governed direct denial + no-document legacy
         run: pnpm --dir server exec vitest run src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts --reporter=verbose
+      - name: Native P04 unit regression
+        run: pnpm --dir server exec vitest run src/services/native-runtime/sensor-admission.test.ts --reporter=verbose
+      - name: Prepare second isolated native DB and migrate
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec "${{ job.services.postgres.id }}" psql -U p04_direct_test -d postgres -c 'CREATE DATABASE paperclip_p04_db_acceptance_01_ci'
+          PAPERCLIP_TEST_DATABASE_URL=postgres://p04_direct_test:p04_direct_ci_only@127.0.0.1:5432/paperclip_p04_db_acceptance_01_ci DATABASE_URL=postgres://p04_direct_test:p04_direct_ci_only@127.0.0.1:5432/paperclip_p04_db_acceptance_01_ci pnpm --filter @paperclipai/db migrate
+      - name: Native P04 real-DB regression
+        env:
+          PAPERCLIP_TEST_DATABASE_URL: postgres://p04_direct_test:p04_direct_ci_only@127.0.0.1:5432/paperclip_p04_db_acceptance_01_ci
+        run: pnpm --dir server exec vitest run src/services/native-runtime/sensor-admission.integration.test.ts --reporter=verbose
       - name: Check working tree integrity
         if: always()
         run: git diff --exit-code
