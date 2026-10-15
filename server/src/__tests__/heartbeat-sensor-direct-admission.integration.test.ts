@@ -1105,7 +1105,8 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       await drainHeartbeatRunsToQuiescence(db, orchestrator);
       expect(afterCheck).toHaveBeenCalledTimes(1);
       expect(execute).not.toHaveBeenCalled();
-      expect(run.errorCode).not.toBe("sensor_admission_denied");
+      expect(run.status).toBe("cancelled");
+      expect(run.errorCode).toBe("issue_cancelled");
       const [issue] = await db.select({ status: issues.status }).from(issues)
         .where(eq(issues.id, f.issueId));
       expect(issue?.status).toBe("cancelled");
@@ -1142,7 +1143,8 @@ describe("P04 direct-adapter governed admission — disposable real PostgreSQL",
       await drainHeartbeatRunsToQuiescence(db, orchestrator);
       expect(afterCheck).toHaveBeenCalledTimes(1);
       expect(execute).not.toHaveBeenCalled();
-      expect(run.errorCode).not.toBe("sensor_admission_denied");
+      expect(run.status).toBe("cancelled");
+      expect(run.errorCode).toBe("issue_reassigned");
       const [issue] = await db.select({ assignee: issues.assigneeAgentId }).from(issues)
         .where(eq(issues.id, f.issueId));
       expect(issue?.assignee).toBeNull();
