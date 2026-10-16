@@ -978,7 +978,10 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
               eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issueId),
               eq(issueDocuments.key, "sensor-admission"),
             ));
-            if (linked) return; // A second run is recorded, never suppressed.
+            // Every real heartbeat provisions its own isolated workspace.
+            // Materialize the same stable test Git baseline for EACH workspace,
+            // not only the first, before running normal DB admission. Do not
+            // fabricate a receipt or bypass a failed verification.
             const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
             const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
             const workspaceId = issue?.executionWorkspaceId;
@@ -989,6 +992,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             await db.update(executionWorkspaces).set({
               metadata: { ...workspace!.metadata, baseRefSnapshot: { resolvedSha: baselineSha } },
             }).where(eq(executionWorkspaces.id, workspaceId!));
+            if (linked) return; // Reuse existing admission document without tampering.
             const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
             const configId = randomUUID(), admissionDocumentId = randomUUID(), admissionRevisionId = randomUUID();
             await db.insert(agentConfigRevisions).values({
@@ -1096,6 +1100,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             candidateId: createdAnchor!.id, candidateIssueStatusVersion: current!.statusVersion,
             sourceRunId: run!.id, sourceRunStatus: run!.status,
             invokedId, invokeError, invokedStatus: invokedRun?.status ?? null,
+            invokedErrorCode: invokedRun?.errorCode ?? null,
+            invokedError: invokedRun?.error ?? null,
             clearedExecution, clearedCheckout, issueSnapshots,
             adapterBindings, adapterCalls: seenAdapterIds,
             actualExecuteCalls: execute.mock.calls.map(([input]) => input.runId),
@@ -1111,26 +1117,27 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             })),
           };
           console.info("INT2_BCD_OBSERVATION " + JSON.stringify(trace));
+          const traceDiagnostic = "INT2_BCD_OBSERVATION " + JSON.stringify(trace);
 
           // If the legitimate route refuses replacement while in_review,
           // leave this selected case FAIL with the exact run/response trace.
           // Astra decides whether another *authorized* lifecycle is required.
-          expect(invokeError, JSON.stringify(trace)).toBeNull();
-          expect(invokedId, JSON.stringify(trace)).toBeTruthy();
-          expect(invokedId, JSON.stringify(trace)).not.toBe(run!.id);
-          expect(invokedRun?.status, JSON.stringify(trace)).toBe("succeeded");
-          expect(invokedRun?.finishedAt, JSON.stringify(trace)).not.toBeNull();
+          expect(invokeError, traceDiagnostic).toBeNull();
+          expect(invokedId, traceDiagnostic).toBeTruthy();
+          expect(invokedId, traceDiagnostic).not.toBe(run!.id);
+          expect(invokedRun?.status, traceDiagnostic).toBe("succeeded");
+          expect(invokedRun?.finishedAt, traceDiagnostic).not.toBeNull();
           expect(
             adapterBindings.filter(entry =>
               entry.runId === invokedId && entry.executionRunId === invokedId
-            ), JSON.stringify(trace),
+            ), traceDiagnostic,
           ).toHaveLength(1);
-          expect(seenAdapterIds.filter(id => id === invokedId), JSON.stringify(trace)).toHaveLength(1);
-          expect(execute.mock.calls.length, JSON.stringify(trace)).toBe(seenAdapterIds.length);
-          expect(terminalIssue.statusVersion, JSON.stringify(trace))
+          expect(seenAdapterIds.filter(id => id === invokedId), traceDiagnostic).toHaveLength(1);
+          expect(execute.mock.calls.length, traceDiagnostic).toBe(seenAdapterIds.length);
+          expect(terminalIssue.statusVersion, traceDiagnostic)
             .toBeGreaterThan(current!.statusVersion);
-          expect(releasedIssue.executionRunId, JSON.stringify(trace)).toBeNull();
-          expect(releasedIssue.checkoutRunId, JSON.stringify(trace)).toBeNull();
+          expect(releasedIssue.executionRunId, traceDiagnostic).toBeNull();
+          expect(releasedIssue.checkoutRunId, traceDiagnostic).toBeNull();
 
           const reviewed = await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({
             status: "done",
