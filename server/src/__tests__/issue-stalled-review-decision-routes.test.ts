@@ -826,7 +826,7 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
 describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   for (const mode of [
     "missing", "document", "release", "successor", "assignee_aba",
-    "config_drift", "replay", "concurrent", "rollback", "generic",
+    "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
   ] as const) {
     it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
@@ -1082,6 +1082,23 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(rebound!.assigneeAgentId).toBe(current!.assigneeAgentId);
           expect(rebound!.statusVersion).toBeGreaterThan(current!.statusVersion);
         }
+        if (mode === "workspace_aba") {
+          // HTTP change-and-revert of a material execution-scope preference:
+          // matching final value never resurrects an older review generation.
+          const initialPreference = current!.executionWorkspacePreference;
+          const nextPreference = initialPreference === "agent_default" ? "inherit" : "agent_default";
+          const changed = await request(board(requesterId)).patch(`/api/issues/${issueId}`)
+            .send({ executionWorkspacePreference: nextPreference });
+          expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+          const [middle] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(middle!.executionWorkspacePreference).toBe(nextPreference);
+          const restored = await request(board(requesterId)).patch(`/api/issues/${issueId}`)
+            .send({ executionWorkspacePreference: initialPreference });
+          expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+          const [again] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(again!.executionWorkspacePreference).toBe(initialPreference);
+          expect(again!.statusVersion).toBeGreaterThan(current!.statusVersion);
+        }
         if (mode === "config_drift") {
           // Live config drift after admission must not revoke frozen B.
           await db.update(agents).set({ adapterConfig: { int2NewPreference: "after_admission" } })
@@ -1155,7 +1172,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(reviewed.body.details?.code, JSON.stringify(result)).toBe("criterion_evidence_missing");
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);
-        } else if (mode === "successor" || mode === "assignee_aba" || mode === "generic") {
+        } else if (mode === "successor" || mode === "assignee_aba" || mode === "workspace_aba" || mode === "generic") {
           expect(reviewed.status, JSON.stringify(result)).toBe(409);
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);
