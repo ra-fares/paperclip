@@ -489,6 +489,8 @@ export async function settleUnrecoverableExecutions(
               status: "blocked",
               executionRunId: null,
               checkoutRunId: null,
+              // Raw recovery status/pointer mutation must fence any prior INT2 candidate.
+              statusVersion: sql`${issues.statusVersion} + 1`,
               updatedAt: now,
             })
             .where(eq(issues.id, task.id)).returning();
