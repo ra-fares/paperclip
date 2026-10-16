@@ -14162,6 +14162,8 @@ export function heartbeatService(
         .update(issues)
         .set({
           executionRunId: queuedRun.id,
+          statusVersion: sql`case when ${issues.executionRunId} is distinct from ${queuedRun.id}
+            then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
           executionAgentNameKey: normalizeAgentNameKey(agent.name),
           executionLockedAt: now,
           updatedAt: now,
@@ -16055,6 +16057,9 @@ export function heartbeatService(
             .update(issues)
             .set({
               executionRunId: scheduledRun.id,
+              statusVersion: sql`case when ${issues.executionRunId} is distinct from ${scheduledRun.id}
+                or (${detachWorkspaceFromIssue} and ${issues.executionWorkspaceId} is not null)
+                then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
               checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
               executionAgentNameKey: normalizeAgentNameKey(agent.name),
               executionLockedAt: now,
@@ -17479,6 +17484,8 @@ export function heartbeatService(
       if (!claimedRun || !issueId || !ownsIssue) return;
       await tx.update(issues).set({
         executionRunId: claimedRun.id,
+        statusVersion: sql`case when ${issues.executionRunId} is distinct from ${claimedRun.id}
+          then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
         executionAgentNameKey: normalizeAgentNameKey(agent.name),
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,
@@ -17872,6 +17879,8 @@ export function heartbeatService(
         .update(issues)
         .set({
           executionRunId: claimed.id,
+          statusVersion: sql`case when ${issues.executionRunId} is distinct from ${claimed.id}
+            then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
           executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
           executionLockedAt: claimedAt,
           updatedAt: claimedAt,
@@ -28077,6 +28086,8 @@ export function heartbeatService(
                   .update(issues)
                   .set({
                     executionRunId: legacyRun.id,
+                    statusVersion: sql`case when ${issues.executionRunId} is distinct from ${legacyRun.id}
+                      then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
                     executionAgentNameKey: normalizeAgentNameKey(
                       legacyAgent?.name,
                     ),
@@ -28233,6 +28244,9 @@ export function heartbeatService(
                   status: "blocked",
                   checkoutRunId: null,
                   executionRunId: null,
+                  statusVersion: sql`case when ${issues.status} is distinct from 'blocked'
+                    or ${issues.executionRunId} is not null or ${issues.checkoutRunId} is not null
+                    then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
                   executionAgentNameKey: null,
                   executionLockedAt: null,
                   updatedAt: now,
