@@ -7832,6 +7832,9 @@ export function issueService(db: Db) {
         .set({
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
+          statusVersion: sql`case when ${issues.checkoutRunId} is distinct from ${input.actorRunId}
+            or ${issues.executionRunId} is distinct from ${input.actorRunId}
+            then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
           executionLockedAt: now,
           updatedAt: now,
         })
@@ -7893,6 +7896,9 @@ export function issueService(db: Db) {
         .set({
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
+          statusVersion: sql`case when ${issues.checkoutRunId} is distinct from ${input.actorRunId}
+            or ${issues.executionRunId} is distinct from ${input.actorRunId}
+            then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
           executionLockedAt: now,
           updatedAt: now,
         })
@@ -7949,6 +7955,10 @@ export function issueService(db: Db) {
         .update(issues)
         .set({
           executionRunId: null,
+          // Only a completed successful original can release without fencing.
+          statusVersion: run?.status === "succeeded"
+            ? sql`${issues.statusVersion}`
+            : sql`${issues.statusVersion} + 1`,
           executionAgentNameKey: null,
           executionLockedAt: null,
           updatedAt: new Date(),
@@ -8020,6 +8030,10 @@ export function issueService(db: Db) {
         .set({
           checkoutRunId: null,
           executionRunId: null,
+          statusVersion: run?.status === "succeeded" &&
+            (!issue.executionRunId || issue.executionRunId === issue.checkoutRunId)
+            ? sql`${issues.statusVersion}`
+            : sql`${issues.statusVersion} + 1`,
           executionAgentNameKey: null,
           executionLockedAt: null,
           updatedAt: new Date(),
@@ -11385,7 +11399,7 @@ export function issueService(db: Db) {
         const materialScopeKeys = [
           "status", "assigneeAgentId", "assigneeUserId", "projectId",
           "projectWorkspaceId", "executionWorkspaceId",
-          "executionWorkspacePreference", "executionRunId",
+          "executionWorkspacePreference", "executionRunId", "checkoutRunId",
         ] as const;
         const materiallyChanged = materialScopeKeys.some(
           key => patch[key] !== undefined && patch[key] !== receiptExisting[key]
@@ -11804,6 +11818,7 @@ export function issueService(db: Db) {
               ...settings,
               environmentId: null,
             },
+            statusVersion: sql`${issues.statusVersion} + 1`,
             updatedAt: new Date(),
           })
           .where(eq(issues.id, row.id));
@@ -11959,6 +11974,12 @@ export function issueService(db: Db) {
           checkoutRunId,
           executionRunId: checkoutRunId,
           status: "in_progress",
+          statusVersion: sql`case when ${issues.status} is distinct from 'in_progress'
+            or ${issues.assigneeAgentId} is distinct from ${agentId}
+            or ${issues.assigneeUserId} is not null
+            or ${issues.checkoutRunId} is distinct from ${checkoutRunId}
+            or ${issues.executionRunId} is distinct from ${checkoutRunId}
+            then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
           startedAt: now,
           updatedAt: now,
         })
@@ -12005,6 +12026,9 @@ export function issueService(db: Db) {
           .set({
             checkoutRunId,
             executionRunId: checkoutRunId,
+            statusVersion: sql`case when ${issues.checkoutRunId} is distinct from ${checkoutRunId}
+              or ${issues.executionRunId} is distinct from ${checkoutRunId}
+              then ${issues.statusVersion} + 1 else ${issues.statusVersion} end`,
             updatedAt: new Date(),
           })
           .where(
@@ -12067,6 +12091,7 @@ export function issueService(db: Db) {
             assigneeAgentId: agentId,
             checkoutRunId,
             executionRunId: checkoutRunId,
+            statusVersion: sql`${issues.statusVersion} + 1`,
             executionAgentNameKey: null,
             executionLockedAt: now,
             status: "in_progress",
@@ -12334,6 +12359,9 @@ export function issueService(db: Db) {
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
+            statusVersion: isTerminal && existing.status !== "in_progress"
+              ? sql`${issues.statusVersion}`
+              : sql`${issues.statusVersion} + 1`,
             updatedAt: new Date(),
           })
           .where(eq(issues.id, id))
@@ -12372,6 +12400,11 @@ export function issueService(db: Db) {
         };
         if (options.clearAssignee) {
           patch.assigneeAgentId = null;
+        }
+        // Explicit admin force-release invalidates current candidate when it
+        // changes ownership/binding, even when pointers are already null.
+        if (options.clearAssignee || existing.executionRunId || existing.checkoutRunId) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
 
         const updated = await tx
