@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
   afterAll,
   beforeAll,
@@ -47,6 +48,8 @@ import {
 // An actual migrated, disposable PostgreSQL is mandatory.
 // Never silently skip a test because embedded PostgreSQL is unavailable.
 const testUrl = process.env.PAPERCLIP_TEST_DATABASE_URL?.trim();
+let embedded: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+let actualTestUrl: string | undefined;
 const ADAPTERS = [
   ["cline_local", "cline"],
   ["agy_local", "gemini"],
@@ -62,7 +65,7 @@ function assertIsolatedTestDatabase(url: string | undefined): asserts url is str
   const parsed = new URL(url);
   if (
     !["localhost", "127.0.0.1"].includes(parsed.hostname) ||
-    !/^\/paperclip_p04_direct_admission_01_[a-z0-9_]+$/.test(parsed.pathname)
+    (!embedded && !/^\/paperclip_p04_direct_admission_01_[a-z0-9_]+$/.test(parsed.pathname))
   ) {
     throw new Error("Refusing non-local or non-task PostgreSQL database");
   }
@@ -178,9 +181,13 @@ async function runFixture(agentId: string, issueId: string) {
   return waitForTerminalRun(queued!.id);
 }
 
-beforeAll(() => {
-  assertIsolatedTestDatabase(testUrl);
-  db = createDb(testUrl);
+beforeAll(async () => {
+  // Historical external-database mode stays supported, but CI uses its own
+  // disposable migrated embedded PostgreSQL. No Docker/Windows/runtime DB.
+  if (!testUrl) embedded = await startEmbeddedPostgresTestDatabase("paperclip_p04_direct_admission_01_");
+  actualTestUrl = testUrl ?? embedded?.connectionString;
+  assertIsolatedTestDatabase(actualTestUrl);
+  db = createDb(actualTestUrl);
   heartbeat = heartbeatService(db);
   for (const [adapterType] of ADAPTERS) {
     registerServerAdapter({
@@ -202,7 +209,8 @@ afterAll(async () => {
   // Drain tracked execution promises before closing disposable PostgreSQL.
   await drainHeartbeatRunsToQuiescence(db, heartbeat);
   for (const [adapterType] of ADAPTERS) unregisterServerAdapter(adapterType);
-  if (testUrl) await closeRegisteredClients(testUrl);
+  if (actualTestUrl) await closeRegisteredClients(actualTestUrl);
+  await embedded?.cleanup();
 });
 
 async function verifyQueuedDocumentTransition(

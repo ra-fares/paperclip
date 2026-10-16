@@ -77,6 +77,9 @@ jobs:
           tsc=$?
           set -e
           echo "$tsc" > .int2-evidence/typecheck.exit_code
+          echo "TYPECHECK_EXIT=$tsc"
+          tail -n 100 .int2-evidence/typecheck.stdout || true
+          tail -n 160 .int2-evidence/typecheck.stderr || true
           run_named () {
             local label="$1" file="$2" pattern="$3"
             set +e
@@ -112,10 +115,23 @@ jobs:
             const checks=names.map(name=>{
               const found=assertions.filter(x=>x.fullName?.includes(name));
               const status=found[0]?.status??null;
-              const classification=found.length!==1||status==="pending"||status==="skipped"?"NOT_RUN":
+              const messages=found.flatMap(x=>x.failureMessages??[]);
+              const stdout=fs.existsSync(dir+"/"+label+".stdout")?fs.readFileSync(dir+"/"+label+".stdout","utf8"):"";
+              const source=[stdout,...messages].join("\\n");
+              const observation=(source.match(/INT2_(?:BCD|REVIEW)_OBSERVATION\\s+(\\{[^\\n]+\\})/)??[])[1]??null;
+              let classification=found.length!==1||status==="pending"||status==="skipped"?"NOT_RUN":
                 (status==="passed"&&exitCode===0&&doc?.numFailedTests===0?"PASS":
-                 status==="failed"?"FAIL":"INVALID_FIXTURE");
-              return {name,classification,status,count:found.length,failureMessages:found[0]?.failureMessages??[]};
+                 status==="failed"?(observation?"FAIL":"INVALID_FIXTURE"):"INVALID_FIXTURE");
+              // The historical first RED remains immutable. Should it ever
+              // reproduce, classify the observed regression separately; it
+              // is NOT a GREEN pass and never conceals a fixture error.
+              if(label==="board"&&classification==="FAIL"&&observation) {
+                try {
+                  const o=JSON.parse(observation);
+                  if(o.httpStatus===200&&o.dbStatus==="done")classification="EXPECTED_RED";
+                }catch{}
+              }
+              return {name,classification,status,count:found.length,failureMessages:messages,observation};
             });
             if(checks.some(x=>x.classification!=="PASS")||exitCode!==0)bad=true;
             output[label]={exitCode,error,checks};
@@ -131,6 +147,7 @@ jobs:
         with:
           name: p04-int2-acceptance-evidence
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 30
           path: .int2-evidence/
       - name: Ensure tracked checkout unchanged
