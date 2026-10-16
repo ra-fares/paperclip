@@ -44,6 +44,7 @@ import {
   approvals,
   assets,
   companies,
+  completionContracts,
   companyMemberships,
   documentRevisions,
   documents,
@@ -66,6 +67,7 @@ import {
   issueWorkProducts,
   issueReadStates,
   issueThreadInteractions,
+  statusDecisions,
   toolActionRequests,
   toolActionDeliveries,
   toolInvocations,
@@ -103,7 +105,9 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { nativeSha256 } from "./native-runtime/canonical.js";
+import { assertIssueReviewVerdictActorAllowed } from "./issue-review-policy.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -6623,6 +6627,311 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
+// Sensor governed-direct INT2: this request describes an independent review,
+// not authority to accept. The service binds every value to DB rows under the
+// issue row lock; the client cannot mint or select the source execution run.
+type GovernedInt2Decision = {
+  candidateId: string;
+  candidateIssueStatusVersion: number;
+  criteriaVerdicts: Array<{
+    criterionId: string;
+    ref: string;
+    bodySha256: string;
+    verdict: "accepted" | "rejected";
+    rationale: string;
+  }>;
+};
+type GovernedIssue = typeof issues.$inferSelect;
+type GovernedRun = typeof heartbeatRuns.$inferSelect;
+type GovernedReceipt = {
+  schema: string;
+  runId: string;
+  issueId: string;
+  completionContractId: string;
+  completionContractSha256: string;
+  sensorAdmission: Record<string, unknown>;
+};
+
+function int2Receipt(run: GovernedRun): GovernedReceipt | null {
+  const input = run.runnerProfileJson?.sensorDirectDispatchClaim;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const row = input as Record<string, unknown>;
+  if (
+    row.schema !== "sensor-direct-dispatch-claim.v2" ||
+    typeof row.runId !== "string" || typeof row.issueId !== "string" ||
+    typeof row.completionContractId !== "string" ||
+    typeof row.completionContractSha256 !== "string" ||
+    !row.sensorAdmission || typeof row.sensorAdmission !== "object" ||
+    Array.isArray(row.sensorAdmission)
+  ) return null;
+  return row as GovernedReceipt;
+}
+
+function int2WorkspaceIdentity(row: typeof executionWorkspaces.$inferSelect) {
+  return nativeSha256({
+    id: row.id, companyId: row.companyId, projectId: row.projectId,
+    projectWorkspaceId: row.projectWorkspaceId, sourceIssueId: row.sourceIssueId,
+    mode: row.mode, strategyType: row.strategyType, providerType: row.providerType,
+    providerRef: row.providerRef, branchName: row.branchName,
+    derivedFromExecutionWorkspaceId: row.derivedFromExecutionWorkspaceId,
+  });
+}
+
+async function assertInt2NativeDecisionInTx(
+  tx: Db, issue: GovernedIssue, decisionId: string | null | undefined,
+  version: number | undefined,
+): Promise<boolean> {
+  if (!decisionId || version !== issue.statusVersion + 1) return false;
+  const [decision] = await tx.select().from(statusDecisions).where(and(
+    eq(statusDecisions.id, decisionId),
+    eq(statusDecisions.companyId, issue.companyId),
+    eq(statusDecisions.issueId, issue.id),
+    eq(statusDecisions.fromStatus, issue.status),
+    eq(statusDecisions.toStatus, "done"),
+    eq(statusDecisions.decisionVersion, version),
+  )).for("share").limit(1);
+  // status_decisions has a company/issue/run/assessment composite FK. This
+  // row is created by native's existing committer inside the SAME transaction.
+  // It does not need to be committed before the projection uses this tx.
+  return Boolean(decision && decision.assessmentId && decision.decisionDigest);
+}
+
+async function prepareInt2AcceptanceInTx(
+  tx: Db,
+  issue: GovernedIssue,
+  decision: GovernedInt2Decision | undefined,
+  reviewer: { userId: string | null; agentId: string | null; interactionId: string | null },
+) {
+  if (issue.status !== "in_review" || !decision) {
+    throw conflict("A current source-run review candidate is required", { code: "governed_candidate_missing" });
+  }
+  const [candidate] = await tx.select().from(activityLog).where(and(
+    eq(activityLog.id, decision.candidateId),
+    eq(activityLog.companyId, issue.companyId),
+    eq(activityLog.entityType, "issue"),
+    eq(activityLog.entityId, issue.id),
+    eq(activityLog.action, "issue.governed_review_candidate.v1"),
+  )).for("share").limit(1);
+  const details = candidate?.details;
+  if (!candidate || !details || details.schema !== "issue.governed_review_candidate.v1" ||
+      candidate.runId !== details.sourceRunId ||
+      details.issueStatusVersion !== issue.statusVersion ||
+      decision.candidateIssueStatusVersion !== issue.statusVersion) {
+    throw conflict("The governed review cycle changed or has no authentic candidate", {
+      code: "governed_candidate_stale",
+    });
+  }
+  const [already] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+    eq(activityLog.companyId, issue.companyId),
+    eq(activityLog.entityType, "issue"),
+    eq(activityLog.entityId, issue.id),
+    eq(activityLog.action, "issue.governed_acceptance_decided.v1"),
+    sql`${activityLog.details} ->> 'candidateId' = ${candidate.id}`,
+  )).limit(1);
+  if (already) throw conflict("Candidate already decided", { code: "governed_candidate_replay" });
+
+  const [run] = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, candidate.runId!),
+    eq(heartbeatRuns.companyId, issue.companyId),
+  )).for("share").limit(1);
+  const receipt = run && int2Receipt(run);
+  if (!run || !receipt || run.runtimeMode !== "legacy" ||
+      run.agentId !== details.sourceAgentId || receipt.runId !== run.id ||
+      receipt.issueId !== issue.id ||
+      run.contextSnapshot?.issueId !== issue.id ||
+      receipt.completionContractId !== details.completionContractId ||
+      receipt.completionContractSha256 !== details.completionContractSha256 ||
+      run.completionContractId !== details.completionContractId ||
+      run.completionContractSha256 !== details.completionContractSha256 ||
+      nativeSha256(receipt.sensorAdmission) !== details.pinDigest ||
+      run.status !== "succeeded" || !run.finishedAt || !run.startedAt) {
+    throw conflict("Source run/committed receipt is ineligible for review", {
+      code: "governed_candidate_source_ineligible",
+    });
+  }
+
+  const [completion] = await tx.select().from(completionContracts).where(and(
+    eq(completionContracts.id, receipt.completionContractId),
+    eq(completionContracts.companyId, issue.companyId),
+    eq(completionContracts.issueId, issue.id),
+  )).for("share").limit(1);
+  if (!completion || completion.canonicalSha256 !== receipt.completionContractSha256 ||
+      nativeSha256({
+        schemaVersion: completion.schemaVersion,
+        policyVersion: completion.policyVersion,
+        risk: completion.risk,
+        completionAuthority: completion.completionAuthority,
+        contract: completion.contractJson,
+      }) !== completion.canonicalSha256) {
+    throw conflict("Frozen completion contract has changed", { code: "governed_candidate_contract_changed" });
+  }
+  if (issue.executionRunId !== null && issue.executionRunId !== run.id) {
+    throw conflict("A replacement execution owns this issue", { code: "governed_candidate_superseded" });
+  }
+  if (issue.checkoutRunId !== null && issue.checkoutRunId !== run.id) {
+    throw conflict("A different checkout owns this issue", { code: "governed_candidate_superseded" });
+  }
+
+  // Mandatory scan even after a successor's executionRunId has been cleared.
+  // Both startedAt and createdAt matter: a queued-before-B run may start
+  // after B, and a completed successor must also fence this candidate.
+  const successors = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId),
+    ne(heartbeatRuns.id, run.id),
+    or(
+      eq(heartbeatRuns.nativeIssueId, issue.id),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+    ),
+  )).for("share");
+  for (const next of successors) {
+    const profile = next.runnerProfileJson;
+    const hasV2 = int2Receipt(next) !== null;
+    const bound = issue.executionRunId === next.id || issue.checkoutRunId === next.id;
+    const descendant = next.retryOfRunId === run.id;
+    const newer = next.createdAt >= candidate.createdAt ||
+      (next.startedAt != null && next.startedAt >= candidate.createdAt);
+    const isReviewer = next.agentId !== run.agentId &&
+      !hasV2 && !bound && !descendant &&
+      typeof next.contextSnapshot?.reviewInteractionId === "string";
+    if (!isReviewer && (hasV2 || bound || descendant || newer)) {
+      throw conflict("A later issue-execution run invalidated this review", {
+        code: "governed_candidate_superseded", successorRunId: next.id,
+      });
+    }
+  }
+
+  const requiredBindings = [
+    "projectId", "projectWorkspaceId", "executionWorkspaceId",
+    "executionWorkspacePreference", "assigneeAgentId", "assigneeUserId",
+  ] as const;
+  if (requiredBindings.some(key => issue[key] !== details[key]) ||
+      nativeSha256(issue.executionWorkspaceSettings ?? null) !== details.executionWorkspaceSettingsDigest ||
+      issue.conversationAgentId != null) {
+    throw conflict("The governed issue scope or assignee changed", { code: "governed_candidate_scope_stale" });
+  }
+  if (issue.projectWorkspaceId) {
+    const [projectWorkspace] = await tx.select().from(projectWorkspaces).where(and(
+      eq(projectWorkspaces.id, issue.projectWorkspaceId),
+      eq(projectWorkspaces.companyId, issue.companyId),
+    )).for("share").limit(1);
+    if (!projectWorkspace || projectWorkspace.projectId !== issue.projectId) {
+      throw conflict("Project workspace no longer belongs to issue scope", { code: "governed_candidate_workspace_stale" });
+    }
+  }
+  if (issue.executionWorkspaceId) {
+    const [workspace] = await tx.select().from(executionWorkspaces).where(and(
+      eq(executionWorkspaces.id, issue.executionWorkspaceId),
+      eq(executionWorkspaces.companyId, issue.companyId),
+    )).for("share").limit(1);
+    if (!workspace || workspace.status !== "active" ||
+        workspace.projectId !== issue.projectId ||
+        int2WorkspaceIdentity(workspace) !== details.executionWorkspaceIdentityDigest) {
+      throw conflict("Execution workspace identity is no longer valid", { code: "governed_candidate_workspace_stale" });
+    }
+  }
+
+  const reviewerId = reviewer.userId ?? reviewer.agentId;
+  if (!reviewerId || reviewerId === run.agentId) {
+    throw forbidden("Independent authenticated reviewer required", { code: "governed_reviewer_denied" });
+  }
+  if (issue.reviewPolicy === "human_only" && !reviewer.userId) {
+    throw forbidden("human_only requires an authenticated human reviewer", { code: "governed_reviewer_denied" });
+  }
+  await assertIssueReviewVerdictActorAllowed(tx, {
+    issue, actor: { type: reviewer.userId ? "user" : "agent", id: reviewerId },
+    reviewPolicy: issue.reviewPolicy,
+  });
+  if (reviewer.agentId) {
+    if (!reviewer.interactionId || reviewer.interactionId !== details.reviewInteractionId) {
+      throw forbidden("Reviewer agent requires server-bound review interaction", { code: "governed_reviewer_denied" });
+    }
+    const [interaction] = await tx.select().from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.id, reviewer.interactionId),
+      eq(issueThreadInteractions.companyId, issue.companyId),
+      eq(issueThreadInteractions.issueId, issue.id),
+      eq(issueThreadInteractions.addresseeAgentId, reviewer.agentId),
+      eq(issueThreadInteractions.sourceRunId, run.id),
+      eq(issueThreadInteractions.status, "pending"),
+      eq(issueThreadInteractions.kind, "request_confirmation"),
+    )).for("share").limit(1);
+    if (!interaction || interaction.payload?.kind === "tool") {
+      throw forbidden("No authorized independent reviewer interaction", { code: "governed_reviewer_denied" });
+    }
+  }
+
+  const criteria = completion.contractJson.criteria;
+  if (!Array.isArray(criteria) || criteria.length === 0 || criteria.length > 100 ||
+      criteria.some(c => !c || typeof c !== "object" || typeof c.id !== "string" ||
+        !c.id.trim() || typeof c.requirement !== "string" || !c.requirement.trim()) ||
+      new Set(criteria.map(c => c.id)).size !== criteria.length) {
+    throw unprocessable("Frozen criteria cannot be mechanically mapped", { code: "governed_contract_unverifiable" });
+  }
+  const evidence = run.resultJson?.evidence;
+  if (!Array.isArray(evidence) || evidence.length !== criteria.length ||
+      decision.criteriaVerdicts.length !== criteria.length) {
+    throw unprocessable("Every criterion requires a documentary evidence revision and reviewer verdict", {
+      code: "criterion_evidence_missing",
+    });
+  }
+  const proof = [];
+  const ids = new Set<string>();
+  for (const criterion of criteria) {
+    const claimed = evidence.filter(e => e && typeof e === "object" && e.criterionId === criterion.id);
+    const verdicts = decision.criteriaVerdicts.filter(v => v.criterionId === criterion.id);
+    if (claimed.length !== 1 || verdicts.length !== 1 || ids.has(criterion.id)) {
+      throw unprocessable("Evidence/decision criterion mapping is not unique", { code: "governed_evidence_invalid" });
+    }
+    ids.add(criterion.id);
+    const ref = claimed[0].ref;
+    const verdict = verdicts[0];
+    const match = typeof ref === "string" ? /^issue_document_revision:([0-9a-f-]{36})$/i.exec(ref) : null;
+    if (!match || verdict.ref !== ref) {
+      throw unprocessable("Only matching issue document revisions are accepted", { code: "governed_evidence_invalid" });
+    }
+    const [revision] = await tx.select().from(documentRevisions).where(and(
+      eq(documentRevisions.id, match[1]),
+      eq(documentRevisions.companyId, issue.companyId),
+    )).for("share").limit(1);
+    if (!revision || revision.createdByRunId !== run.id || revision.createdByAgentId !== run.agentId ||
+        revision.createdAt < run.startedAt || revision.createdAt > run.finishedAt) {
+      throw unprocessable("Document revision is not attributable to the source execution", { code: "governed_evidence_invalid" });
+    }
+    const [document] = await tx.select().from(documents).where(and(
+      eq(documents.id, revision.documentId),
+      eq(documents.companyId, issue.companyId),
+    )).for("share").limit(1);
+    const [link] = await tx.select().from(issueDocuments).where(and(
+      eq(issueDocuments.companyId, issue.companyId),
+      eq(issueDocuments.issueId, issue.id),
+      eq(issueDocuments.documentId, revision.documentId),
+    )).for("share").limit(1);
+    if (!document || !link || link.key === "sensor-admission" ||
+        link.key.startsWith("continuation-summary")) {
+      throw unprocessable("Evidence document is missing its permitted issue link", { code: "governed_evidence_invalid" });
+    }
+    const bodySha256 = createHash("sha256").update(revision.body, "utf8").digest("hex");
+    if (bodySha256 !== verdict.bodySha256) {
+      throw unprocessable("Reviewer did not attest to this exact revision body", { code: "governed_evidence_invalid" });
+    }
+    // Documentary review cannot by itself establish that automated tests
+    // actually executed. Such a criterion needs independent machine proof.
+    if (/\b(test(s|ing|ed)?|ci|pipeline|build)\b|тест|провер(ить|ен|ка)/i.test(criterion.requirement)) {
+      throw unprocessable("Test execution cannot be certified from report text alone", { code: "governed_contract_unverifiable" });
+    }
+    if (verdict.verdict !== "accepted" || !verdict.rationale.trim()) {
+      throw unprocessable("Independent reviewer did not approve all frozen criteria", { code: "governed_criterion_not_accepted" });
+    }
+    proof.push({
+      criterionId: criterion.id,
+      requirementSha256: createHash("sha256").update(criterion.requirement, "utf8").digest("hex"),
+      ref, documentId: revision.documentId, revisionId: revision.id,
+      revisionNumber: revision.revisionNumber, format: revision.format, bodySha256,
+      verdict: verdict.verdict, rationale: verdict.rationale,
+    });
+  }
+  return { candidate, receipt, proof, reviewerId, sourceRunId: run.id };
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -10581,6 +10890,8 @@ export function issueService(db: Db) {
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        governedReviewDecision?: GovernedInt2Decision;
+        governedReviewInteractionId?: string | null;
         companyGuard?: string;
       },
       dbOrTx: any = db,
@@ -10628,6 +10939,8 @@ export function issueService(db: Db) {
         actorRunId,
         actorRunStopId,
         actorUserId,
+        governedReviewDecision,
+        governedReviewInteractionId,
         companyGuard,
         ...issueData
       } = data;
