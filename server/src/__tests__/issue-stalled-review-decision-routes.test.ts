@@ -705,8 +705,15 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
       heartbeat = heartbeatService(db, {
         beforeDirectSensorAdmissionCheck: async ({ runId, issueId: actualIssueId }) => {
           expect(actualIssueId).toBe(issueId);
-          // A replacement is not permitted to masquerade as this fixture run.
-          expect(admittedRunId).toBeUndefined();
+          // Record every pre-claim heartbeat (including continuations), without
+          // throwing to suppress later runs. The selected first RED run is pinned.
+          if (admittedRunId) {
+            const linked = await db.select({ id: issueDocuments.id }).from(issueDocuments)
+              .where(and(eq(issueDocuments.companyId, companyId),
+                eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, "sensor-admission")));
+            expect(linked).toHaveLength(1);
+            return;
+          }
           admittedRunId = runId;
           const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
