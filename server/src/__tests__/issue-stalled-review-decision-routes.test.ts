@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -806,4 +806,273 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
       await cluster.cleanup();
     }
   }, 90_000);
+});
+
+
+/**
+ * INT2 T1/T2: two independent PostgreSQL clusters, identical authenticated
+ * source-run → review candidate → terminal settlement → reviewer lifecycle.
+ * Unlike the preserved historical board-origin negative reproduction, these
+ * controls prove that a valid candidate passed the anchor gate BEFORE the
+ * evidence/no-evidence assertion.
+ */
+describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
+  for (const mode of ["missing", "document"] as const) {
+    it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
+      const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
+      const db = createDb(cluster.connectionString);
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+      const requesterId = randomUUID(), reviewerId = randomUUID(), projectId = randomUUID();
+      const evidenceBody = "Handoff memorandum: the project's delivered scope and review criteria are documented in this revision.";
+      const documentId = randomUUID(), revisionId = randomUUID();
+      const seenAdmissionIds: string[] = [];
+      const seenAdapterIds: string[] = [];
+      const execute = vi.fn<ServerAdapterModule["execute"]>();
+      let h: ReturnType<typeof heartbeatService> | null = null;
+      let createdAnchor: { id: string; details: Record<string, unknown> } | undefined;
+
+      const app = (actor: Record<string, unknown>) => {
+        const api = express();
+        api.use(express.json());
+        api.use((req, _res, next) => { (req as any).actor = actor; next(); });
+        api.use("/api", issueRoutes(db, {} as any, {
+          stalledReviewDecisionEnqueueWakeup: vi.fn(async () => undefined) as any,
+        }));
+        api.use(errorHandler);
+        return api;
+      };
+      const board = (userId: string) => app({
+        type: "board", source: "session", userId, companyIds: [companyId],
+        isInstanceAdmin: false,
+        memberships: [{ companyId, status: "active", membershipRole: "operator" }],
+      });
+
+      try {
+        const now = new Date();
+        await db.insert(authUsers).values([requesterId, reviewerId].map(id => ({
+          id, name: "INT2 fixture authorized human", email: `int2-bcd-${id}@example.invalid`,
+          createdAt: now, updatedAt: now,
+        })));
+        await db.insert(companies).values({
+          id: companyId, name: "INT2 bounded acceptance", issuePrefix: "IBCD",
+          defaultResponsibleUserId: requesterId, requireBoardApprovalForNewAgents: false,
+        });
+        await db.insert(companyMemberships).values([requesterId, reviewerId].map(id => ({
+          companyId, principalType: "user", principalId: id,
+          status: "active", membershipRole: "operator",
+        })));
+        await db.insert(agents).values({
+          id: agentId, companyId, name: "INT2 spy only", role: "engineer",
+          status: "idle", adapterType: "cline_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        await db.insert(projects).values({ id: projectId, companyId, name: "INT2 safe project" });
+        await db.insert(issues).values({
+          id: issueId, companyId, projectId, title: "Produce a reviewable handoff document",
+          description: "Document the project handoff memorandum and its delivered scope.",
+          assigneeAgentId: agentId, status: "in_progress", reviewPolicy: "human_only",
+        });
+        await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+        execute.mockImplementation(async input => {
+          seenAdapterIds.push(input.runId);
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+          const receipt = run?.runnerProfileJson?.sensorDirectDispatchClaim as Record<string, unknown> | undefined;
+          // This read occurs INSIDE the real adapter spy, after committed v2.
+          expect(receipt?.schema).toBe("sensor-direct-dispatch-claim.v2");
+          expect(receipt?.runId).toBe(input.runId);
+          expect(run?.status).toBe("running");
+          expect(run?.completionContractId).toBe(receipt?.completionContractId);
+          expect(run?.completionContractSha256).toBe(receipt?.completionContractSha256);
+          if (!createdAnchor) {
+            const [interaction] = await db.insert(issueThreadInteractions).values({
+              companyId, issueId, kind: "request_confirmation", status: "pending",
+              continuationPolicy: "wake_assignee",
+              createdByAgentId: agentId, sourceRunId: input.runId,
+              addresseeUserId: reviewerId,
+              payload: { version: 1, prompt: "Review the exact handoff document revision." },
+            }).returning();
+            const submitted = await request(app({
+              type: "agent", source: "agent_key", companyId, agentId, runId: input.runId,
+            })).patch(`/api/issues/${issueId}`).send({
+              status: "in_review", reviewInteractionId: interaction.id,
+            });
+            expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+            const [candidate] = await db.select().from(activityLog).where(and(
+              eq(activityLog.companyId, companyId),
+              eq(activityLog.entityId, issueId),
+              eq(activityLog.action, "issue.governed_review_candidate.v1"),
+            ));
+            expect(candidate?.runId).toBe(input.runId);
+            const [during] = await db.select().from(issues).where(eq(issues.id, issueId));
+            expect(candidate?.details?.issueStatusVersion).toBe(during?.statusVersion);
+            expect(candidate?.details?.completionContractId).toBe(run?.completionContractId);
+            expect(candidate?.details?.completionContractSha256).toBe(run?.completionContractSha256);
+            expect(candidate?.details?.sourceRunId).toBe(run?.id);
+            expect(during?.status).toBe("in_review");
+            createdAnchor = {
+              id: candidate!.id, details: candidate!.details as Record<string, unknown>,
+            };
+            if (mode === "document") {
+              await db.insert(documents).values({
+                id: documentId, companyId, title: "Reviewable handoff",
+                latestBody: evidenceBody,
+              });
+              await db.insert(documentRevisions).values({
+                id: revisionId, documentId, companyId, revisionNumber: 1,
+                body: evidenceBody, format: "markdown",
+                createdByAgentId: agentId, createdByRunId: input.runId,
+              });
+              await db.update(documents).set({ latestRevisionId: revisionId })
+                .where(eq(documents.id, documentId));
+              await db.insert(issueDocuments).values({
+                companyId, issueId, documentId, key: "handoff-deliverable",
+              });
+            }
+          }
+          return {
+            exitCode: 0, signal: null, timedOut: false,
+            provider: "cline", model: "safe-spy-only",
+            summary: "Documentation handoff fixture, no actual models called",
+            resultJson: {
+              evidence: mode === "document"
+                ? [{ criterionId: "objective", ref: `issue_document_revision:${revisionId}` }]
+                : [],
+            },
+          };
+        });
+        registerServerAdapter({
+          type: "cline_local", supportsLocalAgentJwt: false, execute,
+          testEnvironment: async () => ({
+            adapterType: "cline_local", status: "pass", checks: [],
+            testedAt: now.toISOString(),
+          }),
+        });
+        h = heartbeatService(db, {
+          beforeDirectSensorAdmissionCheck: async ({ runId, issueId: actualIssueId }) => {
+            seenAdmissionIds.push(runId);
+            expect(actualIssueId).toBe(issueId);
+            const [linked] = await db.select().from(issueDocuments).where(and(
+              eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issueId),
+              eq(issueDocuments.key, "sensor-admission"),
+            ));
+            if (linked) return; // A second run is recorded, never suppressed.
+            const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+            const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+            const workspaceId = issue?.executionWorkspaceId;
+            expect(workspaceId).toBeTruthy();
+            expect(run?.contextSnapshot?.executionWorkspaceId).toBe(workspaceId);
+            const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId!));
+            const baselineSha = "d".repeat(40);
+            await db.update(executionWorkspaces).set({
+              metadata: { ...workspace!.metadata, baseRefSnapshot: { resolvedSha: baselineSha } },
+            }).where(eq(executionWorkspaces.id, workspaceId!));
+            const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+            const configId = randomUUID(), admissionDocumentId = randomUUID(), admissionRevisionId = randomUUID();
+            await db.insert(agentConfigRevisions).values({
+              id: configId, companyId, agentId, beforeConfig: {},
+              afterConfig: {
+                capabilities: agent!.capabilities, adapterType: agent!.adapterType,
+                adapterConfig: agent!.adapterConfig, runtimeConfig: agent!.runtimeConfig,
+                defaultEnvironmentId: agent!.defaultEnvironmentId,
+              },
+            });
+            const body = JSON.stringify({
+              schema: "sensor-admission.v1", issueId, requiredCapabilities: ["code"],
+              workerQualification: {
+                agentId, qualificationRevision: "int2-bcd-qualified",
+                agentConfigRevisionId: configId, qualifiedCapabilities: ["code"],
+              },
+              scope: { allowedPaths: ["server/src/**"], forbiddenPaths: [".github/**"] },
+              workspace: { id: workspaceId, baselineSha }, minimumRiskClass: "standard",
+            });
+            await db.insert(documents).values({
+              id: admissionDocumentId, companyId, title: "INT2 admission", latestBody: body,
+            });
+            await db.insert(documentRevisions).values({
+              id: admissionRevisionId, documentId: admissionDocumentId,
+              companyId, revisionNumber: 1, body,
+            });
+            await db.update(documents).set({ latestRevisionId: admissionRevisionId })
+              .where(eq(documents.id, admissionDocumentId));
+            await db.insert(issueDocuments).values({
+              companyId, issueId, documentId: admissionDocumentId, key: "sensor-admission",
+            });
+          },
+        });
+        const queued = await h.invoke(agentId, "on_demand", {
+          issueId, taskKey: issueId, skipIssueComment: true,
+        }, "manual");
+        expect(queued).not.toBeNull();
+        await drainHeartbeatRunsToQuiescence(db, h);
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+        const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        expect(seenAdmissionIds).toContain(run!.id);
+        expect(seenAdapterIds).toContain(run!.id);
+        expect(execute.mock.calls.length).toBe(seenAdapterIds.length);
+        expect(seenAdapterIds.filter(id => id === run!.id)).toHaveLength(1);
+        expect(run?.status).toBe("succeeded");
+        expect(run?.finishedAt).not.toBeNull();
+        expect(current?.status).toBe("in_review");
+        expect(createdAnchor?.details.sourceRunId).toBe(run?.id);
+        expect(createdAnchor?.details.issueStatusVersion).toBe(current?.statusVersion);
+        expect(createdAnchor?.details.completionContractId).toBe(run?.completionContractId);
+        expect(createdAnchor?.details.completionContractSha256).toBe(run?.completionContractSha256);
+        expect(allRuns.some(row => row.id === run?.id)).toBe(true);
+        const ref = `issue_document_revision:${mode === "document" ? revisionId : randomUUID()}`;
+        const reviewed = await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({
+          status: "done",
+          governedReviewDecision: {
+            candidateId: createdAnchor!.id,
+            candidateIssueStatusVersion: current!.statusVersion,
+            criteriaVerdicts: [{
+              criterionId: "objective", ref,
+              bodySha256: createHash("sha256").update(evidenceBody, "utf8").digest("hex"),
+              verdict: "accepted",
+              rationale: "I reviewed this exact handoff text against the frozen objective.",
+            }],
+          },
+        });
+        const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const basis = await db.select().from(activityLog).where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.governed_acceptance_decided.v1"),
+        ));
+        const result = {
+          mode, runId: run!.id, candidateId: createdAnchor!.id,
+          candidateStatusVersion: current!.statusVersion,
+          pinnedContractId: run!.completionContractId,
+          pinnedContractHash: run!.completionContractSha256,
+          sourceTerminal: run!.status, evidence: run!.resultJson?.evidence,
+          observedRuns: allRuns.map(r => ({ id: r.id, status: r.status })),
+          adapterCalls: seenAdapterIds, admissionChecks: seenAdmissionIds,
+          reviewerHttp: reviewed.status, response: reviewed.body,
+          after: after?.status, acceptedAuditRows: basis.length,
+        };
+        console.info("INT2_BCD_OBSERVATION " + JSON.stringify(result));
+        if (mode === "missing") {
+          expect(reviewed.status, JSON.stringify(result)).toBe(422);
+          expect(reviewed.body.details?.code, JSON.stringify(result)).toBe("criterion_evidence_missing");
+          expect(after?.status).toBe("in_review");
+          expect(basis).toHaveLength(0);
+        } else {
+          expect(reviewed.status, JSON.stringify(result)).toBe(200);
+          expect(after?.status).toBe("done");
+          expect(basis).toHaveLength(1);
+          expect(basis[0].details).toMatchObject({
+            candidateId: createdAnchor!.id,
+            completionContractId: run!.completionContractId,
+            completionContractSha256: run!.completionContractSha256,
+            outcome: "accepted",
+            criterionProof: [{ revisionId, ref }],
+          });
+        }
+      } finally {
+        if (h) await drainHeartbeatRunsToQuiescence(db, h);
+        unregisterServerAdapter("cline_local");
+        await cluster.cleanup();
+      }
+    }, 120_000);
+  }
 });
