@@ -68,7 +68,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           test -f server/node_modules/vitest/vitest.mjs
-      - name: Compile source and run four targeted PostgreSQL groups
+      - name: Compile and probe issue-targeted replacement heartbeat
         shell: bash
         run: |
           set -euo pipefail
@@ -89,33 +89,15 @@ jobs:
             echo "$rc" > ".int2-evidence/$label.exit_code"
             test ! -f "int2-$label.json" || cp "int2-$label.json" .int2-evidence/
           }
-          run_named bcd src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD'
-          run_named board src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 RED: governed direct missing evidence must not close issue'
-          run_named direct src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts 'governed cline_local commits exactly one direct v2 completion pin and never replays'
-          run_named ordinary src/__tests__/issue-stalled-review-decision-routes.test.ts 'rejects stale or covered reviews and serializes concurrent decisions'
-          # These are existing, independently named, real embedded-Postgres
-          # regressions. They do not claim full governed INT2 controller proof.
-          run_named native src/__tests__/native-status-arbiter-corpus.test.ts 'retires a proven automatic review and applies the current successful completion exactly once'
-          run_named tree src/__tests__/issue-tree-control-service.test.ts 'cancels non-terminal issue statuses and restores from the cancel snapshot'
-          run_named workspace src/__tests__/execution-workspaces-service.test.ts 'archives terminal workspaces without running configured cleanup hooks'
-          run_named recovery src/__tests__/native-finalization-recovery.test.ts 'retires an older failed finalizer when a newer run already committed the issue'
+          # Single new hypothesis. 18 prior PASS at b6fa1f5 are immutable.
+          run_named replacement src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD replacement_heartbeat: actual admitted run and independent reviewer'
       - name: Classify executed assertions (skips always NOT_RUN)
         run: |
           node <<'NODE'
           const fs=require("node:fs");
           const dir=".int2-evidence";
           const cases={
-            bcd:[
-              "missing", "document", "release", "successor", "assignee_aba",
-              "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic"
-            ].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer"),
-            board:["P04 INT2 RED: governed direct missing evidence must not close issue"],
-            direct:["governed cline_local commits exactly one direct v2 completion pin and never replays"],
-            ordinary:["rejects stale or covered reviews and serializes concurrent decisions"],
-            native:["retires a proven automatic review and applies the current successful completion exactly once"],
-            tree:["cancels non-terminal issue statuses and restores from the cancel snapshot"],
-            workspace:["archives terminal workspaces without running configured cleanup hooks"],
-            recovery:["retires an older failed finalizer when a newer run already committed the issue"]
+            replacement:["P04 INT2 BCD replacement_heartbeat: actual admitted run and independent reviewer"]
           };
           const output={};
           let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";

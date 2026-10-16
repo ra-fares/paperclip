@@ -30,6 +30,7 @@ import {
 import type { ServerAdapterModule } from "../adapters/index.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { errorHandler } from "../middleware/index.js";
@@ -827,6 +828,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   for (const mode of [
     "missing", "document", "release", "successor", "assignee_aba",
     "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
+    "replacement_heartbeat",
   ] as const) {
     it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
@@ -837,6 +839,10 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       const documentId = randomUUID(), revisionId = randomUUID();
       const seenAdmissionIds: string[] = [];
       const seenAdapterIds: string[] = [];
+      const adapterBindings: Array<{
+        runId: string; executionRunId: string | null;
+        status: string; statusVersion: number;
+      }> = [];
       const execute = vi.fn<ServerAdapterModule["execute"]>();
       let h: ReturnType<typeof heartbeatService> | null = null;
       let createdAnchor: { id: string; details: Record<string, unknown> } | undefined;
@@ -885,6 +891,13 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
 
         execute.mockImplementation(async input => {
           seenAdapterIds.push(input.runId);
+          const [atEntry] = await db.select().from(issues).where(eq(issues.id, issueId));
+          adapterBindings.push({
+            runId: input.runId,
+            executionRunId: atEntry!.executionRunId,
+            status: atEntry!.status,
+            statusVersion: atEntry!.statusVersion,
+          });
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
           const receipt = run?.runnerProfileJson?.sensorDirectDispatchClaim as Record<string, unknown> | undefined;
           // This read occurs INSIDE the real adapter spy, after committed v2.
@@ -1033,6 +1046,127 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         expect(allRuns.some(row => row.id === run?.id)).toBe(true);
         const ref = `issue_document_revision:${mode !== "missing" ? revisionId : randomUUID()}`;
         // All D cases share the same genuine running-run B and terminal C.
+        // Bounded probe of the actual issue-targeted heartbeat route in in_review.
+        // No synthetic successor, no status override, no suppressed hook/adapter.
+        if (mode === "replacement_heartbeat") {
+          const issueSnapshots: Array<{
+            phase: string; status: string; statusVersion: number;
+            executionRunId: string | null; checkoutRunId: string | null;
+          }> = [];
+          const capture = async (phase: string) => {
+            const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+            expect(row).toBeDefined();
+            issueSnapshots.push({
+              phase, status: row!.status, statusVersion: row!.statusVersion,
+              executionRunId: row!.executionRunId, checkoutRunId: row!.checkoutRunId,
+            });
+            return row!;
+          };
+          await capture("source_terminal_before_reinvoke");
+          let invokedId: string | null = null;
+          let invokeError: string | null = null;
+          try {
+            const invoked = await h.invoke(agentId, "on_demand", {
+              issueId, taskKey: issueId, skipIssueComment: true,
+            }, "manual");
+            invokedId = invoked?.id ?? null;
+          } catch (err) {
+            // Preserve a genuine router/policy denial as evidence, then fail
+            // the exact replacement assertion instead of changing production.
+            invokeError = err instanceof Error ? err.message : String(err);
+          }
+          await capture("after_invoke_request");
+          await drainHeartbeatRunsToQuiescence(db, h);
+          const terminalIssue = await capture("after_drain");
+          const [invokedRun] = invokedId
+            ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, invokedId))
+            : [];
+          // This API is the actual issue-service terminal cleanup. Never
+          // directly clear replacement executionRunId with test SQL.
+          let clearedExecution = false, clearedCheckout = false;
+          if (invokedRun?.status === "succeeded") {
+            clearedExecution = await issueService(db).clearExecutionRunIfTerminal(issueId);
+            clearedCheckout = await issueService(db).clearCheckoutRunIfTerminal(issueId);
+          }
+          const releasedIssue = await capture("after_terminal_cleanup");
+          const allObservedRuns = await db.select().from(heartbeatRuns)
+            .where(eq(heartbeatRuns.companyId, companyId));
+          const trace = {
+            mode, postgresVersion: dbVersion.version,
+            candidateId: createdAnchor!.id, candidateIssueStatusVersion: current!.statusVersion,
+            sourceRunId: run!.id, sourceRunStatus: run!.status,
+            invokedId, invokeError, invokedStatus: invokedRun?.status ?? null,
+            clearedExecution, clearedCheckout, issueSnapshots,
+            adapterBindings, adapterCalls: seenAdapterIds,
+            actualExecuteCalls: execute.mock.calls.map(([input]) => input.runId),
+            admissionChecks: seenAdmissionIds,
+            allRuns: allObservedRuns.map(row => ({
+              id: row.id, status: row.status, agentId: row.agentId,
+              retryOfRunId: row.retryOfRunId, nativeIssueId: row.nativeIssueId,
+              contextIssueId: row.contextSnapshot?.issueId ?? null,
+              startedAt: row.startedAt?.toISOString() ?? null,
+              finishedAt: row.finishedAt?.toISOString() ?? null,
+              receiptSchema: (row.runnerProfileJson?.sensorDirectDispatchClaim as
+                Record<string, unknown> | undefined)?.schema ?? null,
+            })),
+          };
+          console.info("INT2_BCD_OBSERVATION " + JSON.stringify(trace));
+
+          // If the legitimate route refuses replacement while in_review,
+          // leave this selected case FAIL with the exact run/response trace.
+          // Astra decides whether another *authorized* lifecycle is required.
+          expect(invokeError, JSON.stringify(trace)).toBeNull();
+          expect(invokedId, JSON.stringify(trace)).toBeTruthy();
+          expect(invokedId, JSON.stringify(trace)).not.toBe(run!.id);
+          expect(invokedRun?.status, JSON.stringify(trace)).toBe("succeeded");
+          expect(invokedRun?.finishedAt, JSON.stringify(trace)).not.toBeNull();
+          expect(
+            adapterBindings.filter(entry =>
+              entry.runId === invokedId && entry.executionRunId === invokedId
+            ), JSON.stringify(trace),
+          ).toHaveLength(1);
+          expect(seenAdapterIds.filter(id => id === invokedId), JSON.stringify(trace)).toHaveLength(1);
+          expect(execute.mock.calls.length, JSON.stringify(trace)).toBe(seenAdapterIds.length);
+          expect(terminalIssue.statusVersion, JSON.stringify(trace))
+            .toBeGreaterThan(current!.statusVersion);
+          expect(releasedIssue.executionRunId, JSON.stringify(trace)).toBeNull();
+          expect(releasedIssue.checkoutRunId, JSON.stringify(trace)).toBeNull();
+
+          const reviewed = await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({
+            status: "done",
+            governedReviewDecision: {
+              candidateId: createdAnchor!.id,
+              candidateIssueStatusVersion: current!.statusVersion,
+              criteriaVerdicts: [{
+                criterionId: "objective", ref,
+                bodySha256: createHash("sha256").update(evidenceBody, "utf8").digest("hex"),
+                verdict: "accepted",
+                rationale: "Verified the bound documentary evidence, not the replacement.",
+              }],
+            },
+          });
+          const [afterD] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const accepted = await db.select().from(activityLog).where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.governed_acceptance_decided.v1"),
+          ));
+          const outcome = {
+            ...trace, reviewerStatus: reviewed.status,
+            reviewerCode: reviewed.body.details?.code ?? null,
+            finalStatus: afterD?.status,
+            finalVersion: afterD?.statusVersion, acceptedDecisions: accepted.length,
+          };
+          console.info("INT2_BCD_OBSERVATION " + JSON.stringify(outcome));
+          expect(reviewed.status, JSON.stringify(outcome)).toBe(409);
+          expect(
+            ["governed_candidate_superseded", "governed_candidate_stale", "governed_candidate_missing"],
+            JSON.stringify(outcome),
+          ).toContain(reviewed.body.details?.code);
+          expect(accepted, JSON.stringify(outcome)).toHaveLength(0);
+          expect(afterD?.status, JSON.stringify(outcome)).not.toBe("done");
+          return;
+        }
         if (mode === "release") {
           const beforeReleaseVersion = current!.statusVersion;
           expect([null, run!.id]).toContain(current!.executionRunId);
