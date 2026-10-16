@@ -850,6 +850,23 @@ const issueCommentAttachmentIdsSchema = z
     message: "Attachment ids must be unique",
   });
 
+// INT2 v1: client references a server-minted review candidate. Neither the
+// candidate nor these verdicts confer authority until issueService rechecks
+// their identities and immutable document revisions under the issue row lock.
+export const governedReviewDecisionSchema = z.object({
+  candidateId: z.string().uuid(),
+  candidateIssueStatusVersion: z.number().int().nonnegative(),
+  criteriaVerdicts: z.array(z.object({
+    criterionId: z.string().trim().min(1).max(160),
+    ref: z.string().regex(/^issue_document_revision:[0-9a-fA-F-]{36}$/),
+    bodySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    verdict: z.enum(["accepted", "rejected"]),
+    rationale: z.string().trim().min(1).max(4000),
+  }).strict()).min(1).max(100),
+}).strict();
+
+export type GovernedReviewDecision = z.infer<typeof governedReviewDecisionSchema>;
+
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     createdByUserId: true,
@@ -867,6 +884,7 @@ export const updateIssueSchema = objectWithoutDefaults(
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),
     onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
     reviewInteractionId: z.string().guid().optional(),
+    governedReviewDecision: governedReviewDecisionSchema.optional(),
     reviewRequest: issueReviewRequestSchema.optional().nullable(),
     reopen: z.boolean().optional(),
     resume: z.boolean().optional(),
