@@ -1761,7 +1761,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
         await db
           .update(issues)
-          .set({ executionWorkspaceId: null, updatedAt: now() })
+          .set({
+            executionWorkspaceId: null,
+            statusVersion: sql`${issues.statusVersion} + 1`,
+            updatedAt: now(),
+          })
           .where(and(
             eq(issues.companyId, workspace.companyId),
             eq(issues.executionWorkspaceId, workspace.id),
