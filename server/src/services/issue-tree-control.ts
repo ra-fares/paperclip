@@ -981,6 +981,8 @@ export function issueTreeControlService(db: Db) {
           .update(issues)
           .set({
             status,
+            // Restoring a review is a new cycle, never the old candidate.
+            statusVersion: sql`${issues.statusVersion} + 1`,
             cancelledAt: null,
             completedAt: null,
             checkoutRunId: null,
