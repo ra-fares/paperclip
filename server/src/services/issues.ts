@@ -11269,6 +11269,140 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        // INT2 is enforced at the sole issue status writer. An HTTP guard
+        // alone is bypassable by stalled reviews and interaction resolvers.
+        const [sensorDocument] = await tx.select({ id: issueDocuments.id })
+          .from(issueDocuments).where(and(
+            eq(issueDocuments.companyId, receiptExisting.companyId),
+            eq(issueDocuments.issueId, receiptExisting.id),
+            eq(issueDocuments.key, "sensor-admission"),
+          )).limit(1);
+        const governedIssue = receiptExisting.sensorGovernedAt != null || Boolean(sensorDocument);
+        if (governedReviewDecision && (patch.status !== "done" || !governedIssue)) {
+          throw unprocessable("Governed review decisions apply only to governed issue acceptance", {
+            code: "governed_decision_not_applicable",
+          });
+        }
+        let acceptedInt2: Awaited<ReturnType<typeof prepareInt2AcceptanceInTx>> | null = null;
+        let candidateSource: {
+          sourceRunId: string;
+          sourceAgentId: string;
+          receipt: GovernedReceipt;
+          executionWorkspaceIdentityDigest: string | null;
+        } | null = null;
+        if (governedIssue && patch.status === "done") {
+          const nativeAuthority =
+            !actorAgentId && !actorUserId && !governedReviewDecision &&
+            await assertInt2NativeDecisionInTx(
+              tx as Db, receiptExisting, issueData.lastStatusDecisionId,
+              issueData.statusVersion,
+            );
+          if (!nativeAuthority) {
+            acceptedInt2 = await prepareInt2AcceptanceInTx(
+              tx as Db, receiptExisting, governedReviewDecision,
+              {
+                userId: actorUserId ?? null,
+                agentId: actorAgentId ?? null,
+                interactionId: governedReviewInteractionId ?? null,
+              },
+            );
+          }
+        }
+
+        if (governedIssue && receiptExisting.status !== "in_review" &&
+            patch.status === "in_review" && actorAgentId && actorRunId) {
+          if (receiptExisting.executionRunId !== actorRunId ||
+              receiptExisting.assigneeAgentId !== actorAgentId ||
+              receiptExisting.conversationAgentId != null) {
+            throw conflict("Authenticated source run no longer owns governed issue", {
+              code: "governed_review_source_stale",
+            });
+          }
+          const [sourceRun] = await tx.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, actorRunId),
+            eq(heartbeatRuns.companyId, receiptExisting.companyId),
+            eq(heartbeatRuns.agentId, actorAgentId),
+          )).for("share").limit(1);
+          const sourceReceipt = sourceRun && int2Receipt(sourceRun);
+          if (!sourceRun || !sourceReceipt || sourceRun.runtimeMode !== "legacy" ||
+              sourceRun.status !== "running" ||
+              sourceRun.contextSnapshot?.issueId !== receiptExisting.id ||
+              sourceReceipt.runId !== sourceRun.id ||
+              sourceReceipt.issueId !== receiptExisting.id ||
+              sourceReceipt.completionContractId !== sourceRun.completionContractId ||
+              sourceReceipt.completionContractSha256 !== sourceRun.completionContractSha256) {
+            throw conflict("Source run has no running committed v2 admission receipt", {
+              code: "governed_review_source_ineligible",
+            });
+          }
+          // Verify immutable contract, not a live config/qualification lookup.
+          const [contract] = await tx.select().from(completionContracts).where(and(
+            eq(completionContracts.id, sourceReceipt.completionContractId),
+            eq(completionContracts.companyId, receiptExisting.companyId),
+            eq(completionContracts.issueId, receiptExisting.id),
+          )).for("share").limit(1);
+          if (!contract || contract.canonicalSha256 !== sourceReceipt.completionContractSha256 ||
+              nativeSha256({
+                schemaVersion: contract.schemaVersion,
+                policyVersion: contract.policyVersion,
+                risk: contract.risk,
+                completionAuthority: contract.completionAuthority,
+                contract: contract.contractJson,
+              }) !== contract.canonicalSha256) {
+            throw conflict("Source completion contract changed", {
+              code: "governed_review_contract_stale",
+            });
+          }
+          let executionWorkspaceIdentityDigest: string | null = null;
+          if (receiptExisting.executionWorkspaceId) {
+            const [workspace] = await tx.select().from(executionWorkspaces).where(and(
+              eq(executionWorkspaces.id, receiptExisting.executionWorkspaceId),
+              eq(executionWorkspaces.companyId, receiptExisting.companyId),
+            )).for("share").limit(1);
+            if (!workspace || workspace.status !== "active" ||
+                workspace.projectId !== receiptExisting.projectId) {
+              throw conflict("Source workspace is not valid", {
+                code: "governed_review_workspace_stale",
+              });
+            }
+            executionWorkspaceIdentityDigest = int2WorkspaceIdentity(workspace);
+          }
+          candidateSource = {
+            sourceRunId: sourceRun.id, sourceAgentId: sourceRun.agentId,
+            receipt: sourceReceipt, executionWorkspaceIdentityDigest,
+          };
+          // A running original must stay bound while it settles. Otherwise
+          // ordinary in_review side effects detach it before C.
+          patch.executionRunId = receiptExisting.executionRunId;
+          patch.checkoutRunId = receiptExisting.checkoutRunId;
+          patch.executionAgentNameKey = receiptExisting.executionAgentNameKey;
+          patch.executionLockedAt = receiptExisting.executionLockedAt;
+        }
+
+        // A genuine change of status, ownership or execution scope advances
+        // the version once. An idempotent write does not. Native's explicit
+        // decision version is a separate CAS and must not be double-bumped.
+        const materialScopeKeys = [
+          "status", "assigneeAgentId", "assigneeUserId", "projectId",
+          "projectWorkspaceId", "executionWorkspaceId",
+          "executionWorkspacePreference", "executionRunId",
+        ] as const;
+        const materiallyChanged = materialScopeKeys.some(
+          key => patch[key] !== undefined && patch[key] !== receiptExisting[key]
+        ) || (patch.executionWorkspaceSettings !== undefined &&
+          nativeSha256(patch.executionWorkspaceSettings) !==
+          nativeSha256(receiptExisting.executionWorkspaceSettings));
+        if (materiallyChanged && patch.statusVersion === undefined) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+        }
+        if (acceptedInt2 && (materialScopeKeys.some(
+          key => key !== "status" && patch[key] !== undefined &&
+            patch[key] !== receiptExisting[key]
+        ) || patch.executionWorkspaceSettings !== undefined)) {
+          throw conflict("Acceptance cannot modify execution scope", {
+            code: "governed_candidate_scope_mutation",
+          });
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -11276,6 +11410,73 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        // The candidate ID is generated only from a genuinely authenticated
+        // running source, after the status version has been persisted. Its
+        // event row and the issue transition share this exact transaction.
+        if (candidateSource) {
+          const [candidate] = await tx.insert(activityLog).values({
+            companyId: updated.companyId,
+            actorType: "agent", actorId: candidateSource.sourceAgentId,
+            agentId: candidateSource.sourceAgentId,
+            runId: candidateSource.sourceRunId,
+            action: "issue.governed_review_candidate.v1",
+            entityType: "issue", entityId: updated.id,
+            details: {
+              schema: "issue.governed_review_candidate.v1",
+              issueStatusVersion: updated.statusVersion,
+              priorStatus: receiptExisting.status,
+              sourceRunId: candidateSource.sourceRunId,
+              sourceAgentId: candidateSource.sourceAgentId,
+              receiptSchema: candidateSource.receipt.schema,
+              pinDigest: nativeSha256(candidateSource.receipt.sensorAdmission),
+              completionContractId: candidateSource.receipt.completionContractId,
+              completionContractSha256: candidateSource.receipt.completionContractSha256,
+              projectId: receiptExisting.projectId,
+              projectWorkspaceId: receiptExisting.projectWorkspaceId,
+              executionWorkspaceId: receiptExisting.executionWorkspaceId,
+              executionWorkspacePreference: receiptExisting.executionWorkspacePreference,
+              executionWorkspaceSettingsDigest:
+                nativeSha256(receiptExisting.executionWorkspaceSettings ?? null),
+              executionWorkspaceIdentityDigest: candidateSource.executionWorkspaceIdentityDigest,
+              assigneeAgentId: receiptExisting.assigneeAgentId,
+              assigneeUserId: receiptExisting.assigneeUserId,
+              reviewInteractionId: governedReviewInteractionId ?? null,
+            },
+          }).returning({ id: activityLog.id });
+          if (!candidate) throw new Error("governed_review_candidate_insert_failed");
+        }
+        if (acceptedInt2) {
+          const basis = {
+            candidateId: acceptedInt2.candidate.id,
+            candidateIssueStatusVersion: receiptExisting.statusVersion,
+            receiptSchema: acceptedInt2.receipt.schema,
+            pinDigest: nativeSha256(acceptedInt2.receipt.sensorAdmission),
+            sourceRunId: acceptedInt2.sourceRunId,
+            completionContractId: acceptedInt2.receipt.completionContractId,
+            completionContractSha256: acceptedInt2.receipt.completionContractSha256,
+            criterionProof: acceptedInt2.proof,
+            reviewer: {
+              actorType: actorUserId ? "user" : "agent",
+              actorId: acceptedInt2.reviewerId,
+            },
+            policy: receiptExisting.reviewPolicy ?? "anyone",
+            outcome: "accepted",
+            priorStatus: receiptExisting.status,
+            nextStatus: updated.status,
+          };
+          await tx.insert(activityLog).values({
+            companyId: updated.companyId,
+            actorType: actorUserId ? "user" : "agent",
+            actorId: acceptedInt2.reviewerId,
+            agentId: actorAgentId ?? null,
+            runId: acceptedInt2.sourceRunId,
+            action: "issue.governed_acceptance_decided.v1",
+            entityType: "issue", entityId: updated.id,
+            details: {
+              ...basis, canonicalDecisionSha256: nativeSha256(basis),
+            },
+          });
+        }
         await recordChatCompletion(tx, receiptExisting, updated);
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
