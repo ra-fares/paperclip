@@ -1011,6 +1011,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         }, "manual");
         expect(queued).not.toBeNull();
         await drainHeartbeatRunsToQuiescence(db, h);
+        const [dbVersion] = await db.select({ version: sql<string>`version()` })
+          .from(sql`(select 1) as probe`);
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
         const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
         const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
@@ -1047,7 +1049,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           eq(activityLog.action, "issue.governed_acceptance_decided.v1"),
         ));
         const result = {
-          mode, runId: run!.id, candidateId: createdAnchor!.id,
+          mode, postgresVersion: dbVersion.version, runId: run!.id, candidateId: createdAnchor!.id,
           candidateStatusVersion: current!.statusVersion,
           pinnedContractId: run!.completionContractId,
           pinnedContractHash: run!.completionContractSha256,
