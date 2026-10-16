@@ -1,50 +1,55 @@
-# One P04 INT2 RED: true embedded PostgreSQL preflight followed by a single named failing oracle.
-name: Sensor P04 INT2 first RED
+# Historical first RED remains on its original branch. This is GREEN evaluation only.
+name: Sensor P04 INT2 isolated acceptance
 on:
   push:
-    branches: [codex/p04-int2-first-red]
+    branches: [codex/p04-int2-acceptance-fix]
     paths:
       - .github/workflows/sensor-p04-int2-first-red.yml
+      - packages/shared/src/validators/issue.ts
+      - server/src/routes/issues.ts
+      - server/src/services/issues.ts
+      - server/src/services/heartbeat.ts
+      - server/src/services/execution-recovery-resolution.ts
+      - server/src/services/issue-tree-control.ts
+      - server/src/services/execution-workspaces.ts
+      - server/src/routes/execution-workspaces.ts
       - server/src/__tests__/issue-stalled-review-decision-routes.test.ts
+      - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-int2-first-red
+  group: sensor-p04-int2-acceptance-fix
   cancel-in-progress: false
 jobs:
-  one-preflight-one-red:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/p04-int2-first-red'
+  isolated-postgres:
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/p04-int2-acceptance-fix'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
+    timeout-minutes: 40
     env:
       CI: 'true'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
       NO_COLOR: '1'
     steps:
-      - name: Checkout exact test candidate
+      - name: Checkout pinned candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          fetch-depth: 10 # include prepared 237db parent through isolated workflow commits
-      - name: Verify SHA, ancestry and workflow-only diff
-        shell: bash
+          fetch-depth: 40
+      - name: Verify ancestry and exact allowed diff
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/p04-int2-evidence" "$RUNNER_TEMP/paperclip-p04-int2-first-red"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/paperclip-p04-int2-first-red" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence "$RUNNER_TEMP/p04-int2-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/p04-int2-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git merge-base --is-ancestor 237db6500b4f913271453a4070cb6a6e3f2779db HEAD
-          git diff --name-only 237db6500b4f913271453a4070cb6a6e3f2779db HEAD > "$RUNNER_TEMP/p04-int2-evidence/changed-files.txt"
-          test "$(cat "$RUNNER_TEMP/p04-int2-evidence/changed-files.txt")" = '.github/workflows/sensor-p04-int2-first-red.yml'
-          {
-            echo "BASE=244aecdffc8ace975130995d973e17cdc0697f45"
-            echo "TEST_COMMIT=237db6500b4f913271453a4070cb6a6e3f2779db"
-            echo "EXECUTION_SHA=$GITHUB_SHA"
-            echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
-            echo "RUNNER_OS=$RUNNER_OS"
-          } > "$RUNNER_TEMP/p04-int2-evidence/identity.txt"
+          git merge-base --is-ancestor af05d88bc3064639f69cbc87932cc17cfba9dbd2 HEAD
+          git diff --name-only af05d88bc3064639f69cbc87932cc17cfba9dbd2 HEAD | tee .int2-evidence/changed-files.txt
+          while IFS= read -r f; do
+            case "$f" in
+              packages/shared/src/validators/issue.ts|server/src/routes/issues.ts|server/src/services/issues.ts|server/src/services/heartbeat.ts|server/src/services/execution-recovery-resolution.ts|server/src/services/issue-tree-control.ts|server/src/services/execution-workspaces.ts|server/src/routes/execution-workspaces.ts|server/src/__tests__/issue-stalled-review-decision-routes.test.ts|server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
+              *) echo "OUTSIDE_WRITE_SET $f" >&2; exit 1 ;;
+            esac
+          done < .int2-evidence/changed-files.txt
+          echo "BASE=af05d88bc3064639f69cbc87932cc17cfba9dbd2 SHA=$GITHUB_SHA RUN=$GITHUB_RUN_ID" > .int2-evidence/identity.txt
       - name: Setup Node 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -55,8 +60,7 @@ jobs:
         with:
           version: 9.15.4
           run_install: false
-      - name: Install pinned dependencies and build plugin SDK
-        shell: bash
+      - name: Frozen install and SDK
         run: |
           set -euo pipefail
           node --version
@@ -64,75 +68,71 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           test -f server/node_modules/vitest/vitest.mjs
-      - name: Preflight requires one executed DB test
+      - name: Compile source and run four targeted PostgreSQL groups
         shell: bash
         run: |
           set -euo pipefail
           set +e
-          node server/node_modules/vitest/vitest.mjs run --root server src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=json --outputFile=../int2-preflight.json -t 'enforces not_creator when accepting or rejecting pending review interactions' > "$RUNNER_TEMP/p04-int2-evidence/preflight.stdout" 2> "$RUNNER_TEMP/p04-int2-evidence/preflight.stderr"
-          rc=$?
+          pnpm --filter @paperclipai/server typecheck > .int2-evidence/typecheck.stdout 2> .int2-evidence/typecheck.stderr
+          tsc=$?
           set -e
-          echo "$rc" > "$RUNNER_TEMP/p04-int2-evidence/preflight.exit_code"
-          node - "$RUNNER_TEMP/p04-int2-evidence" "$rc" <<'NODE'
-          const fs=require('node:fs'),path=require('node:path');
-          const dir=process.argv[2],rc=Number(process.argv[3]);
-          const result={classification:'NOT_RUN',exitCode:rc};
-          try {
-            const j=JSON.parse(fs.readFileSync('int2-preflight.json','utf8'));
-            const x=j.testResults.flatMap(a=>a.assertionResults).filter(a=>a.fullName.includes('enforces not_creator when accepting or rejecting pending review interactions'));
-            result.selectedCount=x.length;result.selectedStatus=x[0]?.status??null;
-            if(x.length===1&&x[0].status==='passed'&&j.numFailedTests===0&&rc===0)result.classification='PREFLIGHT_EXECUTED_PASS';
-            else result.classification='PREFLIGHT_NOT_PASS';
-          } catch(e){result.error=String(e)}
-          fs.writeFileSync(path.join(dir,'preflight-classification.json'),JSON.stringify(result,null,2));
-          console.log(result);
-          if(result.classification!=='PREFLIGHT_EXECUTED_PASS')process.exitCode=1;
-          NODE
-      - name: Exactly one INT2 RED must fail at final evidence oracle
-        shell: bash
+          echo "$tsc" > .int2-evidence/typecheck.exit_code
+          run_named () {
+            local label="$1" file="$2" pattern="$3"
+            set +e
+            node server/node_modules/vitest/vitest.mjs run --root server "$file" --reporter=json --outputFile="../int2-$label.json" -t "$pattern" > ".int2-evidence/$label.stdout" 2> ".int2-evidence/$label.stderr"
+            local rc=$?
+            set -e
+            echo "$rc" > ".int2-evidence/$label.exit_code"
+            test ! -f "int2-$label.json" || cp "int2-$label.json" .int2-evidence/
+          }
+          run_named bcd src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD'
+          run_named board src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 RED: governed direct missing evidence must not close issue'
+          run_named direct src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts 'governed cline_local commits exactly one direct v2 completion pin and never replays'
+          run_named ordinary src/__tests__/issue-stalled-review-decision-routes.test.ts 'rejects stale or covered reviews and serializes concurrent decisions'
+      - name: Classify executed assertions (skips always NOT_RUN)
         run: |
-          set -euo pipefail
-          set +e
-          node server/node_modules/vitest/vitest.mjs run --root server src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=json --outputFile=../int2-red.json -t 'P04 INT2 RED: governed direct missing evidence must not close issue' > "$RUNNER_TEMP/p04-int2-evidence/red.stdout" 2> "$RUNNER_TEMP/p04-int2-evidence/red.stderr"
-          rc=$?
-          set -e
-          echo "$rc" > "$RUNNER_TEMP/p04-int2-evidence/red.exit_code"
-          node - "$RUNNER_TEMP/p04-int2-evidence" "$rc" <<'NODE'
-          const fs=require('node:fs'),path=require('node:path');
-          const dir=process.argv[2],rc=Number(process.argv[3]);
-          const result={classification:'INVALID_REPRO',exitCode:rc};
-          try{
-            const j=JSON.parse(fs.readFileSync('int2-red.json','utf8'));
-            const x=j.testResults.flatMap(a=>a.assertionResults).filter(a=>a.fullName.includes('P04 INT2 RED: governed direct missing evidence must not close issue'));
-            result.selectedCount=x.length;result.selectedStatus=x[0]?.status??null;
-            const logs=fs.readFileSync(path.join(dir,'red.stdout'),'utf8');
-            const match=logs.match(/INT2_REVIEW_OBSERVATION\s+(\{[^\r\n]*\})/);
-            if(match){
-              const observation=JSON.parse(match[1]);
-              result.observation=observation;
-              if(x.length===1&&x[0].status==='failed'&&rc!==0
-                &&(x[0].failureMessages??[]).some(s=>s.includes('INT2_REVIEW_ASSERTION'))
-                &&observation.httpStatus===200&&observation.dbStatus==='done')
-                  result.classification='EXPECTED_RED_GOVERNED_ACCEPTANCE_GAP';
-            }else if(x.length===1&&x[0].status==='passed')result.classification='ORACLE_PASS_NOT_RED';
-            else if(x.length===1&&x[0].status==='pending')result.classification='NOT_RUN_SKIPPED';
-          }catch(e){result.error=String(e)}
-          fs.writeFileSync(path.join(dir,'red-classification.json'),JSON.stringify(result,null,2));
-          console.log(JSON.stringify(result));
-          // Expected RED is intentionally NOT a GREEN workflow; evidence survives always().
-          process.exitCode=1;
+          node <<'NODE'
+          const fs=require("node:fs");
+          const dir=".int2-evidence";
+          const cases={
+            bcd:["P04 INT2 BCD missing: actual admitted run and independent reviewer","P04 INT2 BCD document: actual admitted run and independent reviewer"],
+            board:["P04 INT2 RED: governed direct missing evidence must not close issue"],
+            direct:["governed cline_local commits exactly one direct v2 completion pin and never replays"],
+            ordinary:["rejects stale or covered reviews and serializes concurrent decisions"]
+          };
+          const output={};
+          let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";
+          output.typecheck=bad?"FAIL":"PASS";
+          for(const [label,names] of Object.entries(cases)){
+            const exitCode=Number(fs.readFileSync(dir+"/"+label+".exit_code","utf8"));
+            let doc=null,error=null;
+            try{doc=JSON.parse(fs.readFileSync(dir+"/int2-"+label+".json","utf8"))}catch(e){error=String(e)}
+            const assertions=(doc?.testResults??[]).flatMap(x=>x.assertionResults??[]);
+            const checks=names.map(name=>{
+              const found=assertions.filter(x=>x.fullName?.includes(name));
+              const status=found[0]?.status??null;
+              const classification=found.length!==1||status==="pending"||status==="skipped"?"NOT_RUN":
+                (status==="passed"&&exitCode===0&&doc?.numFailedTests===0?"PASS":
+                 status==="failed"?"FAIL":"INVALID_FIXTURE");
+              return {name,classification,status,count:found.length,failureMessages:found[0]?.failureMessages??[]};
+            });
+            if(checks.some(x=>x.classification!=="PASS")||exitCode!==0)bad=true;
+            output[label]={exitCode,error,checks};
+          }
+          output.overall=bad?"FAIL_OR_NOT_RUN":"PASS";
+          fs.writeFileSync(dir+"/classification.json",JSON.stringify(output,null,2));
+          console.log(JSON.stringify(output,null,2));
+          if(bad)process.exitCode=1;
           NODE
-      - name: Upload exact evidence even when tests fail
+      - name: Upload all evidence even on failure
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: p04-int2-first-red-evidence
+          name: p04-int2-acceptance-evidence
           if-no-files-found: warn
           retention-days: 30
-          path: |
-            int2-preflight.json
-            int2-red.json
-            ${{ runner.temp }}/p04-int2-evidence/*
-      - name: Check worktree unchanged
+          path: .int2-evidence/
+      - name: Ensure tracked checkout unchanged
         if: always()
         run: git diff --exit-code
