@@ -123,7 +123,7 @@ jobs:
               const source=[stdout,...messages].join("\\n");
               const observation=(source.match(/INT2_(?:BCD|REVIEW)_OBSERVATION\\s+(\\{[^\\n]+\\})/)??[])[1]??null;
               let classification=found.length!==1||status==="pending"||status==="skipped"?"NOT_RUN":
-                (status==="passed"&&exitCode===0&&doc?.numFailedTests===0?"PASS":
+                (status==="passed"?"PASS":
                  status==="failed"?(observation?"FAIL":"INVALID_FIXTURE"):"INVALID_FIXTURE");
               // The historical first RED remains immutable. Should it ever
               // reproduce, classify the observed regression separately; it
@@ -136,8 +136,14 @@ jobs:
               }
               return {name,classification,status,count:found.length,failureMessages:messages,observation};
             });
-            if(checks.some(x=>x.classification!=="PASS")||exitCode!==0)bad=true;
-            output[label]={exitCode,error,checks};
+            // A group may fail with eight other selected assertions passing.
+            // Preserve both the per-test and whole-group outcomes.
+            const groupFailed=exitCode!==0 || (doc?.numFailedTests??0)>0 || Boolean(error);
+            if(checks.some(x=>x.classification!=="PASS")||groupFailed)bad=true;
+            output[label]={
+              exitCode,error,numPassedTests:doc?.numPassedTests??null,
+              numFailedTests:doc?.numFailedTests??null,groupFailed,checks,
+            };
           }
           output.overall=bad?"FAIL_OR_NOT_RUN":"PASS";
           fs.writeFileSync(dir+"/classification.json",JSON.stringify(output,null,2));

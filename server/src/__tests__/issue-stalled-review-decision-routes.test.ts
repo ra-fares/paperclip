@@ -1063,14 +1063,23 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         }
         if (mode === "assignee_aba") {
           // Use real PATCH writers, not a silent raw SQL scope change.
+          // Preserve the one-assignee invariant: A -> B -> A.
+          const alternateAgentId = randomUUID();
+          await db.insert(agents).values({
+            id: alternateAgentId, companyId, name: "INT2 alternate assignee",
+            role: "engineer", status: "idle", adapterType: "cline_local",
+            adapterConfig: {}, runtimeConfig: {}, permissions: {},
+          });
           const changed = await request(board(requesterId)).patch(`/api/issues/${issueId}`)
-            .send({ assigneeUserId: reviewerId });
+            .send({ assigneeAgentId: alternateAgentId });
           expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+          const [middle] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(middle!.assigneeAgentId).toBe(alternateAgentId);
           const restored = await request(board(requesterId)).patch(`/api/issues/${issueId}`)
-            .send({ assigneeUserId: null });
+            .send({ assigneeAgentId: agentId });
           expect(restored.status, JSON.stringify(restored.body)).toBe(200);
           const [rebound] = await db.select().from(issues).where(eq(issues.id, issueId));
-          expect(rebound!.assigneeUserId).toBe(current!.assigneeUserId);
+          expect(rebound!.assigneeAgentId).toBe(current!.assigneeAgentId);
           expect(rebound!.statusVersion).toBeGreaterThan(current!.statusVersion);
         }
         if (mode === "config_drift") {
@@ -1082,9 +1091,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           // Disposable DB aborts acceptance audit after issue status UPDATE.
           await db.execute(sql.raw(`
             CREATE FUNCTION int2_reject_acceptance_audit() RETURNS trigger
-            LANGUAGE plpgsql AS $
+            LANGUAGE plpgsql AS $$
             BEGIN RAISE EXCEPTION 'int2_forced_audit_failure'; END;
-            $;
+            $$;
           `));
           await db.execute(sql.raw(`
             CREATE TRIGGER int2_reject_acceptance_audit_trigger
