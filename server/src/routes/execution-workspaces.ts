@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
@@ -1227,6 +1227,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           .update(issues)
           .set({
             executionWorkspaceId: null,
+            statusVersion: sql`${issues.statusVersion} + 1`,
             updatedAt: new Date(),
           })
           .where(
