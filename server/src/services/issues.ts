@@ -6854,7 +6854,9 @@ async function prepareInt2AcceptanceInTx(
       eq(issueThreadInteractions.status, "pending"),
       eq(issueThreadInteractions.kind, "request_confirmation"),
     )).for("share").limit(1);
-    if (!interaction || interaction.payload?.kind === "tool") {
+    if (!interaction ||
+        (interaction.payload !== null && typeof interaction.payload === "object" &&
+          "kind" in interaction.payload && interaction.payload.kind === "tool")) {
       throw forbidden("No authorized independent reviewer interaction", { code: "governed_reviewer_denied" });
     }
   }

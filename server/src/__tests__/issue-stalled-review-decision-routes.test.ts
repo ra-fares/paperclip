@@ -824,7 +824,10 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
  * evidence/no-evidence assertion.
  */
 describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
-  for (const mode of ["missing", "document"] as const) {
+  for (const mode of [
+    "missing", "document", "release", "successor", "assignee_aba",
+    "config_drift", "replay", "concurrent", "rollback", "generic",
+  ] as const) {
     it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
       const db = createDb(cluster.connectionString);
@@ -919,7 +922,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             createdAnchor = {
               id: candidate!.id, details: candidate!.details as Record<string, unknown>,
             };
-            if (mode === "document") {
+            if (mode !== "missing") {
               await db.insert(documents).values({
                 id: documentId, companyId, title: "Reviewable handoff",
                 latestBody: evidenceBody,
@@ -941,7 +944,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             provider: "cline", model: "safe-spy-only",
             summary: "Documentation handoff fixture, no actual models called",
             resultJson: {
-              evidence: mode === "document"
+              evidence: mode !== "missing"
                 ? [{ criterionId: "objective", ref: `issue_document_revision:${revisionId}` }]
                 : [],
             },
@@ -1028,8 +1031,69 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         expect(createdAnchor?.details.completionContractId).toBe(run?.completionContractId);
         expect(createdAnchor?.details.completionContractSha256).toBe(run?.completionContractSha256);
         expect(allRuns.some(row => row.id === run?.id)).toBe(true);
-        const ref = `issue_document_revision:${mode === "document" ? revisionId : randomUUID()}`;
-        const reviewed = await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({
+        const ref = `issue_document_revision:${mode !== "missing" ? revisionId : randomUUID()}`;
+        // All D cases share the same genuine running-run B and terminal C.
+        if (mode === "release") {
+          const beforeReleaseVersion = current!.statusVersion;
+          expect([null, run!.id]).toContain(current!.executionRunId);
+          if (current!.executionRunId === run!.id) {
+            // Simulate normal terminal same-source pointer release, no fence.
+            await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+          }
+          const [released] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(released!.executionRunId).toBeNull();
+          expect(released!.statusVersion).toBe(beforeReleaseVersion);
+        }
+        if (mode === "successor") {
+          // Persisted descendant remains detectable even with released pointer.
+          // DB successor-scan probe; not an actual adapter/controller replay.
+          const later = new Date(Math.max(Date.now(), run!.finishedAt!.getTime() + 5_000));
+          await db.insert(heartbeatRuns).values({
+            companyId, agentId, status: "succeeded", runtimeMode: "legacy",
+            contextSnapshot: { issueId }, retryOfRunId: run!.id,
+            createdAt: later, startedAt: later, finishedAt: later,
+            resultJson: { evidence: [] },
+          });
+          if (current!.executionRunId === run!.id) {
+            await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+          }
+          const [released] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(released!.executionRunId).toBeNull();
+          expect(released!.statusVersion).toBe(current!.statusVersion);
+        }
+        if (mode === "assignee_aba") {
+          // Use real PATCH writers, not a silent raw SQL scope change.
+          const changed = await request(board(requesterId)).patch(`/api/issues/${issueId}`)
+            .send({ assigneeUserId: reviewerId });
+          expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+          const restored = await request(board(requesterId)).patch(`/api/issues/${issueId}`)
+            .send({ assigneeUserId: null });
+          expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+          const [rebound] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(rebound!.assigneeUserId).toBe(current!.assigneeUserId);
+          expect(rebound!.statusVersion).toBeGreaterThan(current!.statusVersion);
+        }
+        if (mode === "config_drift") {
+          // Live config drift after admission must not revoke frozen B.
+          await db.update(agents).set({ adapterConfig: { int2NewPreference: "after_admission" } })
+            .where(eq(agents.id, agentId));
+        }
+        if (mode === "rollback") {
+          // Disposable DB aborts acceptance audit after issue status UPDATE.
+          await db.execute(sql.raw(`
+            CREATE FUNCTION int2_reject_acceptance_audit() RETURNS trigger
+            LANGUAGE plpgsql AS $
+            BEGIN RAISE EXCEPTION 'int2_forced_audit_failure'; END;
+            $;
+          `));
+          await db.execute(sql.raw(`
+            CREATE TRIGGER int2_reject_acceptance_audit_trigger
+            BEFORE INSERT ON activity_log FOR EACH ROW
+            WHEN (NEW.action = 'issue.governed_acceptance_decided.v1')
+            EXECUTE FUNCTION int2_reject_acceptance_audit();
+          `));
+        }
+        const decisionPayload = {
           status: "done",
           governedReviewDecision: {
             candidateId: createdAnchor!.id,
@@ -1037,12 +1101,29 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             criteriaVerdicts: [{
               criterionId: "objective", ref,
               bodySha256: createHash("sha256").update(evidenceBody, "utf8").digest("hex"),
-              verdict: "accepted",
+              verdict: "accepted" as const,
               rationale: "I reviewed this exact handoff text against the frozen objective.",
             }],
           },
-        });
+        };
+        const decide = () => request(board(reviewerId))
+          .patch(`/api/issues/${issueId}`).send(decisionPayload);
+        let reviewed: Awaited<ReturnType<typeof decide>>;
+        const competing: number[] = [];
+        if (mode === "concurrent") {
+          const race = await Promise.all([decide(), decide()]);
+          competing.push(...race.filter(r => r.status !== 200).map(r => r.status));
+          reviewed = race.find(r => r.status === 200) ?? race[0];
+        } else {
+          reviewed = mode === "generic"
+            ? await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({ status: "done" })
+            : await decide();
+          if (mode === "replay" && reviewed.status === 200) {
+            competing.push((await decide()).status);
+          }
+        }
         const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const observedRunsAfter = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
         const basis = await db.select().from(activityLog).where(and(
           eq(activityLog.companyId, companyId),
           eq(activityLog.entityId, issueId),
@@ -1054,7 +1135,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           pinnedContractId: run!.completionContractId,
           pinnedContractHash: run!.completionContractSha256,
           sourceTerminal: run!.status, evidence: run!.resultJson?.evidence,
-          observedRuns: allRuns.map(r => ({ id: r.id, status: r.status })),
+          observedRuns: observedRunsAfter.map(r => ({ id: r.id, status: r.status })), competing,
           adapterCalls: seenAdapterIds, admissionChecks: seenAdmissionIds,
           reviewerHttp: reviewed.status, response: reviewed.body,
           after: after?.status, acceptedAuditRows: basis.length,
@@ -1063,6 +1144,14 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         if (mode === "missing") {
           expect(reviewed.status, JSON.stringify(result)).toBe(422);
           expect(reviewed.body.details?.code, JSON.stringify(result)).toBe("criterion_evidence_missing");
+          expect(after?.status).toBe("in_review");
+          expect(basis).toHaveLength(0);
+        } else if (mode === "successor" || mode === "assignee_aba" || mode === "generic") {
+          expect(reviewed.status, JSON.stringify(result)).toBe(409);
+          expect(after?.status).toBe("in_review");
+          expect(basis).toHaveLength(0);
+        } else if (mode === "rollback") {
+          expect(reviewed.status, JSON.stringify(result)).toBeGreaterThanOrEqual(500);
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);
         } else {
@@ -1076,6 +1165,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             outcome: "accepted",
             criterionProof: [{ revisionId, ref }],
           });
+          if (mode === "replay" || mode === "concurrent") {
+            expect(competing.sort(), JSON.stringify(result)).toEqual([409]);
+          }
         }
       } finally {
         if (h) await drainHeartbeatRunsToQuiescence(db, h);

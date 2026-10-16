@@ -99,7 +99,10 @@ jobs:
           const fs=require("node:fs");
           const dir=".int2-evidence";
           const cases={
-            bcd:["P04 INT2 BCD missing: actual admitted run and independent reviewer","P04 INT2 BCD document: actual admitted run and independent reviewer"],
+            bcd:[
+              "missing", "document", "release", "successor", "assignee_aba",
+              "config_drift", "replay", "concurrent", "rollback", "generic"
+            ].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer"),
             board:["P04 INT2 RED: governed direct missing evidence must not close issue"],
             direct:["governed cline_local commits exactly one direct v2 completion pin and never replays"],
             ordinary:["rejects stale or covered reviews and serializes concurrent decisions"]
