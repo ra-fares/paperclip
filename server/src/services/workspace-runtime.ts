@@ -7648,37 +7648,60 @@ async function lockWorkspaceRuntimeStartParents(
   db: Db,
   input: StartRuntimeServicesForWorkspaceControlInput,
 ) {
-  let allowFixedPortFallback = false;
-  if (input.executionWorkspaceId) {
-    const [lockedExecutionWorkspace] = await db
-      .select({ id: executionWorkspaces.id, mode: executionWorkspaces.mode })
-      .from(executionWorkspaces)
-      .where(
-        and(
-          eq(executionWorkspaces.id, input.executionWorkspaceId),
-          eq(executionWorkspaces.companyId, input.actor.companyId),
-        ),
-      )
-      .for("update");
-    if (!lockedExecutionWorkspace) throw new Error("Execution workspace not found before starting runtime services");
-    allowFixedPortFallback = lockedExecutionWorkspace.mode === "isolated_workspace";
+  // Only a hint: the parent set can change while the initial read is unlocked.
+  // Every parent is locked before EW, then the immutable-to-this-start
+  // company/source/parent/status is checked again under the EW row lock.
+  const [probe] = input.executionWorkspaceId
+    ? await db.select({
+        companyId: executionWorkspaces.companyId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        mode: executionWorkspaces.mode,
+        status: executionWorkspaces.status,
+      }).from(executionWorkspaces).where(and(
+        eq(executionWorkspaces.id, input.executionWorkspaceId),
+        eq(executionWorkspaces.companyId, input.actor.companyId),
+      )).limit(1)
+    : [];
+  if (input.executionWorkspaceId && !probe) {
+    throw conflict("Execution workspace vanished before runtime reservation", {
+      code: "workspace_runtime_parent_stale",
+    });
   }
-
-  if (input.workspace.workspaceId) {
-    const [lockedProjectWorkspace] = await db
-      .select({ id: projectWorkspaces.id })
-      .from(projectWorkspaces)
-      .where(
-        and(
-          eq(projectWorkspaces.id, input.workspace.workspaceId),
-          eq(projectWorkspaces.companyId, input.actor.companyId),
-        ),
-      )
-      .for("update");
-    if (!lockedProjectWorkspace) throw new Error("Project workspace not found before starting runtime services");
+  const parentIds = [...new Set([
+    input.workspace.workspaceId ?? null,
+    probe?.projectWorkspaceId ?? null,
+  ].filter((id): id is string => id !== null))].sort();
+  for (const id of parentIds) {
+    const [parent] = await db.select({ id: projectWorkspaces.id })
+      .from(projectWorkspaces).where(and(
+        eq(projectWorkspaces.id, id),
+        eq(projectWorkspaces.companyId, input.actor.companyId),
+      )).for("update").limit(1);
+    if (!parent) throw conflict("Runtime start project workspace vanished", {
+      code: "workspace_runtime_parent_stale",
+    });
   }
-
-  return allowFixedPortFallback;
+  if (!input.executionWorkspaceId) return false;
+  const [locked] = await db.select({
+    companyId: executionWorkspaces.companyId,
+    projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+    sourceIssueId: executionWorkspaces.sourceIssueId,
+    mode: executionWorkspaces.mode,
+    status: executionWorkspaces.status,
+  }).from(executionWorkspaces).where(and(
+    eq(executionWorkspaces.id, input.executionWorkspaceId),
+    eq(executionWorkspaces.companyId, input.actor.companyId),
+  )).for("update").limit(1);
+  if (!locked || !probe || locked.companyId !== probe.companyId ||
+      locked.projectWorkspaceId !== probe.projectWorkspaceId ||
+      locked.sourceIssueId !== probe.sourceIssueId ||
+      locked.mode !== probe.mode || locked.status !== probe.status) {
+    throw conflict("Execution workspace changed during runtime parent locking", {
+      code: "workspace_runtime_parent_stale",
+    });
+  }
+  return locked.mode === "isolated_workspace";
 }
 
 function canRetryDeferredPortBindCollision(
