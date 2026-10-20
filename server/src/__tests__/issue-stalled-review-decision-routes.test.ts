@@ -2692,7 +2692,10 @@ describeEmbeddedPostgres("P04 INT2 W01-005 workspace revision database", () => {
  */
 describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", () => {
   it("P04 INT2 W008 genuine postcommit fixed-port collision and retry", async () => {
+    const stage = w011StageRecorder("native_retry");
+    stage("before_pg_start", { writerPoolMaxConnections: 1, observerPoolMaxConnections: 1 });
     const cluster = await startEmbeddedPostgresTestDatabase("int2-w008-port-retry-");
+    stage("pg_started");
     // Start embedded PG before mocking node:child_process. These are genuine,
     // separate PostgreSQL connection pools (not SQL query stubs).
     const writer = createDb(cluster.connectionString, {
@@ -2713,12 +2716,17 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
     let mocksInstalled = false;
     let runtimeForCleanup: typeof import("../services/workspace-runtime.js") | null = null;
     let pendingStart: Promise<unknown> | null = null;
+    let pendingStartSettled = false;
+    let primaryError: unknown = null;
+    const cleanupErrors: unknown[] = [];
     let portProbe: import("node:net").Server | null = null;
     let portProbeClosed = false;
     const exposureBefore = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
     const selectRows = () => observer.select().from(workspaceRuntimeServices)
       .where(eq(workspaceRuntimeServices.executionWorkspaceId, ewId));
+    stage("native_retry_pools_ready", { writerPoolMaxConnections: 1, observerPoolMaxConnections: 1 });
     try {
+      stage("seed_begin");
       await writer.insert(companies).values({ id: companyId, name: "W008 collision fixture", issuePrefix: "WC8" });
       await writer.insert(projects).values({ id: projectId, companyId, name: "W008 collision fixture project" });
       await writer.insert(projectWorkspaces).values({
@@ -2735,6 +2743,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         strategyType: "git_worktree", status: "active",
         cwd: "/tmp/w008-nongit-" + pwId,
       });
+      stage("seed_complete", { ewId, pwId, issueId });
 
       // Temporary allowed loopback port probe; never starts a dev-server.
       const probe = net.createServer();
@@ -2749,6 +2758,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
       });
       await new Promise<void>((resolve, reject) => probe.close(err => err ? reject(err) : resolve()));
       portProbeClosed = true;
+      stage("loopback_probe_complete", { port });
       expect(port).toBeGreaterThan(0);
       process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "off";
 
@@ -2820,6 +2830,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
       }));
       const runtime = await import("../services/workspace-runtime.js");
       runtimeForCleanup = runtime;
+      stage("module_setup_complete");
       const cwd = syntheticCwd;
       const service = {
         name: "w008-inert-safe-process",
@@ -2828,6 +2839,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         readiness: { type: "none", timeoutSec: 2 },
         lifecycle: "manual",
       };
+      stage("runtime_start_enter", { ewId, port });
       const started = runtime.startRuntimeServicesForWorkspaceControl({
         db: writer, actor: { id: null, name: "W008 test", companyId },
         issue: { id: issueId, identifier: "WC8-1", title: "W008 safe fixture" },
@@ -2841,8 +2853,14 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         config: { workspaceRuntime: { services: [service] }, desiredState: "running" },
       });
       pendingStart = started;
-      // Promise rejection is observed immediately, including on setup/observer failure.
-      void started.catch(() => undefined);
+      // Observe settlement immediately; cleanup never abandons this task.
+      void started.then(
+        () => { pendingStartSettled = true; stage("runtime_start_settled", { outcome: "fulfilled" }); },
+        (error) => {
+          pendingStartSettled = true;
+          stage("runtime_start_settled", { outcome: "rejected", error: error instanceof Error ? error.message : String(error) });
+        },
+      );
       // Read through INDEPENDENT connection; only a committed 'starting' row
       // can release the foreign-owner gate. Polling is scheduling, not proof.
       let first: Awaited<ReturnType<typeof selectRows>>[number] | undefined;
@@ -2859,8 +2877,10 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         throw new Error("W008_INVALID_FIXTURE: no committed first starting row / fixed port / single fake spawn");
       }
       events.push({ event: "FIRST_STARTING_COMMITTED", row: first.id, port: first.port });
+      stage("first_starting_committed", { rowId: first.id, port: first.port, spawnCount });
       expect(postSpawnLookups).toBeGreaterThan(0);
       // THIS resolve causes the REAL private RuntimeServicePortBindCollision.
+      stage("native_collision_release", { port: first.port });
       resolveForeignOwner(99001);
       const finalRefs = await started;
       const rows = await selectRows();
@@ -2885,25 +2905,70 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
       expect(newRunning, JSON.stringify(diagnostics)).toBeDefined();
       expect(events.some(x => x.event === "REGISTRY_REMOVE")).toBe(true);
       expect(finalRefs.map(x => x.id)).toContain(newRunning!.id);
+      stage("native_retry_assertions_complete", { spawnCount, firstRowId: first.id, secondRowId: newRunning!.id });
+    } catch (error) {
+      primaryError = error;
+      let catalog: W011CatalogRow[] = [];
+      try { catalog = await w011ReadPgCatalog(observer, ["w008-runtime", "w008-observer"]); } catch {}
+      stage("native_retry_error", {
+        error: error instanceof Error ? error.message : String(error),
+        pendingStartSettled,
+        catalog,
+        events,
+      });
     } finally {
+      stage("native_retry_cleanup_begin", { pendingStartSettled });
       resolveForeignOwner?.(99001);
-      // Always drain before undoing mocks and closing the PG cluster, regardless
-      // of which setup/query/assertion failed. No detached startup survives.
-      if (pendingStart) await pendingStart.catch(() => undefined);
+      if (pendingStart && !pendingStartSettled) {
+        try {
+          const cancelled = await w011CancelApplicationSessions(observer, ["w008-runtime"]);
+          stage("native_retry_pg_cancel_requested", { cancelled });
+        } catch (error) {
+          cleanupErrors.push(error);
+          stage("native_retry_cleanup_error", { phase: "pg_cancel", error: error instanceof Error ? error.message : String(error) });
+        }
+        await w011SettleAfterCancellation(pendingStart, writer, stage, "native_retry_start");
+      }
       if (portProbe && !portProbeClosed) {
         await new Promise<void>(resolve => {
           try { portProbe!.close(() => resolve()); } catch { resolve(); }
         });
       }
       if (mocksInstalled) {
-        // Runtime stop uses the mocked supervisor, never the host process table.
-        await runtimeForCleanup?.resetRuntimeServicesForTests({ terminateProcesses: true });
+        try {
+          // Runtime stop uses the mocked supervisor, never the host process table.
+          await runtimeForCleanup?.resetRuntimeServicesForTests({ terminateProcesses: true });
+        } catch (error) {
+          cleanupErrors.push(error);
+          stage("native_retry_cleanup_error", { phase: "runtime_reset", error: error instanceof Error ? error.message : String(error) });
+        }
         vi.doUnmock("node:child_process");
         vi.doUnmock("../services/local-service-supervisor.js");
         vi.resetModules();
+        stage("native_retry_mocks_removed");
       }
-      await cluster.cleanup();
+      try {
+        await closeRegisteredClients(cluster.connectionString);
+        stage("native_retry_clients_closed");
+      } catch (error) {
+        cleanupErrors.push(error);
+        stage("native_retry_cleanup_error", { phase: "close_clients", error: error instanceof Error ? error.message : String(error) });
+      }
+      try {
+        await cluster.cleanup();
+        stage("native_retry_cluster_cleaned");
+      } catch (error) {
+        cleanupErrors.push(error);
+        stage("native_retry_cleanup_error", { phase: "cluster_cleanup", error: error instanceof Error ? error.message : String(error) });
+      }
+      stage("native_retry_cleanup_complete", {
+        pendingStartSettled,
+        cleanupErrors: cleanupErrors.map(error => error instanceof Error ? error.message : String(error)),
+        primaryError: primaryError instanceof Error ? primaryError.message : primaryError ? String(primaryError) : null,
+      });
     }
+    if (primaryError) throw primaryError;
+    if (cleanupErrors.length > 0) throw cleanupErrors[0];
   }, 120_000);
 });
 
@@ -2934,7 +2999,7 @@ function w011StageRecorder(mode: string): W011StageWriter {
       stage,
       ...details,
     };
-    console.info("INT2_W011_STAGE " + JSON.stringify(event));
+    console.info("INT2_W012_STAGE " + JSON.stringify(event));
     if (output) {
       writeFileSync(output, JSON.stringify(event) + "\n", { encoding: "utf8", flag: "a" });
     }
