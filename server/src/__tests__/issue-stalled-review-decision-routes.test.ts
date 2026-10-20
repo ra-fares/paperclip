@@ -845,6 +845,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
     "workspace_settings_aba", "project_workspace_membership_db",
     "project_workspace_membership_aba_db", "execution_workspace_membership_db",
     "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
+    "project_workspace_company_db", "execution_workspace_company_db",
+    "execution_workspace_project_workspace_db", "execution_workspace_source_issue_db",
   ] as const) {
     it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
@@ -905,7 +907,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         await db.insert(projects).values({ id: projectId, companyId, name: "INT2 safe project" });
         const projectWorkspaceMembershipMode =
           mode === "project_workspace_membership_db" ||
-          mode === "project_workspace_membership_aba_db";
+          mode === "project_workspace_membership_aba_db" ||
+          mode === "project_workspace_company_db";
         const originalProjectWorkspaceId = projectWorkspaceMembershipMode ? randomUUID() : null;
         if (originalProjectWorkspaceId) {
           // The bound project workspace MUST exist at original genuine B:
@@ -1422,6 +1425,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           "workspace_settings_aba", "project_workspace_membership_db",
           "project_workspace_membership_aba_db", "execution_workspace_membership_db",
           "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
+          "project_workspace_company_db", "execution_workspace_company_db",
+          "execution_workspace_project_workspace_db", "execution_workspace_source_issue_db",
         ] as const;
         type IdentityMode = (typeof identityModes)[number];
         const isIdentity = (value: string): value is IdentityMode =>
@@ -1521,7 +1526,23 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 id: otherProjectId, companyId, name: "INT2 DB relation foreign project",
               });
             }
-            if (mode.startsWith("project_workspace_membership")) {
+            if (mode === "project_workspace_company_db" ||
+                mode === "execution_workspace_company_db") {
+              const otherCompanyId = randomUUID();
+              await db.insert(companies).values({
+                id: otherCompanyId, name: "INT2 separate scope company", issuePrefix: "XB",
+              });
+              if (mode === "project_workspace_company_db") {
+                expect(originalProjectWorkspaceId).toBeTruthy();
+                await db.update(projectWorkspaces).set({ companyId: otherCompanyId })
+                  .where(eq(projectWorkspaces.id, originalProjectWorkspaceId!));
+              } else {
+                expect(initial.executionWorkspaceId).toBeTruthy();
+                await db.update(executionWorkspaces).set({ companyId: otherCompanyId })
+                  .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+              }
+              mutations.push({ phase: "db_workspace_company_changed", otherCompanyId });
+            } else if (mode.startsWith("project_workspace_membership")) {
               expect(originalProjectWorkspaceId).toBeTruthy();
               await db.update(projectWorkspaces).set({ projectId: otherProjectId })
                 .where(eq(projectWorkspaces.id, originalProjectWorkspaceId!));
@@ -1537,6 +1558,26 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 await db.update(executionWorkspaces).set({ projectId: otherProjectId })
                   .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
                 mutations.push({ phase: "db_execution_workspace_project_changed", projectId: otherProjectId });
+              } else if (mode === "execution_workspace_project_workspace_db") {
+                const extraProjectWorkspaceId = randomUUID();
+                await db.insert(projectWorkspaces).values({
+                  id: extraProjectWorkspaceId, companyId, projectId,
+                  name: "INT2 DB alternative parent workspace",
+                  sourceType: "local_path", cwd: process.cwd(),
+                });
+                await db.update(executionWorkspaces).set({
+                  projectWorkspaceId: extraProjectWorkspaceId,
+                }).where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+                mutations.push({ phase: "db_execution_workspace_parent_changed", extraProjectWorkspaceId });
+              } else if (mode === "execution_workspace_source_issue_db") {
+                const otherIssueId = randomUUID();
+                await db.insert(issues).values({
+                  id: otherIssueId, companyId, projectId,
+                  title: "INT2 DB alternative source issue", status: "backlog",
+                });
+                await db.update(executionWorkspaces).set({ sourceIssueId: otherIssueId })
+                  .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+                mutations.push({ phase: "db_execution_workspace_source_issue_changed", otherIssueId });
               } else {
                 const [workspace] = await db.select().from(executionWorkspaces)
                   .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
@@ -1571,8 +1612,11 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             originalCandidateId: createdAnchor!.id,
             originalCandidateVersion: initialVersion,
             initial, mutations,
-            expectedCode: mode.endsWith("_db") && !mode.endsWith("_aba_db")
-              ? "governed_candidate_workspace_stale" : "governed_candidate_stale",
+            expectedCode: mode === "project_workspace_company_db" ||
+              mode === "execution_workspace_company_db"
+                ? "workspace_company_prevalidation_422"
+                : mode.endsWith("_db") && !mode.endsWith("_aba_db")
+                  ? "governed_candidate_workspace_stale" : "governed_candidate_stale",
           };
         }
         if (mode === "config_drift") {
@@ -1658,10 +1702,22 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(basis).toHaveLength(0);
         } else if (mode === "successor" || mode === "assignee_aba" ||
             mode === "workspace_aba" || mode === "generic" || scopeTrace) {
-          expect(reviewed.status, JSON.stringify(result)).toBe(409);
-          if (mode === "workspace_aba" || scopeTrace) {
-            expect(reviewed.body.details?.code, JSON.stringify(result))
-              .toBe(scopeTrace?.expectedCode ?? "governed_candidate_stale");
+          if (mode === "project_workspace_company_db" ||
+              mode === "execution_workspace_company_db") {
+            // Existing issue-update prevalidation rejects cross-company
+            // references before candidate D; this is NOT proof of D 409.
+            expect(reviewed.status, JSON.stringify(result)).toBe(422);
+            expect(reviewed.body.error, JSON.stringify(result)).toBe(
+              mode === "project_workspace_company_db"
+                ? "Project workspace must belong to same company"
+                : "Execution workspace must belong to same company",
+            );
+          } else {
+            expect(reviewed.status, JSON.stringify(result)).toBe(409);
+            if (mode === "workspace_aba" || scopeTrace) {
+              expect(reviewed.body.details?.code, JSON.stringify(result))
+                .toBe(scopeTrace?.expectedCode ?? "governed_candidate_stale");
+            }
           }
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);

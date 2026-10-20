@@ -97,16 +97,16 @@ jobs:
           # is separately reported as an existing regression, not INT2 proof.
           export INT2_NATIVE_TX_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_SCOPE_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
-          run_named scope src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD (project_aba|project_workspace_aba|execution_workspace_aba|workspace_settings_aba|project_workspace_membership_db|project_workspace_membership_aba_db|execution_workspace_membership_db|execution_workspace_identity_db|execution_workspace_identity_aba_db):'
-          run_named controls src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD (document|config_drift|workspace_aba):'
+          # Follow-up only covers additional company/source workspace relations.
+          # Earlier R3 identity CI #39371874723 stays immutable, including RED.
+          run_named affiliation src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD (project_workspace_company_db|execution_workspace_company_db|execution_workspace_project_workspace_db|execution_workspace_source_issue_db):'
       - name: Classify executed assertions (skips always NOT_RUN)
         run: |
           node <<'NODE'
           const fs=require("node:fs");
           const dir=".int2-evidence";
           const cases={
-            scope:["project_aba","project_workspace_aba","execution_workspace_aba","workspace_settings_aba","project_workspace_membership_db","project_workspace_membership_aba_db","execution_workspace_membership_db","execution_workspace_identity_db","execution_workspace_identity_aba_db"].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer"),
-            controls:["document","config_drift","workspace_aba"].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer")
+            affiliation:["project_workspace_company_db","execution_workspace_company_db","execution_workspace_project_workspace_db","execution_workspace_source_issue_db"].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer")
           };
           const output={};
           let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";
@@ -146,26 +146,25 @@ jobs:
               numFailedTests:doc?.numFailedTests??null,groupFailed,checks,
             };
           }
-          // Save and classify each completed scope observation; a failed
-          // test is never rewritten as PASS. A missing trace is NOT_RUN.
-          output.scopeEvidence={};
-          for(const mode of ["project_aba","project_workspace_aba","execution_workspace_aba","workspace_settings_aba","project_workspace_membership_db","project_workspace_membership_aba_db","execution_workspace_membership_db","execution_workspace_identity_db","execution_workspace_identity_aba_db"]){
+          output.affiliationEvidence={};
+          for(const mode of ["project_workspace_company_db","execution_workspace_company_db",
+            "execution_workspace_project_workspace_db","execution_workspace_source_issue_db"]){
             const file=dir+"/scope-"+mode+"-observation.json";
             let row=null,error=null;
             try{row=JSON.parse(fs.readFileSync(file,"utf8"))}catch(e){error=String(e)}
-            const httpMode=!mode.endsWith("_db");
-            const expectedCode=httpMode?"governed_candidate_stale":
-              mode.endsWith("_aba_db")?"governed_candidate_stale":"governed_candidate_workspace_stale";
-            const valid=!error && row?.mode===mode && row?.reviewerHttp===409 &&
-              row?.response?.details?.code===expectedCode &&
-              row?.acceptedAuditRows===0 && row?.after==="in_review" &&
-              row?.candidateStatusVersion===row?.scopeTrace?.originalCandidateVersion &&
-              row?.scopeTrace?.channel===(httpMode?"AUTHORIZED_HTTP_PATCH":"DB_ONLY_DEFENSE_NOT_LIFECYCLE");
-            output.scopeEvidence[mode]={file,error,valid,expectedCode,
-              code:row?.response?.details?.code??null,
-              reviewerHttp:row?.reviewerHttp??null,
-              finalStatus:row?.after??null,finalVersion:row?.afterVersion??null,
-              observations:row?.scopeTrace?.mutations?.length??null};
+            const companyMode=mode.endsWith("_company_db");
+            const expectedReason=mode==="project_workspace_company_db"
+              ?"Project workspace must belong to same company"
+              :"Execution workspace must belong to same company";
+            const valid=!error && row?.mode===mode &&
+              row?.reviewerHttp===(companyMode?422:409) &&
+              (companyMode?row?.response?.error===expectedReason:
+                row?.response?.details?.code==="governed_candidate_workspace_stale") &&
+              row?.after==="in_review" && row?.acceptedAuditRows===0 &&
+              row?.scopeTrace?.channel==="DB_ONLY_DEFENSE_NOT_LIFECYCLE";
+            output.affiliationEvidence[mode]={file,error,valid,
+              http:row?.reviewerHttp??null,reason:row?.response?.details?.code??row?.response?.error??null,
+              finalStatus:row?.after??null,acceptedRows:row?.acceptedAuditRows??null};
             if(!valid)bad=true;
           }
           output.overall=bad?"FAIL_OR_NOT_RUN":"PASS";
