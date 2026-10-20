@@ -2425,3 +2425,186 @@ describeEmbeddedPostgres("P04 INT2 W01-005 workspace revision database", () => {
     }
   }, 120_000);
 });
+
+
+/**
+ * W01-008 isolated port/readiness fixture. The full D/start/reconcile matrix
+ * remains separate: this case is ONLY the actual two-transaction retry path.
+ * Every selector runs in its own Vitest process to isolate module mocks.
+ */
+describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", () => {
+  it("P04 INT2 W008 genuine postcommit fixed-port collision and retry", async () => {
+    const cluster = await startEmbeddedPostgresTestDatabase("int2-w008-port-retry-");
+    // Start embedded PG before mocking node:child_process. These are genuine,
+    // separate PostgreSQL connection pools (not SQL query stubs).
+    const writer = createDb(cluster.connectionString, {
+      maxConnections: 1, applicationName: "w008-runtime",
+    });
+    const observer = createDb(cluster.connectionString, {
+      maxConnections: 1, applicationName: "w008-observer",
+    });
+    const { EventEmitter } = await import("node:events");
+    const net = (await import("node:net")).default;
+    const companyId = randomUUID(), projectId = randomUUID();
+    const pwId = randomUUID(), ewId = randomUUID(), issueId = randomUUID();
+    const events: Array<{ event: string; port?: number | null; row?: string }> = [];
+    const children: Array<EventEmitter & { pid: number; exitCode: null; signalCode: null; kill: () => boolean }> = [];
+    let spawnCount = 0, postSpawnLookups = 0, resolveForeignOwner!: (pid: number) => void;
+    const foreignOwnerGate = new Promise<number>(resolve => { resolveForeignOwner = resolve; });
+    const fakeRegistry = new Map<string, unknown>();
+    let mocksInstalled = false;
+    const selectRows = () => observer.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.executionWorkspaceId, ewId));
+    try {
+      await writer.insert(companies).values({ id: companyId, name: "W008 collision fixture", issuePrefix: "WC8" });
+      await writer.insert(projects).values({ id: projectId, companyId, name: "W008 collision fixture project" });
+      await writer.insert(projectWorkspaces).values({
+        id: pwId, companyId, projectId, name: "W008 pinned parent",
+        sourceType: "local_path", cwd: "/tmp/w008-nongit-" + pwId,
+      });
+      await writer.insert(issues).values({
+        id: issueId, companyId, projectId, projectWorkspaceId: pwId,
+        title: "W008 test-only runtime start", status: "in_review",
+      });
+      await writer.insert(executionWorkspaces).values({
+        id: ewId, companyId, projectId, projectWorkspaceId: pwId, sourceIssueId: issueId,
+        name: "W008 isolated test EW", mode: "isolated_workspace",
+        strategyType: "git_worktree", status: "active",
+        cwd: "/tmp/w008-nongit-" + pwId,
+      });
+
+      // Temporary allowed loopback port probe; never starts a dev-server.
+      const probe = net.createServer();
+      const port = await new Promise<number>((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(0, "127.0.0.1", () => {
+          const addr = probe.address();
+          if (!addr || typeof addr === "string") reject(new Error("Loopback probe no port"));
+          else resolve(addr.port);
+        });
+      });
+      await new Promise<void>((resolve, reject) => probe.close(err => err ? reject(err) : resolve()));
+      expect(port).toBeGreaterThan(0);
+
+      // Real entrypoint and PRIVATE bind-collision class remain untouched.
+      // Only operating-system service side effects are replaced.
+      vi.resetModules();
+      vi.doMock("node:child_process", async importOriginal => ({
+        ...(await importOriginal<typeof import("node:child_process")>()),
+        spawn: (...args: unknown[]) => {
+          if (args.length !== 3 || args[0] !== "/bin/sh" || !Array.isArray(args[1])) {
+            throw new Error("W008_UNEXPECTED_PROCESS_SPAWN " + JSON.stringify(args));
+          }
+          spawnCount += 1;
+          if (spawnCount > 2) throw new Error("W008_THIRD_PROCESS_SPAWN");
+          const child = Object.assign(new EventEmitter(), {
+            pid: 81000 + spawnCount,
+            exitCode: null as null,
+            signalCode: null as null,
+            kill: () => true,
+          });
+          children.push(child);
+          events.push({ event: "FAKE_SPAWN_" + spawnCount });
+          return child;
+        },
+        execFile: () => { throw new Error("W008_UNEXPECTED_GIT_OR_SHELL_EXECFILE"); },
+      }));
+      vi.doMock("../services/local-service-supervisor.js", async importOriginal => ({
+        ...(await importOriginal<typeof import("../services/local-service-supervisor.js")>()),
+        openLocalServiceLogFile: async () => ({
+          handle: { fd: 2, close: async () => undefined }, logPath: "/dev/null", startOffset: 0,
+        }),
+        readLocalServicePortOwner: async (requested: number) => {
+          if (spawnCount === 0) return null;
+          postSpawnLookups += 1;
+          if (spawnCount === 1) {
+            events.push({ event: "FIRST_POST_SPAWN_BIND_CHECK", port: requested });
+            return await foreignOwnerGate;
+          }
+          events.push({ event: "SECOND_OWNER_READ", port: requested });
+          return children[1]!.pid;
+        },
+        isLocalServiceProcessOwnedBy: async (actualPid: number, expectedPid: number) =>
+          actualPid === expectedPid,
+        findAdoptableLocalService: async () => null,
+        writeLocalServiceRegistryRecord: async (record: { serviceKey: string }) => {
+          fakeRegistry.set(record.serviceKey, record);
+          events.push({ event: "REGISTRY_WRITE" });
+        },
+        removeLocalServiceRegistryRecord: async (key: string) => {
+          fakeRegistry.delete(key); events.push({ event: "REGISTRY_REMOVE" });
+        },
+        touchLocalServiceRegistryRecord: async () => undefined,
+        terminateLocalService: async () => { events.push({ event: "FAKE_TERMINATE" }); },
+        readLocalServiceProcessCwd: async () => null,
+        readLocalServiceProcessGroupId: async () => null,
+      }));
+      mocksInstalled = true;
+      const runtime = await import("../services/workspace-runtime.js");
+      const cwd = "/tmp/w008-nongit-" + pwId;
+      const service = {
+        name: "w008-inert-safe-process",
+        command: "W008_INERT_COMMAND_MUST_NOT_EXECUTE",
+        port: { type: "fixed", value: port },
+        readiness: { type: "none", timeoutSec: 2 },
+        lifecycle: "manual",
+      };
+      const started = runtime.startRuntimeServicesForWorkspaceControl({
+        db: writer, actor: { id: null, name: "W008 test", companyId },
+        issue: { id: issueId, identifier: "WC8-1", title: "W008 safe fixture" },
+        workspace: {
+          baseCwd: cwd, source: "task_session", projectId, workspaceId: pwId,
+          repoUrl: null, repoRef: null, strategy: "project_primary",
+          cwd, branchName: null, worktreePath: null, warnings: [], created: false,
+          branchCreatedByRuntime: false,
+        },
+        executionWorkspaceId: ewId, adapterEnv: {},
+        config: { workspaceRuntime: { services: [service] }, desiredState: "running" },
+      });
+      // Read through INDEPENDENT connection; only a committed 'starting' row
+      // can release the foreign-owner gate. Polling is scheduling, not proof.
+      let first: Awaited<ReturnType<typeof selectRows>>[number] | undefined;
+      const expires = Date.now() + 12_000;
+      while (Date.now() < expires) {
+        const rows = await selectRows();
+        first = rows.find(row => row.status === "starting");
+        if (first) break;
+        await new Promise<void>(resolve => setTimeout(resolve, 20));
+      }
+      if (!first || spawnCount !== 1 || first.port !== port) {
+        resolveForeignOwner(99001);
+        await started.catch(() => undefined);
+        throw new Error("W008_INVALID_FIXTURE: no committed first starting row / fixed port / single fake spawn");
+      }
+      events.push({ event: "FIRST_STARTING_COMMITTED", row: first.id, port: first.port });
+      expect(postSpawnLookups).toBeGreaterThan(0);
+      // THIS resolve causes the REAL private RuntimeServicePortBindCollision.
+      resolveForeignOwner(99001);
+      const finalRefs = await started;
+      const rows = await selectRows();
+      const failed = rows.find(row => row.id === first!.id);
+      const newRunning = rows.find(row => row.id !== first!.id && row.status === "running");
+      const diagnostics = { events, spawnCount, initialPort: port,
+        firstRowId: first.id, firstStatusAfter: failed?.status ?? null,
+        secondRowId: newRunning?.id ?? null, secondPort: newRunning?.port ?? null,
+        finalRefs: finalRefs.map(x => x.id), rows: rows.map(x => ({
+          id: x.id, status: x.status, port: x.port, healthStatus: x.healthStatus,
+        })) };
+      console.info("INT2_W008_NATIVE_COLLISION " + JSON.stringify(diagnostics));
+      expect(spawnCount, JSON.stringify(diagnostics)).toBe(2);
+      expect(failed?.status, JSON.stringify(diagnostics)).toBe("stopped");
+      expect(newRunning?.port, JSON.stringify(diagnostics)).not.toBe(port);
+      expect(newRunning, JSON.stringify(diagnostics)).toBeDefined();
+      expect(events.some(x => x.event === "REGISTRY_REMOVE")).toBe(true);
+      expect(finalRefs.map(x => x.id)).toContain(newRunning!.id);
+    } finally {
+      resolveForeignOwner?.(99001); // unblock promise if fixture failed before gate release
+      if (mocksInstalled) {
+        vi.doUnmock("node:child_process");
+        vi.doUnmock("../services/local-service-supervisor.js");
+        vi.resetModules();
+      }
+      await cluster.cleanup();
+    }
+  }, 120_000);
+});
