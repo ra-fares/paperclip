@@ -878,7 +878,13 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         : mode.startsWith("lock_")
           ? { maxConnections: 1, applicationName: "w009-source" }
           : undefined);
-      stage("source_pool_ready", { maxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default" });
+      const w011Observer = w011Selected
+        ? createDb(cluster.connectionString, { maxConnections: 1, applicationName: "w011-fixture-observer" })
+        : null;
+      stage("source_pool_ready", {
+        maxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default",
+        diagnosticObserverMaxConnections: w011Observer ? 1 : 0,
+      });
       const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
       const requesterId = randomUUID(), reviewerId = randomUUID(), projectId = randomUUID();
       const evidenceBody = "Handoff memorandum: the project's delivered scope and review criteria are documented in this revision.";
@@ -1019,11 +1025,35 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
               payload: { version: 1, prompt: "Review the exact handoff document revision." },
             }).returning();
             stage("B_request_enter", { runId: input.runId });
-            const submitted = await request(app({
+            const bRequest = request(app({
               type: "agent", source: "agent_key", companyId, agentId, runId: input.runId,
             })).patch(`/api/issues/${issueId}`).send({
               status: "in_review", reviewInteractionId: interaction.id,
             });
+            const bTask = bRequest.then((response) => response);
+            let submitted: Awaited<typeof bTask>;
+            if (w011Selected && w011Observer) {
+              try {
+                submitted = await w011Watchdog(
+                  bTask,
+                  "B_request",
+                  async () => {
+                    const catalog = await w011ReadPgCatalog(w011Observer, ["w011-source"]);
+                    stage("watchdog_timeout", { label: "B_request", runId: input.runId, catalog });
+                    return { runId: input.runId, catalog };
+                  },
+                  15_000,
+                );
+              } catch (error) {
+                try { bRequest.abort(); } catch {}
+                const cancelled = await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => []);
+                stage("B_request_cancelled", { cancelled });
+                await bTask.catch(() => undefined);
+                throw error;
+              }
+            } else {
+              submitted = await bTask;
+            }
             stage("B_request_result", { runId: input.runId, httpStatus: submitted.status });
             expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
             const [candidate] = await db.select().from(activityLog).where(and(
@@ -1956,6 +1986,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             candidateVersion: current!.statusVersion, decisionPayload,
             originalAdapterCalls: [...seenAdapterIds],
             sourcePoolMaxConnections: w011Selected ? 2 : 1,
+            observerDb: w011Observer ?? undefined,
             stage,
           });
           bodySucceeded = true;
@@ -1968,11 +1999,38 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           competing.push(...race.filter(r => r.status !== 200).map(r => r.status));
           reviewed = race.find(r => r.status === 200) ?? race[0];
         } else {
-          if (mode === "document") stage("D_request_enter", { reviewerId });
-          reviewed = mode === "generic"
-            ? await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({ status: "done" })
-            : await decide();
-          if (mode === "document") stage("D_request_result", { httpStatus: reviewed.status });
+          if (mode === "document") {
+            stage("D_request_enter", { reviewerId });
+            const docRequest = decide();
+            const docTask = docRequest.then((response) => response);
+            try {
+              reviewed = await w011Watchdog(
+                docTask,
+                "document_D_request",
+                async () => {
+                  const catalog = w011Observer
+                    ? await w011ReadPgCatalog(w011Observer, ["w011-source"])
+                    : [];
+                  stage("watchdog_timeout", { label: "document_D_request", catalog });
+                  return { catalog };
+                },
+                15_000,
+              );
+            } catch (error) {
+              try { docRequest.abort(); } catch {}
+              const cancelled = w011Observer
+                ? await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => [])
+                : [];
+              stage("D_request_cancelled", { cancelled });
+              await docTask.catch(() => undefined);
+              throw error;
+            }
+            stage("D_request_result", { httpStatus: reviewed.status });
+          } else {
+            reviewed = mode === "generic"
+              ? await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({ status: "done" })
+              : await decide();
+          }
           if (mode === "replay" && reviewed.status === 200) {
             competing.push((await decide()).status);
           }
@@ -2805,6 +2863,20 @@ async function w011ReadPgCatalog(
   )) as unknown as W011CatalogRow[];
 }
 
+
+async function w011CancelApplicationSessions(
+  observer: ReturnType<typeof createDb>,
+  applicationNames: string[],
+) {
+  const quoted = applicationNames.map((name) => "'" + name.replaceAll("'", "''") + "'").join(",");
+  return await observer.execute(sql.raw(
+    "SELECT pid,application_name,state,pg_cancel_backend(pid) AS cancelled" +
+    " FROM pg_stat_activity WHERE datname=current_database()" +
+    " AND application_name IN (" + quoted + ")" +
+    " AND pid<>pg_backend_pid() ORDER BY application_name,pid"
+  )) as unknown as Array<Record<string, unknown>>;
+}
+
 function w011PendingTaskState(input: {
   dSettled: boolean;
   writerSettled: boolean;
@@ -2926,6 +2998,7 @@ type W009ContentionArgs = {
   candidateId:string; candidateVersion:number;
   decisionPayload:Record<string,unknown>; originalAdapterCalls:string[];
   sourcePoolMaxConnections:number;
+  observerDb?:ReturnType<typeof createDb>;
   stage: W011StageWriter;
 };
 
@@ -2942,13 +3015,15 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const stage=a.stage;
   const writer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-writer"});
   const reviewerDb=createDb(a.connectionString,{maxConnections:2,applicationName:"w009-D"});
-  const observer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-observer"});
+  const ownsObserver=!a.observerDb;
+  const observer=a.observerDb ?? createDb(a.connectionString,{maxConnections:1,applicationName:"w009-observer"});
   const gateDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-gate"});
   stage("contention_pools_ready", {
     sourcePoolMaxConnections: a.sourcePoolMaxConnections,
     writerPoolMaxConnections: 1,
     reviewerPoolMaxConnections: 2,
     observerPoolMaxConnections: 1,
+    observerOwnedByHelper: ownsObserver,
     gatePoolMaxConnections: 1,
     totalRolePoolCapacity: 7,
     rationale: "source/reviewer need transaction plus nested settings read; runtime writer keeps persistence on tx and registry DB is not queried inside parent-lock transaction",
@@ -3422,7 +3497,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     if(beforeHttps===undefined)delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
     else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS=beforeHttps;
 
-    for(const [name,roleDb] of [["reviewer",reviewerDb],["writer",writer],["gate",gateDb],["observer",observer]] as const){
+    const poolsToClose:Array<readonly [string,ReturnType<typeof createDb>]>=[
+      ["reviewer",reviewerDb],["writer",writer],["gate",gateDb],
+      ...(ownsObserver ? [["observer",observer] as const] : []),
+    ];
+    for(const [name,roleDb] of poolsToClose){
       try{await roleDb.$client.end({timeout:1});stage("contention_pool_closed",{name});}
       catch(error){
         cleanupErrors.push(error);
