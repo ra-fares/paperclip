@@ -846,6 +846,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
     "workspace_settings_aba", "execution_workspace_branch_aba_http", "project_workspace_membership_db",
     "project_workspace_membership_aba_db", "execution_workspace_membership_db",
     "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
+    "project_workspace_identity_revision_aba_db",
     "project_workspace_company_db", "execution_workspace_company_db",
     "execution_workspace_project_workspace_db", "execution_workspace_source_issue_db",
   ] as const) {
@@ -914,7 +915,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         const projectWorkspaceMembershipMode =
           mode === "project_workspace_membership_db" ||
           mode === "project_workspace_membership_aba_db" ||
-          mode === "project_workspace_company_db";
+          mode === "project_workspace_company_db" ||
+          mode === "project_workspace_identity_revision_aba_db";
         const originalProjectWorkspaceId = projectWorkspaceMembershipMode ? randomUUID() : null;
         if (originalProjectWorkspaceId) {
           // The bound project workspace MUST exist at original genuine B:
@@ -1125,6 +1127,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             const row = {
               phase, httpStatus, responseBody,
               branchName: workspace?.branchName ?? null,
+              identityRevision: workspace?.identityRevision ?? null,
               workspaceStatus: workspace?.status ?? null,
               issueStatus: issue?.status ?? null,
               issueVersion: issue?.statusVersion ?? null,
@@ -1217,6 +1220,13 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           reviewBody = reviewed.body;
           await capture("after_reviewer_D", reviewed.status, reviewed.body);
           const observation = await save("REVIEW_ATTEMPTED", true);
+          const originalRevision = BigInt(String(before.identityRevision));
+          const changedRevision = BigInt(String(middle.identityRevision));
+          const restoredRevision = BigInt(String(afterRestore.identityRevision));
+          expect(changedRevision).toBe(originalRevision + 1n);
+          expect(restoredRevision).toBe(originalRevision + 2n);
+          expect(createdAnchor!.details.workspaceRevisionSchema)
+            .toBe("p04-workspace-identity-revision.v1");
           // Safety oracle remains 409. 200/done/accepted1 is a genuine
           // application ABA RED, never made green by editing the assertion.
           expect(reviewed.status, JSON.stringify(observation)).toBe(409);
@@ -1552,6 +1562,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           "workspace_settings_aba", "project_workspace_membership_db",
           "project_workspace_membership_aba_db", "execution_workspace_membership_db",
           "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
+          "project_workspace_identity_revision_aba_db",
           "project_workspace_company_db", "execution_workspace_company_db",
           "execution_workspace_project_workspace_db", "execution_workspace_source_issue_db",
         ] as const;
@@ -1669,6 +1680,24 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                   .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
               }
               mutations.push({ phase: "db_workspace_company_changed", otherCompanyId });
+            } else if (mode === "project_workspace_identity_revision_aba_db") {
+              // Genuine B is already pinned to this PW. Restore identical cwd
+              // after two independent table updates without touching the issue.
+              expect(originalProjectWorkspaceId).toBeTruthy();
+              const [pw] = await db.select().from(projectWorkspaces)
+                .where(eq(projectWorkspaces.id, originalProjectWorkspaceId!));
+              expect(pw).toBeDefined();
+              const first = BigInt(pw!.identityRevision);
+              await db.update(projectWorkspaces).set({ cwd: "/tmp/int2-w01-005-alternate" })
+                .where(eq(projectWorkspaces.id, pw!.id));
+              await db.update(projectWorkspaces).set({ cwd: pw!.cwd })
+                .where(eq(projectWorkspaces.id, pw!.id));
+              const [restored] = await db.select().from(projectWorkspaces)
+                .where(eq(projectWorkspaces.id, pw!.id));
+              expect(restored!.identityRevision).toBe((first + 2n).toString());
+              expect(restored!.cwd).toBe(pw!.cwd);
+              mutations.push({ phase: "project_workspace_identity_revision_restored",
+                before: pw!.identityRevision, after: restored!.identityRevision });
             } else if (mode.startsWith("project_workspace_membership")) {
               expect(originalProjectWorkspaceId).toBeTruthy();
               await db.update(projectWorkspaces).set({ projectId: otherProjectId })
