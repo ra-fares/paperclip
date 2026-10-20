@@ -1,181 +1,86 @@
-# W01-002: one isolated application-HTTP ABA probe; no production change.
-name: Sensor P04 INT2 W01-002 HTTP ABA
+# W01-005 CI1: non-pruning schema migration generation only; no providers or deployment.
+name: Sensor P04 W01-005 migration generator
 on:
   push:
-    branches: [codex/w01-002-int2-http-aba]
-    paths:
-      - .github/workflows/sensor-p04-int2-first-red.yml
-      - server/src/__tests__/issue-stalled-review-decision-routes.test.ts
+    branches: [codex/w01-005-int2-workspace-revision]
+    paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-int2-w01-002-http-aba
+  group: sensor-p04-w01-005-generator
   cancel-in-progress: false
 jobs:
-  isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-002-int2-http-aba'
+  migration-generation:
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-005-int2-workspace-revision'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       CI: 'true'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
-      NO_COLOR: '1'
     steps:
-      - name: Checkout isolated exact candidate
+      - name: Checkout exact committed candidate with no retained write credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 40
-      - name: Validate exact SHA ancestry and two-file allowlist
+      - name: Source identity and allowlist, historical migration manifest
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence "$RUNNER_TEMP/p04-int2-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/p04-int2-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence/generated
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git merge-base --is-ancestor f5a92c492ac48909fc6d867345a80becc50bc2c1 HEAD
-          git diff --name-only f5a92c492ac48909fc6d867345a80becc50bc2c1 HEAD | tee .int2-evidence/changed-files.txt
-          while IFS= read -r f; do
-            case "$f" in
-              server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_W01_002_WRITE_SET $f" >&2; exit 1 ;;
+          git merge-base --is-ancestor c3c73673205c62eb6d5490417502126dc32726ff HEAD
+          git diff --name-only c3c73673205c62eb6d5490417502126dc32726ff HEAD | tee .int2-evidence/changed-files.txt
+          while IFS= read -r p; do
+            case "$p" in
+              packages/db/src/schema/project_workspaces.ts|packages/db/src/schema/execution_workspaces.ts|server/src/services/issues.ts|server/src/services/execution-workspaces.ts|server/src/services/workspace-runtime.ts|server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml|packages/db/src/migrations/meta/_journal.json|packages/db/src/migrations/meta/0294_snapshot.json|packages/db/src/migrations/0294_*.sql) ;;
+              *) echo "OUTSIDE_W01_005_WRITE_SET $p" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
-          test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
-          echo "BASE=f5a92c492ac48909fc6d867345a80becc50bc2c1 SHA=$GITHUB_SHA RUN=$GITHUB_RUN_ID" > .int2-evidence/identity.txt
-      - name: Set up Node 24
+          git ls-files packages/db/src/migrations/'*.sql' packages/db/src/migrations/meta/'*_snapshot.json' | sort > .int2-evidence/historical-files.txt
+          while IFS= read -r p; do sha256sum "$p"; done < .int2-evidence/historical-files.txt > .int2-evidence/historical-sha256.txt
+          printf 'SHA=%s\nRUN=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > .int2-evidence/identity.txt
+      - name: Node 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Set up pnpm 9.15.4
+      - name: pnpm 9.15.4
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9.15.4
           run_install: false
-      - name: Frozen install and SDK build dependencies
-        run: |
-          set -euo pipefail
-          node --version
-          pnpm --version
-          pnpm install --frozen-lockfile
-          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
-          test -f server/node_modules/vitest/vitest.mjs
-      - name: Run typecheck, HTTP ABA target, and positive BCD documentary control
+      - name: Frozen install and non-pruning migration generator
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence
-          set +e
-          pnpm --filter @paperclipai/server typecheck > .int2-evidence/typecheck.stdout 2> .int2-evidence/typecheck.stderr
-          tsc=$?
-          set -e
-          echo "$tsc" > .int2-evidence/typecheck.exit_code
-          echo "TYPECHECK_EXIT=$tsc"
-          tail -n 100 .int2-evidence/typecheck.stdout || true
-          tail -n 100 .int2-evidence/typecheck.stderr || true
-          export INT2_HTTP_ABA_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/http-aba-observation.json"
-          export INT2_POSITIVE_BCD_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/positive-document-observation.json"
-          run_named () {
-            local label="$1" pattern="$2"
-            set +e
-            node server/node_modules/vitest/vitest.mjs run --root server src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=json --outputFile="../int2-$label.json" -t "$pattern" > ".int2-evidence/$label.stdout" 2> ".int2-evidence/$label.stderr"
-            local rc=$?
-            set -e
-            echo "$rc" > ".int2-evidence/$label.exit_code"
-            if test -f "int2-$label.json"; then cp "int2-$label.json" ".int2-evidence/"; fi
-            echo "TEST_CASE=$label EXIT=$rc"
-            tail -n 90 ".int2-evidence/$label.stderr" || true
-            tail -n 90 ".int2-evidence/$label.stdout" || true
-          }
-          run_named target 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate'
-          run_named control 'P04 INT2 BCD document: actual admitted run and independent reviewer'
-      - name: Classify selected cases; keep semantic RED as failing CI
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p .int2-evidence
-          node <<'NODE'
-          const fs = require('node:fs');
-          const dir = '.int2-evidence';
-          const expected = {
-            target: 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate',
-            control: 'P04 INT2 BCD document: actual admitted run and independent reviewer',
-          };
-          const read = name => { try { return fs.readFileSync(dir+'/'+name,'utf8'); } catch { return null; } };
-          const asJson = name => { try { return JSON.parse(read(name)); } catch { return null; } };
-          const out = { head: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID };
-          const tsc = read('typecheck.exit_code');
-          out.typecheck = { exitCode: tsc===null ? null : Number(tsc.trim()), classification: tsc===null?'NOT_RUN':tsc.trim()==='0'?'PASS':'FAIL' };
-          let bad = out.typecheck.classification !== 'PASS';
-          for (const [label,name] of Object.entries(expected)) {
-            const doc = asJson('int2-'+label+'.json'), raw = read(label+'.exit_code');
-            const exitCode = raw===null ? null : Number(raw.trim());
-            const matches = (doc?.testResults??[]).flatMap(file=>file.assertionResults??[])
-              .filter(test=>test.fullName===('stalled review decision routes '+name) || test.fullName===('P04 INT2 bound candidate and evidence gates '+name) || test.fullName?.endsWith(name));
-            const status = matches[0]?.status ?? null;
-            const executed = (doc?.testResults??[]).flatMap(file=>file.assertionResults??[])
-              .filter(test=>test.status==='passed'||test.status==='failed');
-            const selectedOne = matches.length===1 && executed.length===1;
-            out[label] = { name, count: matches.length, selectedOne,
-              status, exitCode, numPassedTests:doc?.numPassedTests??null,
-              numFailedTests:doc?.numFailedTests??null, numTotalTests:doc?.numTotalTests??null,
-              failureMessages:matches.flatMap(test=>test.failureMessages??[]),
-              classification:'NOT_RUN' };
-            if (!selectedOne || exitCode===null || status==='pending' || status==='skipped') {
-              out[label].classification='NOT_RUN';
-            } else {
-              out[label].classification = status==='passed' && exitCode===0 &&
-                doc.numPassedTests===1 && doc.numFailedTests===0?'PASS':'FAIL';
-            }
-          }
-          const o=asJson('http-aba-observation.json');
-          out.targetObservation=o;
-          if (o) {
-            const steps=o.steps??[];
-            const a=steps.find(x=>x.phase==='before_http_A');
-            const b=steps.find(x=>x.phase==='after_http_B');
-            const c=steps.find(x=>x.phase==='after_http_restored_A');
-            const valid=o.preconditionsValid===true && o.stage==='REVIEW_ATTEMPTED' &&
-              o.sourceRunStatus==='succeeded' && o.receiptSchema==='sensor-direct-dispatch-claim.v2' &&
-              !!o.candidateId && !!o.completionContractId && !!o.completionContractSha256 &&
-              !!o.documentaryRevisionId && !!a && !!b && !!c &&
-              b.httpStatus===200 && b.branchName===o.branchB &&
-              c.httpStatus===200 && c.branchName===o.branchA &&
-              b.issueWorkspaceId===o.workspaceId && c.issueWorkspaceId===o.workspaceId &&
-              a.issueStatus==='in_review' && b.issueStatus==='in_review' && c.issueStatus==='in_review' &&
-              o.adapterCalls?.includes(o.sourceRunId) &&
-              o.actualAdapterCalls?.includes(o.sourceRunId);
-            out.target.preconditionsValid=Boolean(valid);
-            if (!valid) out.target.classification='INVALID_REPRO';
-            else if (o.reviewerHttp===200 && o.finalStatus==='done' && o.acceptedAuditRows===1)
-              out.target.classification='REPRODUCED_GAP';
-            else if (o.reviewerHttp===409 && o.reviewerCode==='governed_candidate_stale' &&
-                     o.finalStatus==='in_review' && o.acceptedAuditRows===0 &&
-                     out.target.classification==='PASS')
-              out.target.classification='PASS';
-            else out.target.classification='FAIL_OR_OTHER_DENIAL';
-          } else out.target.classification='INVALID_REPRO';
-          const positive=asJson('positive-document-observation.json');
-          out.controlObservation=positive;
-          if (!positive || positive.mode!=='document' || positive.reviewerHttp!==200 ||
-              positive.after!=='done' || positive.acceptedAuditRows!==1 ||
-              out.control.classification!=='PASS') out.control.classification='INVALID_REPRO_OR_FAIL';
-          for (const label of ['target','control']) if (out[label].classification!=='PASS') bad=true;
-          out.overall=bad?'FAIL_OR_NOT_RUN':'PASS';
-          fs.writeFileSync(dir+'/classification.json',JSON.stringify(out,null,2)+'\n');
-          console.log(JSON.stringify(out,null,2));
-          if (bad) process.exitCode=1;
-          NODE
-      - name: Upload evidence on PASS, RED, or infrastructure failure
+          node --version | tee .int2-evidence/node-version.txt
+          pnpm --version | tee .int2-evidence/pnpm-version.txt
+          pnpm install --frozen-lockfile > .int2-evidence/install.stdout 2> .int2-evidence/install.stderr
+          pnpm --filter @paperclipai/db run check:migrations > .int2-evidence/baseline-check.stdout 2> .int2-evidence/baseline-check.stderr
+          pnpm --filter @paperclipai/db exec tsc -p tsconfig.json > .int2-evidence/compile.stdout 2> .int2-evidence/compile.stderr
+          pnpm --filter @paperclipai/db exec drizzle-kit generate --config=drizzle.config.ts > .int2-evidence/generate.stdout 2> .int2-evidence/generate.stderr
+          git diff --exit-code HEAD -- packages/db/src/migrations/'*.sql' packages/db/src/migrations/meta/'*_snapshot.json'
+          git ls-files packages/db/src/migrations/'*.sql' packages/db/src/migrations/meta/'*_snapshot.json' | sort > .int2-evidence/historical-files-after.txt
+          diff -u .int2-evidence/historical-files.txt .int2-evidence/historical-files-after.txt
+          while IFS= read -r p; do sha256sum "$p"; done < .int2-evidence/historical-files.txt > .int2-evidence/historical-sha256-after.txt
+          diff -u .int2-evidence/historical-sha256.txt .int2-evidence/historical-sha256-after.txt
+          test "$(find packages/db/src/migrations -maxdepth 1 -name '0294_*.sql' | wc -l)" = 1
+          test -f packages/db/src/migrations/meta/0294_snapshot.json
+          cp packages/db/src/migrations/0294_*.sql .int2-evidence/generated/
+          cp packages/db/src/migrations/meta/0294_snapshot.json .int2-evidence/generated/
+          cp packages/db/src/migrations/meta/_journal.json .int2-evidence/generated/
+          git diff -- packages/db/src/migrations/meta/_journal.json > .int2-evidence/journal.patch
+          (cd .int2-evidence/generated && sha256sum * > ../generated-sha256.txt)
+          git status --short --untracked-files=all > .int2-evidence/status.txt
+          cat .int2-evidence/generate.stdout
+          cat .int2-evidence/generated-sha256.txt
+      - name: Always upload generated artifacts and failure logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: p04-int2-w01-002-http-aba-evidence
-          if-no-files-found: warn
-          include-hidden-files: true
-          retention-days: 30
+          name: w01-005-ci1-generation
           path: .int2-evidence/
-      - name: Ensure tracked checkout unchanged
-        if: always()
-        run: git diff --exit-code
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
