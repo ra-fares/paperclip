@@ -2045,6 +2045,13 @@
       "when": 1792012200000,
       "tag": "0293_sensor_issue_governance",
       "breakpoints": true
+    },
+    {
+      "idx": 294,
+      "version": "7",
+      "when": 1792495744640,
+      "tag": "0294_freezing_beyonder",
+      "breakpoints": true
     }
   ]
 }
