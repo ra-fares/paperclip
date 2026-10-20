@@ -2926,10 +2926,13 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         "CREATE TRIGGER w009_hold_review_trigger AFTER UPDATE ON issues"+
         " FOR EACH ROW EXECUTE FUNCTION w009_hold_review()"));
     } else if(reconcile) {
+      // This trigger fires on issue_comments, whose FK is issue_id. NEW.id
+      // denotes the COMMENT id; using it would never park the real writer.
+      const commentIssueCondition="NEW.issue_id = '"+a.issueId+"'::uuid";
       await a.db.execute(sql.raw(
-        "CREATE FUNCTION w009_hold_comment() RETURNS trigger LANGUAGE plpgsql AS $$"+
-        " BEGIN IF "+condition+" THEN"+
-        " PERFORM pg_advisory_xact_lock("+key+"); END IF; RETURN NEW; END $$"));
+        "CREATE FUNCTION w009_hold_comment() RETURNS trigger LANGUAGE plpgsql AS $"+
+        " BEGIN IF "+commentIssueCondition+" THEN"+
+        " PERFORM pg_advisory_xact_lock("+key+"); END IF; RETURN NEW; END $"));
       await a.db.execute(sql.raw(
         "CREATE TRIGGER w009_hold_comment_trigger BEFORE INSERT ON issue_comments"+
         " FOR EACH ROW EXECUTE FUNCTION w009_hold_comment()"));
