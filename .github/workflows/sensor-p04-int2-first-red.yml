@@ -68,7 +68,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           test -f server/node_modules/vitest/vitest.mjs
-      - name: Compile and probe issue-targeted replacement heartbeat
+      - name: Compile and probe rejected-heartbeat review fencing
         shell: bash
         run: |
           set -euo pipefail
@@ -89,15 +89,16 @@ jobs:
             echo "$rc" > ".int2-evidence/$label.exit_code"
             test ! -f "int2-$label.json" || cp "int2-$label.json" .int2-evidence/
           }
-          # Single new hypothesis. 18 prior PASS at b6fa1f5 are immutable.
-          run_named replacement src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD replacement_heartbeat: actual admitted run and independent reviewer'
+          # Historical replacement_heartbeat remains FAILED at ee6453c and
+          # is never silently reclassified green by this separate scenario.
+          run_named rejected src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD rejected_replacement_fencing: actual admitted run and independent reviewer'
       - name: Classify executed assertions (skips always NOT_RUN)
         run: |
           node <<'NODE'
           const fs=require("node:fs");
           const dir=".int2-evidence";
           const cases={
-            replacement:["P04 INT2 BCD replacement_heartbeat: actual admitted run and independent reviewer"]
+            rejected:["P04 INT2 BCD rejected_replacement_fencing: actual admitted run and independent reviewer"]
           };
           const output={};
           let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";
@@ -113,7 +114,7 @@ jobs:
               const messages=found.flatMap(x=>x.failureMessages??[]);
               const stdout=fs.existsSync(dir+"/"+label+".stdout")?fs.readFileSync(dir+"/"+label+".stdout","utf8"):"";
               const source=[stdout,...messages].join("\\n");
-              const observation=(source.match(/INT2_(?:BCD|REVIEW)_OBSERVATION\\s+(\\{[^\\n]+\\})/)??[])[1]??null;
+              const observation=(source.match(/INT2_(?:BCD|REVIEW|REJECTED_FENCING)_OBSERVATION\\s+(\\{[^\\n]+\\})/)??[])[1]??null;
               let classification=found.length!==1||status==="pending"||status==="skipped"?"NOT_RUN":
                 (status==="passed"?"PASS":
                  status==="failed"?(observation?"FAIL":"INVALID_FIXTURE"):"INVALID_FIXTURE");

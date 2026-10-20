@@ -828,7 +828,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   for (const mode of [
     "missing", "document", "release", "successor", "assignee_aba",
     "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
-    "replacement_heartbeat",
+    "replacement_heartbeat", "rejected_replacement_fencing",
   ] as const) {
     it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
@@ -842,6 +842,11 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       const adapterBindings: Array<{
         runId: string; executionRunId: string | null;
         status: string; statusVersion: number;
+      }> = [];
+      const admissionBindings: Array<{
+        runId: string; status: string; statusVersion: number;
+        executionRunId: string | null; workspaceId: string | null;
+        runWorkspaceId: unknown;
       }> = [];
       const execute = vi.fn<ServerAdapterModule["execute"]>();
       let h: ReturnType<typeof heartbeatService> | null = null;
@@ -987,6 +992,13 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             const workspaceId = issue?.executionWorkspaceId;
             expect(workspaceId).toBeTruthy();
             expect(run?.contextSnapshot?.executionWorkspaceId).toBe(workspaceId);
+            admissionBindings.push({
+              runId, status: issue!.status,
+              statusVersion: issue!.statusVersion,
+              executionRunId: issue!.executionRunId,
+              workspaceId: issue!.executionWorkspaceId,
+              runWorkspaceId: run?.contextSnapshot?.executionWorkspaceId ?? null,
+            });
             const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId!));
             const baselineSha = "d".repeat(40);
             await db.update(executionWorkspaces).set({
@@ -1052,7 +1064,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         // All D cases share the same genuine running-run B and terminal C.
         // Bounded probe of the actual issue-targeted heartbeat route in in_review.
         // No synthetic successor, no status override, no suppressed hook/adapter.
-        if (mode === "replacement_heartbeat") {
+        if (mode === "replacement_heartbeat" || mode === "rejected_replacement_fencing") {
+          const originalCandidateVersion = createdAnchor!.details.issueStatusVersion as number;
+          expect(originalCandidateVersion).toBe(current!.statusVersion);
           const issueSnapshots: Array<{
             phase: string; status: string; statusVersion: number;
             executionRunId: string | null; checkoutRunId: string | null;
@@ -1088,7 +1102,11 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           // This API is the actual issue-service terminal cleanup. Never
           // directly clear replacement executionRunId with test SQL.
           let clearedExecution = false, clearedCheckout = false;
-          if (invokedRun?.status === "succeeded") {
+          if (invokedRun?.status === "succeeded" ||
+              (mode === "rejected_replacement_fencing" && invokedRun?.status === "failed")) {
+            // The heartbeat's own terminal cleanup usually released both
+            // pointers already. Invoke the real production cleanup API once
+            // more for idempotence, never update issues by SQL in this test.
             clearedExecution = await issueService(db).clearExecutionRunIfTerminal(issueId);
             clearedCheckout = await issueService(db).clearCheckoutRunIfTerminal(issueId);
           }
@@ -1103,7 +1121,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             invokedErrorCode: invokedRun?.errorCode ?? null,
             invokedError: invokedRun?.error ?? null,
             clearedExecution, clearedCheckout, issueSnapshots,
-            adapterBindings, adapterCalls: seenAdapterIds,
+            admissionBindings, adapterBindings, adapterCalls: seenAdapterIds,
             actualExecuteCalls: execute.mock.calls.map(([input]) => input.runId),
             admissionChecks: seenAdmissionIds,
             allRuns: allObservedRuns.map(row => ({
@@ -1118,6 +1136,122 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           };
           console.info("INT2_BCD_OBSERVATION " + JSON.stringify(trace));
           const traceDiagnostic = "INT2_BCD_OBSERVATION " + JSON.stringify(trace);
+
+          if (mode === "rejected_replacement_fencing") {
+            // This is a different asserted outcome from historical
+            // replacement_heartbeat (which still expects a successful run,
+            // still FAILS on workspace_mismatch, and is not run as GREEN).
+            const [revision] = await db.select().from(documentRevisions)
+              .where(eq(documentRevisions.id, revisionId));
+            const [evidenceLink] = await db.select().from(issueDocuments)
+              .where(and(
+                eq(issueDocuments.companyId, companyId),
+                eq(issueDocuments.issueId, issueId),
+                eq(issueDocuments.documentId, documentId),
+                eq(issueDocuments.key, "handoff-deliverable"),
+              ));
+            expect(revision).toMatchObject({
+              id: revisionId, body: evidenceBody,
+              createdByRunId: run!.id, createdByAgentId: agentId,
+            });
+            expect(evidenceLink).toBeDefined();
+            expect(run?.resultJson?.evidence).toEqual([{
+              criterionId: "objective", ref,
+            }]);
+            expect(run?.status).toBe("succeeded");
+            expect(run?.runnerProfileJson?.sensorDirectDispatchClaim).toMatchObject({
+              schema: "sensor-direct-dispatch-claim.v2", runId: run!.id,
+            });
+            expect(invokeError, traceDiagnostic).toBeNull();
+            expect(invokedId, traceDiagnostic).toBeTruthy();
+            expect(invokedId, traceDiagnostic).not.toBe(run!.id);
+            expect(allObservedRuns, traceDiagnostic).toHaveLength(2);
+            expect(invokedRun?.status, traceDiagnostic).toBe("failed");
+            expect(invokedRun?.finishedAt, traceDiagnostic).not.toBeNull();
+            expect(invokedRun?.errorCode, traceDiagnostic).toBe("sensor_admission_denied");
+            expect(invokedRun?.error, traceDiagnostic).toContain(
+              "sensor_admission_denied:workspace_mismatch:",
+            );
+            expect(invokedRun?.retryOfRunId, traceDiagnostic).toBeNull();
+            expect(invokedRun?.contextSnapshot?.issueId, traceDiagnostic).toBe(issueId);
+            expect(invokedRun?.runnerProfileJson?.sensorDirectDispatchClaim, traceDiagnostic)
+              .toBeUndefined();
+            expect(seenAdmissionIds.filter(id => id === invokedId), traceDiagnostic).toHaveLength(1);
+            expect(admissionBindings.filter(entry =>
+              entry.runId === invokedId && entry.executionRunId === invokedId
+            ), traceDiagnostic).toHaveLength(1);
+            expect(seenAdapterIds, traceDiagnostic).toEqual([run!.id]);
+            expect(execute.mock.calls.map(([input]) => input.runId), traceDiagnostic)
+              .toEqual([run!.id]);
+            expect(terminalIssue.statusVersion, traceDiagnostic)
+              .toBeGreaterThan(originalCandidateVersion);
+            expect(releasedIssue.statusVersion, traceDiagnostic)
+              .toBe(terminalIssue.statusVersion);
+            expect(releasedIssue.status, traceDiagnostic).toBe("in_review");
+            expect(releasedIssue.executionRunId, traceDiagnostic).toBeNull();
+            expect(releasedIssue.checkoutRunId, traceDiagnostic).toBeNull();
+
+            // **Original** candidate version, NOT releasedIssue.statusVersion.
+            // Exact genuine source-run-authored document revision remains
+            // available; only the changed review generation may reject it.
+            const review = await request(board(reviewerId))
+              .patch(`/api/issues/${issueId}`).send({
+                status: "done",
+                governedReviewDecision: {
+                  candidateId: createdAnchor!.id,
+                  candidateIssueStatusVersion: originalCandidateVersion,
+                  criteriaVerdicts: [{
+                    criterionId: "objective", ref,
+                    bodySha256: createHash("sha256").update(evidenceBody, "utf8").digest("hex"),
+                    verdict: "accepted",
+                    rationale: "Independently reviewed the pinned source-run handoff revision.",
+                  }],
+                },
+              });
+            const [afterD] = await db.select().from(issues)
+              .where(eq(issues.id, issueId));
+            const accepted = await db.select().from(activityLog).where(and(
+              eq(activityLog.companyId, companyId),
+              eq(activityLog.entityId, issueId),
+              eq(activityLog.action, "issue.governed_acceptance_decided.v1"),
+            ));
+            const afterRuns = await db.select().from(heartbeatRuns)
+              .where(eq(heartbeatRuns.companyId, companyId));
+            const outcome = {
+              ...trace,
+              storedCandidateVersion: originalCandidateVersion,
+              sentCandidateVersion: originalCandidateVersion,
+              reviewerHttp: review.status,
+              reviewerCode: review.body.details?.code ?? null,
+              reviewerBody: review.body,
+              finalStatus: afterD?.status,
+              finalStatusVersion: afterD?.statusVersion,
+              finalExecutionRunId: afterD?.executionRunId,
+              finalCheckoutRunId: afterD?.checkoutRunId,
+              acceptedAuditRows: accepted.length,
+              allRunsAfterDecision: afterRuns.map(row => ({
+                id: row.id, status: row.status,
+                retryOfRunId: row.retryOfRunId,
+                contextIssueId: row.contextSnapshot?.issueId ?? null,
+                errorCode: row.errorCode,
+              })),
+              allAdapterCallsAfterDecision: execute.mock.calls.map(([input]) => input.runId),
+            };
+            console.info("INT2_REJECTED_FENCING_OBSERVATION " + JSON.stringify(outcome));
+            const diagnostic = JSON.stringify(outcome);
+            expect(review.status, diagnostic).toBe(409);
+            expect(review.body.details?.code, diagnostic).toBe("governed_candidate_stale");
+            expect(accepted, diagnostic).toHaveLength(0);
+            expect(afterD?.status, diagnostic).toBe("in_review");
+            expect(afterD?.statusVersion, diagnostic).toBe(releasedIssue.statusVersion);
+            expect(afterD?.executionRunId, diagnostic).toBeNull();
+            expect(afterD?.checkoutRunId, diagnostic).toBeNull();
+            expect(afterRuns.map(row => row.id).sort(), diagnostic)
+              .toEqual(allObservedRuns.map(row => row.id).sort());
+            expect(execute.mock.calls.map(([input]) => input.runId), diagnostic)
+              .toEqual([run!.id]);
+            return;
+          }
 
           // If the legitimate route refuses replacement while in_review,
           // leave this selected case FAIL with the exact run/response trace.
