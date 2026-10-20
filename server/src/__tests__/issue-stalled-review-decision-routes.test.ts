@@ -2007,6 +2007,35 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         };
         const decide = () => request(board(reviewerId))
           .patch(`/api/issues/${issueId}`).send(decisionPayload);
+        const decideWithDiagnostics = async (label: string) => {
+          stage("D_request_enter", { reviewerId, label });
+          const dRequest = decide();
+          const dTask = dRequest.then((response) => response);
+          try {
+            const response = await w011Watchdog(
+              dTask,
+              label,
+              async () => {
+                const catalog = w011Observer
+                  ? await w011ReadPgCatalog(w011Observer, [sourceApplicationName])
+                  : [];
+                stage("watchdog_timeout", { label, catalog });
+                return { catalog };
+              },
+              15_000,
+            );
+            stage("D_request_result", { label, httpStatus: response.status });
+            return response;
+          } catch (error) {
+            try { dRequest.abort(); } catch {}
+            const cancelled = w011Observer
+              ? await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => [])
+              : [];
+            stage("D_request_cancelled", { label, cancelled });
+            await w011SettleAfterCancellation(dTask, db, stage, label);
+            throw error;
+          }
+        };
         if (mode.startsWith("lock_")) {
           await w009ExerciseGenuineContention({
             mode, connectionString: cluster.connectionString, db,
@@ -2029,33 +2058,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           competing.push(...race.filter(r => r.status !== 200).map(r => r.status));
           reviewed = race.find(r => r.status === 200) ?? race[0];
         } else {
-          if (mode === "document") {
-            stage("D_request_enter", { reviewerId });
-            const docRequest = decide();
-            const docTask = docRequest.then((response) => response);
-            try {
-              reviewed = await w011Watchdog(
-                docTask,
-                "document_D_request",
-                async () => {
-                  const catalog = w011Observer
-                    ? await w011ReadPgCatalog(w011Observer, [sourceApplicationName])
-                    : [];
-                  stage("watchdog_timeout", { label: "document_D_request", catalog });
-                  return { catalog };
-                },
-                15_000,
-              );
-            } catch (error) {
-              try { docRequest.abort(); } catch {}
-              const cancelled = w011Observer
-                ? await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => [])
-                : [];
-              stage("D_request_cancelled", { cancelled });
-              await w011SettleAfterCancellation(docTask, db, stage, "document_D_request");
-              throw error;
-            }
-            stage("D_request_result", { httpStatus: reviewed.status });
+          if (w012Selected) {
+            reviewed = await decideWithDiagnostics(`${mode}_D_request`);
           } else {
             reviewed = mode === "generic"
               ? await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({ status: "done" })
