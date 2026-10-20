@@ -2920,6 +2920,7 @@ type W009ContentionArgs = {
   pwId:string; ewId:string; reviewerId:string; runId:string;
   candidateId:string; candidateVersion:number;
   decisionPayload:Record<string,unknown>; originalAdapterCalls:string[];
+  stage: W011StageWriter;
 };
 
 /** Runs only AFTER the historical real heartbeat/issue routes pinned authentic B and terminal C. */
@@ -2932,16 +2933,30 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const {EventEmitter}=await import("node:events");
   const {promisify}=await import("node:util");
   const net=await import("node:net");
+  const stage=a.stage;
   const writer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-writer"});
-  const reviewerDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-D"});
+  const reviewerDb=createDb(a.connectionString,{maxConnections:2,applicationName:"w009-D"});
   const observer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-observer"});
   const gateDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-gate"});
+  stage("contention_pools_ready", {
+    sourcePoolMaxConnections: 2,
+    writerPoolMaxConnections: 1,
+    reviewerPoolMaxConnections: 2,
+    observerPoolMaxConnections: 1,
+    gatePoolMaxConnections: 1,
+    totalRolePoolCapacity: 7,
+    rationale: "source/reviewer need transaction plus nested settings read; runtime writer keeps persistence on tx and registry DB is not queried inside parent-lock transaction",
+  });
   const gateEntered=w009Deferred(),releaseGate=w009Deferred();
   const logEntered=w009Deferred(),releaseLog=w009Deferred();
   const foreignOwner=w009Deferred<number>();
   const events:Array<Record<string,unknown>>=[];
   let gateTask:Promise<unknown>|null=null, writerTask:Promise<unknown>|null=null;
   let dTask:Promise<{status:number;body:Record<string,unknown>}>|null=null;
+  let dRequest:{abort?:()=>unknown}|null=null;
+  let dSettled=false,writerSettled=false,gateSettled=false;
+  let primaryError:unknown=null;
+  const cleanupErrors:unknown[]=[];
   let runtimeForStop:typeof import("../services/workspace-runtime.js")|null=null;
   let probe:import("node:net").Server|null=null,probeClosed=true;
   let spawnCount=0,logCount=0,port=0,foreignReleased=false,mocksInstalled=false;
@@ -2957,6 +2972,16 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const key=806000+Math.floor(Math.random()*10000);
   const emit=(name:string,details:Record<string,unknown>={})=>events.push({name,...details});
   const failOs=(description:string):never=>{throw new Error("W009_UNEXPECTED_OS_ACTION "+description);};
+  const pendingState=()=>w011PendingTaskState({dSettled,writerSettled,gateSettled});
+  const contentionCatalog=async()=>await w011ReadPgCatalog(
+    observer,["w009-D","w009-writer","w009-gate","w009-observer"],
+  );
+  const watchdogDetails=async(label:string)=>{
+    const catalog=await contentionCatalog();
+    const pending=pendingState();
+    stage("watchdog_timeout",{label,pending,catalog});
+    return {label,pending,catalog};
+  };
   const fakeGitOutput=(binary:unknown,argv:unknown):string=>{
     if(binary!=="git"||!Array.isArray(argv)||argv[0]!=="-C"||
        typeof argv[1]!=="string"||!(argv[1] as string).startsWith("/tmp/w009-nongit-")) {
@@ -2976,6 +3001,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     return answers[op];
   };
   try {
+    stage("contention_helper_enter",{mode});
     process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
     vi.resetModules();
     mocksInstalled=true;
@@ -3071,9 +3097,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       },
     }));
 
+    stage("module_setup_enter");
     const dynamicRoutes = (await import("../routes/issues.js")).issueRoutes;
     const realReconcile = (await import("../services/execution-workspaces.js")).executionWorkspaceService;
     if(!reconcile)runtimeForStop=await import("../services/workspace-runtime.js");
+    stage("module_setup_complete");
 
     // The reviewer is a GENUINE authorized HTTP issue route loaded AFTER
     // mock graph setup, not a direct private issue-service update.
@@ -3093,21 +3121,35 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     }));
     api.use(errorHandler);
     const launchD=()=>{
-      const task=request(api).patch("/api/issues/"+a.issueId).send(a.decisionPayload)
-        .then(r=>({status:r.status,body:r.body as Record<string,unknown>}));
-      dTask=task;void task.catch(()=>undefined);
+      stage("D_launch",{reviewerPoolMaxConnections:2});
+      const req=request(api).patch("/api/issues/"+a.issueId).send(a.decisionPayload);
+      dRequest=req as unknown as {abort?:()=>unknown};
+      const task=req.then(r=>({status:r.status,body:r.body as Record<string,unknown>}));
+      dTask=task;
+      void task.then(
+        (result)=>{dSettled=true;stage("D_settled",{httpStatus:result.status});},
+        (error)=>{dSettled=true;stage("D_rejected",{error:error instanceof Error?error.message:String(error)});},
+      );
     };
     const launchGate=async()=>{
       // A dedicated session owns the advisory lock. A real SQL trigger on
       // the production write path parks AFTER that path's row locks.
       gateTask=gateDb.transaction(async tx=>{
         await tx.execute(sql.raw("SELECT pg_advisory_lock("+key+")"));
+        stage("gate_acquired",{key});
         gateEntered.resolve();
         try {await releaseGate.promise;}
         finally {await tx.execute(sql.raw("SELECT pg_advisory_unlock("+key+")"));}
       });
-      void gateTask.catch(()=>undefined);
-      await w009Watchdog(gateEntered.promise,"advisory_gate_claim");
+      void gateTask.then(
+        ()=>{gateSettled=true;stage("gate_settled");},
+        (error)=>{gateSettled=true;stage("gate_rejected",{error:error instanceof Error?error.message:String(error)});},
+      );
+      await w011Watchdog(
+        gateEntered.promise,
+        "advisory_gate_claim",
+        ()=>watchdogDetails("advisory_gate_claim"),
+      );
     };
     const condition="NEW.id = '"+a.issueId+"'::uuid";
     if(dFirst) {
@@ -3130,6 +3172,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         "CREATE TRIGGER w009_hold_comment_trigger BEFORE INSERT ON issue_comments"+
         " FOR EACH ROW EXECUTE FUNCTION w009_hold_comment()"));
     }
+    stage("gate_trigger_installed",{dFirst,reconcile});
 
     const startRuntime=async()=>{
       const bindProbe=net.createServer();
@@ -3164,7 +3207,10 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         config:{workspaceRuntime:{services:[service]},desiredState:"running"},
       });
       writerTask=runner;
-      void runner.catch(()=>undefined);
+      void runner.then(
+        ()=>{writerSettled=true;stage("writer_settled",{kind:"runtime"});},
+        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"runtime",error:error instanceof Error?error.message:String(error)});},
+      );
     };
     const startReconcile=()=>{
       const runner=realReconcile(writer).reconcileExecutionWorkspaceBranch(a.ewId,{
@@ -3172,7 +3218,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         reason:"W009 bounded test of real branch reconciliation under review",
         actor:{actorType:"system",actorId:"workspace_runtime",agentId:null,runId:a.runId},
       });
-      writerTask=runner;void runner.catch(()=>undefined);
+      writerTask=runner;
+      void runner.then(
+        ()=>{writerSettled=true;stage("writer_settled",{kind:"reconcile"});},
+        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"reconcile",error:error instanceof Error?error.message:String(error)});},
+      );
     };
     const startWriter=async()=>{
       if(reconcile)startReconcile();else await startRuntime();
@@ -3199,35 +3249,44 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       }
       await launchGate();
       launchD();
-      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-gate"));
+      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-gate",stage));
+      stage("writer_launch",{kind:retry?"retry":"runtime"});
       if(!retry)await startWriter();
       else {foreignReleased=true;foreignOwner.resolve(99001);}
-      lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-D"));
+      lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-D",stage));
+      stage("gate_release",{reason:"required_waits_observed"});
       releaseGate.resolve();
     } else {
       if(reconcile) {
         await launchGate();
         await startWriter();
-        lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-gate"));
+        lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-gate",stage));
       } else {
         await startWriter();
         if(retry) {
           await firstCommitted();
           foreignReleased=true;foreignOwner.resolve(99001);
         }
-        await w009Watchdog(logEntered.promise,"real_parent_locked_log_hook"); // TX locks already acquired
+        await w011Watchdog(
+          logEntered.promise,
+          "real_parent_locked_log_hook",
+          ()=>watchdogDetails("real_parent_locked_log_hook"),
+        ); // TX locks already acquired
       }
       launchD();
-      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-writer"));
+      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-writer",stage));
+      stage("writer_barrier_release",{reconcile});
       if(reconcile)releaseGate.resolve();else releaseLog.resolve();
     }
     if(!dTask||!writerTask)throw new Error("W009_INVALID_LAUNCH: missing real contender");
+    stage("settlement_enter",{pending:pendingState()});
     const [dResult,writerResult]=await Promise.all([
       dTask,writerTask.then(v=>({ok:true,value:v}),e=>({
         ok:false,error:e instanceof Error?e.message:String(e),
         code:(e as {details?:{code?:unknown}})?.details?.code??null,
       })),
     ]);
+    stage("settlement_complete",{pending:pendingState(),dHttp:dResult.status,writerOk:writerResult.ok});
     const [afterIssue]=await a.db.select().from(issues).where(eq(issues.id,a.issueId));
     const accepted=await a.db.select().from(activityLog).where(and(
       eq(activityLog.entityId,a.issueId),
@@ -3275,19 +3334,74 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       expect(serviceRows.some(r=>r.port!==port),JSON.stringify(finding)).toBe(true);
     } else if(!reconcile)expect(spawnCount).toBe(1);
     if(quarantine)expect(events.some(e=>e.name==="PRE_TX_RESCUE_STUB")).toBe(true);
+  } catch(error) {
+    primaryError=error;
+    let catalog:W011CatalogRow[]=[];
+    try{catalog=await contentionCatalog();}catch{}
+    stage("contention_error",{
+      error:error instanceof Error?error.message:String(error),
+      pending:pendingState(),
+      catalog,
+      lockEvidence,
+      events,
+    });
   } finally {
+    stage("contention_cleanup_begin",{pending:pendingState(),hadPrimaryError:Boolean(primaryError)});
     releaseLog.resolve();
     releaseGate.resolve();
     foreignReleased=true;foreignOwner.resolve(99001);
-    // Settle ALL launched promises before unmock and PG teardown.
-    await Promise.allSettled([dTask,writerTask,gateTask].filter(
-      (p):p is Promise<unknown>=>p!==null,
-    ));
-    await runtimeForStop?.resetRuntimeServicesForTests({terminateProcesses:true});
+    stage("contention_gates_released",{pending:pendingState()});
+
+    if(!dSettled && dRequest?.abort) {
+      try{dRequest.abort();stage("contention_http_aborted");}
+      catch(error){
+        cleanupErrors.push(error);
+        stage("contention_cleanup_error",{phase:"http_abort",error:error instanceof Error?error.message:String(error)});
+      }
+    }
+
+    if(!dSettled||!writerSettled||!gateSettled) {
+      try {
+        const cancelled=await observer.execute(sql.raw(
+          "SELECT pid,application_name,state,pg_cancel_backend(pid) AS cancelled"+
+          " FROM pg_stat_activity WHERE datname=current_database()"+
+          " AND application_name IN ('w009-D','w009-writer','w009-gate')"+
+          " AND pid<>pg_backend_pid() ORDER BY application_name,pid"
+        )) as unknown as Array<Record<string,unknown>>;
+        stage("contention_pg_cancel_requested",{pending:pendingState(),cancelled});
+      } catch(error) {
+        cleanupErrors.push(error);
+        stage("contention_cleanup_error",{phase:"pg_cancel",error:error instanceof Error?error.message:String(error)});
+      }
+    }
+
+    const rolePools=[reviewerDb,writer,gateDb];
+    let forcedPoolsClosed=false;
+    const forceCloseTimer=setTimeout(()=>{
+      forcedPoolsClosed=true;
+      stage("contention_role_pool_force_close",{pending:pendingState()});
+      void Promise.all(rolePools.map((roleDb)=>roleDb.$client.end({timeout:1}).catch((error:unknown)=>{
+        cleanupErrors.push(error);
+        stage("contention_cleanup_error",{phase:"role_pool_force_close",error:error instanceof Error?error.message:String(error)});
+      })));
+    },2000);
+
+    const launched=[dTask,writerTask,gateTask].filter((p):p is Promise<unknown>=>p!==null);
+    const settlements=await Promise.allSettled(launched);
+    clearTimeout(forceCloseTimer);
+    stage("contention_tasks_settled",{pending:pendingState(),forcedPoolsClosed,settlements:settlements.map((result)=>result.status)});
+
+    try{await runtimeForStop?.resetRuntimeServicesForTests({terminateProcesses:true});}
+    catch(error){
+      cleanupErrors.push(error);
+      stage("contention_cleanup_error",{phase:"runtime_reset",error:error instanceof Error?error.message:String(error)});
+    }
     if(probe&&!probeClosed) {
       await new Promise<void>(resolve=>{
         try{probe!.close(()=>resolve());}catch{resolve();}
       });
+      probeClosed=true;
+      stage("contention_probe_closed");
     }
     if(mocksInstalled) {
       vi.doUnmock("node:child_process");
@@ -3295,12 +3409,26 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       vi.doUnmock("../services/workspace-git-operation-scheduler.js");
       vi.doUnmock("../services/workspace-runtime.js");
       vi.resetModules();
+      stage("contention_mocks_removed");
     }
     if(beforeHttps===undefined)delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
     else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS=beforeHttps;
-    // The enclosing authentic BCD fixture still owns a.db and PG cleanup.
-    // Its finally closes the registered clients before cluster cleanup.
+
+    for(const [name,roleDb] of [["reviewer",reviewerDb],["writer",writer],["gate",gateDb],["observer",observer]] as const){
+      try{await roleDb.$client.end({timeout:1});stage("contention_pool_closed",{name});}
+      catch(error){
+        cleanupErrors.push(error);
+        stage("contention_cleanup_error",{phase:"pool_close",name,error:error instanceof Error?error.message:String(error)});
+      }
+    }
+    stage("contention_cleanup_complete",{
+      pending:pendingState(),
+      cleanupErrors:cleanupErrors.map((error)=>error instanceof Error?error.message:String(error)),
+      primaryError:primaryError instanceof Error?primaryError.message:primaryError?String(primaryError):null,
+    });
   }
+  if(primaryError)throw primaryError;
+  if(cleanupErrors.length>0)throw cleanupErrors[0];
 }
 
 
