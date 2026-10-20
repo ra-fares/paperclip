@@ -863,26 +863,35 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       : mode.startsWith("lock_")
         ? `P04 INT2 W009 ${mode}: genuine BCD and PG lock`
         : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
-      const w011Selected = mode === "lock_runtime_d_first" || mode === "document";
+      const w012Selected =
+        mode.startsWith("lock_") ||
+        mode === "document" ||
+        mode === "execution_workspace_branch_aba_http" ||
+        mode === "indirect_parent_pw_change_db" ||
+        mode === "indirect_parent_pw_aba_db" ||
+        mode === "rollback";
+      const sourceApplicationName = w012Selected ? "w012-source" :
+        mode.startsWith("lock_") ? "w009-source" : "paperclip";
       const stage = w011StageRecorder(mode);
       stage("before_pg_start", {
-        sourcePoolMaxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default",
-        rationale: w011Selected
+        sourcePoolMaxConnections: w012Selected ? 2 : mode.startsWith("lock_") ? 1 : "default",
+        rationale: w012Selected
           ? "one request transaction plus one existing out-of-transaction instance-settings read"
-          : "historical topology outside W011 selected scope",
+          : "historical topology outside W012 selected scope",
       });
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
       stage("pg_started");
-      const db = createDb(cluster.connectionString, w011Selected
-        ? { maxConnections: 2, applicationName: "w011-source" }
+      const db = createDb(cluster.connectionString, w012Selected
+        ? { maxConnections: 2, applicationName: sourceApplicationName }
         : mode.startsWith("lock_")
           ? { maxConnections: 1, applicationName: "w009-source" }
           : undefined);
-      const w011Observer = w011Selected
-        ? createDb(cluster.connectionString, { maxConnections: 1, applicationName: "w011-fixture-observer" })
+      const w011Observer = w012Selected
+        ? createDb(cluster.connectionString, { maxConnections: 1, applicationName: "w012-fixture-observer" })
         : null;
       stage("source_pool_ready", {
-        maxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default",
+        maxConnections: w012Selected ? 2 : mode.startsWith("lock_") ? 1 : "default",
+        sourceApplicationName,
         diagnosticObserverMaxConnections: w011Observer ? 1 : 0,
       });
       const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
@@ -971,7 +980,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           assigneeAgentId: agentId, status: "in_progress", reviewPolicy: "human_only",
         });
         await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
-        stage("seed_complete", { sourcePoolMaxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default" });
+        stage("seed_complete", { sourcePoolMaxConnections: w012Selected ? 2 : mode.startsWith("lock_") ? 1 : "default" });
 
         execute.mockImplementation(async input => {
           stage("adapter_enter", { runId: input.runId });
@@ -1032,13 +1041,13 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             });
             const bTask = bRequest.then((response) => response);
             let submitted: Awaited<typeof bTask>;
-            if (w011Selected && w011Observer) {
+            if (w012Selected && w011Observer) {
               try {
                 submitted = await w011Watchdog(
                   bTask,
                   "B_request",
                   async () => {
-                    const catalog = await w011ReadPgCatalog(w011Observer, ["w011-source"]);
+                    const catalog = await w011ReadPgCatalog(w011Observer, [sourceApplicationName]);
                     stage("watchdog_timeout", { label: "B_request", runId: input.runId, catalog });
                     return { runId: input.runId, catalog };
                   },
@@ -1046,7 +1055,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 );
               } catch (error) {
                 try { bRequest.abort(); } catch {}
-                const cancelled = await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => []);
+                const cancelled = await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => []);
                 stage("B_request_cancelled", { cancelled });
                 await w011SettleAfterCancellation(bTask, db, stage, "B_request");
                 throw error;
@@ -1191,20 +1200,20 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         expect(queued).not.toBeNull();
         stage("C_drain_enter", { runId: queued!.id });
         const cDrainTask = drainHeartbeatRunsToQuiescence(db, h);
-        if (w011Selected && w011Observer) {
+        if (w012Selected && w011Observer) {
           try {
             await w011Watchdog(
               cDrainTask,
               "C_drain",
               async () => {
-                const catalog = await w011ReadPgCatalog(w011Observer, ["w011-source"]);
+                const catalog = await w011ReadPgCatalog(w011Observer, [sourceApplicationName]);
                 stage("watchdog_timeout", { label: "C_drain", runId: queued!.id, catalog });
                 return { runId: queued!.id, catalog };
               },
               30_000,
             );
           } catch (error) {
-            const cancelled = await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => []);
+            const cancelled = await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => []);
             stage("C_drain_cancelled", { runId: queued!.id, cancelled });
             await w011SettleAfterCancellation(cDrainTask, db, stage, "C_drain");
             throw error;
@@ -2006,7 +2015,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             reviewerId, runId: run!.id, candidateId: createdAnchor!.id,
             candidateVersion: current!.statusVersion, decisionPayload,
             originalAdapterCalls: [...seenAdapterIds],
-            sourcePoolMaxConnections: w011Selected ? 2 : 1,
+            sourcePoolMaxConnections: w012Selected ? 2 : 1,
             observerDb: w011Observer ?? undefined,
             stage,
           });
@@ -2030,7 +2039,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 "document_D_request",
                 async () => {
                   const catalog = w011Observer
-                    ? await w011ReadPgCatalog(w011Observer, ["w011-source"])
+                    ? await w011ReadPgCatalog(w011Observer, [sourceApplicationName])
                     : [];
                   stage("watchdog_timeout", { label: "document_D_request", catalog });
                   return { catalog };
@@ -2040,7 +2049,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             } catch (error) {
               try { docRequest.abort(); } catch {}
               const cancelled = w011Observer
-                ? await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => [])
+                ? await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => [])
                 : [];
               stage("D_request_cancelled", { cancelled });
               await w011SettleAfterCancellation(docTask, db, stage, "document_D_request");
@@ -2831,12 +2840,12 @@ function w009Deferred<T = void>() {
 type W011StageWriter = (stage: string, details?: Record<string, unknown>) => void;
 
 function w011StageRecorder(mode: string): W011StageWriter {
-  const dir = process.env.INT2_W011_EVIDENCE_DIR;
+  const dir = process.env.INT2_W012_EVIDENCE_DIR ?? process.env.INT2_W011_EVIDENCE_DIR;
   const output = dir ? `${dir}/stages-${mode}.jsonl` : null;
   let sequence = 0;
   return (stage, details = {}) => {
     const event = {
-      schema: "p04-int2-w011-stage.v1",
+      schema: "p04-int2-w012-stage.v1",
       sequence: ++sequence,
       at: new Date().toISOString(),
       mode,
@@ -3048,20 +3057,23 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const {promisify}=await import("node:util");
   const net=await import("node:net");
   const stage=a.stage;
-  const writer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-writer"});
+  const writerPoolMaxConnections=quarantine?2:1;
+  const writer=createDb(a.connectionString,{maxConnections:writerPoolMaxConnections,applicationName:"w009-writer"});
   const reviewerDb=createDb(a.connectionString,{maxConnections:2,applicationName:"w009-D"});
   const ownsObserver=!a.observerDb;
   const observer=a.observerDb ?? createDb(a.connectionString,{maxConnections:1,applicationName:"w009-observer"});
   const gateDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-gate"});
   stage("contention_pools_ready", {
     sourcePoolMaxConnections: a.sourcePoolMaxConnections,
-    writerPoolMaxConnections: 1,
+    writerPoolMaxConnections,
     reviewerPoolMaxConnections: 2,
     observerPoolMaxConnections: 1,
     observerOwnedByHelper: ownsObserver,
     gatePoolMaxConnections: 1,
-    totalRolePoolCapacity: 7,
-    rationale: "source/reviewer need transaction plus nested settings read; runtime writer keeps persistence on tx and registry DB is not queried inside parent-lock transaction",
+    totalRolePoolCapacity: a.sourcePoolMaxConnections + writerPoolMaxConnections + 2 + 1 + 1,
+    rationale: quarantine
+      ? "source/reviewer and quarantine writer each need transaction plus existing nested original-pool settings read"
+      : "source/reviewer need transaction plus nested settings read; normal/retry/forward writer uses transaction-scoped DB for locked persistence",
   });
   const gateEntered=w009Deferred(),releaseGate=w009Deferred();
   const logEntered=w009Deferred(),releaseLog=w009Deferred();
