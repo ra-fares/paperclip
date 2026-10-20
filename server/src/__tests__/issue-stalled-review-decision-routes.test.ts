@@ -2172,7 +2172,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             JSON.stringify(result, null, 2) + "\n",
             { encoding: "utf8", flag: "wx" });
         }
-        if (scopeTrace && process.env.INT2_SCOPE_EVIDENCE_DIR) {
+        if ((scopeTrace || mode === "rollback") && process.env.INT2_SCOPE_EVIDENCE_DIR) {
           writeFileSync(
             `${process.env.INT2_SCOPE_EVIDENCE_DIR}/scope-${mode}-observation.json`,
             JSON.stringify(result, null, 2) + "\n",
