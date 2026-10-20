@@ -2876,3 +2876,225 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       },
     }));
     mocksInstalled=true;
+
+    const dynamicRoutes = (await import("../routes/issues.js")).issueRoutes;
+    const realReconcile = (await import("../services/execution-workspaces.js")).executionWorkspaceService;
+    if(!reconcile)runtimeForStop=await import("../services/workspace-runtime.js");
+
+    // The reviewer is a GENUINE authorized HTTP issue route loaded AFTER
+    // mock graph setup, not a direct private issue-service update.
+    const api=express();
+    api.use(express.json());
+    api.use((req,_res,next)=>{
+      (req as any).actor={
+        type:"board",source:"session",userId:a.reviewerId,companyIds:[a.companyId],
+        isInstanceAdmin:false,memberships:[
+          {companyId:a.companyId,status:"active",membershipRole:"operator"},
+        ],
+      };
+      next();
+    });
+    api.use("/api",dynamicRoutes(reviewerDb,{} as any,{
+      stalledReviewDecisionEnqueueWakeup:vi.fn(async()=>undefined) as any,
+    }));
+    api.use(errorHandler);
+    const launchD=()=>{
+      const task=request(api).patch("/api/issues/"+a.issueId).send(a.decisionPayload)
+        .then(r=>({status:r.status,body:r.body as Record<string,unknown>}));
+      dTask=task;void task.catch(()=>undefined);
+    };
+    const launchGate=async()=>{
+      // A dedicated session owns the advisory lock. A real SQL trigger on
+      // the production write path parks AFTER that path's row locks.
+      gateTask=gateDb.transaction(async tx=>{
+        await tx.execute(sql.raw("SELECT pg_advisory_lock("+key+")"));
+        gateEntered.resolve();
+        try {await releaseGate.promise;}
+        finally {await tx.execute(sql.raw("SELECT pg_advisory_unlock("+key+")"));}
+      });
+      void gateTask.catch(()=>undefined);
+      await gateEntered.promise;
+    };
+    const condition="NEW.id = '"+a.issueId+"'::uuid";
+    if(dFirst) {
+      await a.db.execute(sql.raw(
+        "CREATE FUNCTION w009_hold_review() RETURNS trigger LANGUAGE plpgsql AS $$"+
+        " BEGIN IF "+condition+" AND NEW.status='done' THEN"+
+        " PERFORM pg_advisory_xact_lock("+key+"); END IF; RETURN NEW; END $$"));
+      await a.db.execute(sql.raw(
+        "CREATE TRIGGER w009_hold_review_trigger AFTER UPDATE ON issues"+
+        " FOR EACH ROW EXECUTE FUNCTION w009_hold_review()"));
+    } else if(reconcile) {
+      await a.db.execute(sql.raw(
+        "CREATE FUNCTION w009_hold_comment() RETURNS trigger LANGUAGE plpgsql AS $$"+
+        " BEGIN IF "+condition+" THEN"+
+        " PERFORM pg_advisory_xact_lock("+key+"); END IF; RETURN NEW; END $$"));
+      await a.db.execute(sql.raw(
+        "CREATE TRIGGER w009_hold_comment_trigger BEFORE INSERT ON issue_comments"+
+        " FOR EACH ROW EXECUTE FUNCTION w009_hold_comment()"));
+    }
+
+    const startRuntime=async()=>{
+      const bindProbe=net.createServer();
+      probe=bindProbe;probeClosed=false;
+      port=await new Promise<number>((resolve,reject)=>{
+        bindProbe.once("error",reject);
+        bindProbe.listen(0,"127.0.0.1",()=>{
+          const addr=bindProbe.address();
+          if(!addr||typeof addr==="string")reject(new Error("W009 loopback port unavailable"));
+          else resolve(addr.port);
+        });
+      });
+      await new Promise<void>((resolve,reject)=>bindProbe.close(err=>err?reject(err):resolve()));
+      probeClosed=true;
+      const cwd="/tmp/w009-nongit-"+a.issueId;
+      if((await import("node:fs")).existsSync(cwd))return failOs("synthetic cwd is real checkout");
+      const service={
+        name:"w009-isolated-test",command:"W008_INERT_COMMAND_MUST_NOT_EXECUTE",
+        port:{type:"fixed",value:port},readiness:{type:"none",timeoutSec:2},
+        lifecycle:"manual",
+      };
+      const runner=runtimeForStop!.startRuntimeServicesForWorkspaceControl({
+        db:writer,actor:{id:a.agentId,name:"W009 safe fake",companyId:a.companyId},
+        issue:{id:a.issueId,identifier:"W009-1",title:"W009 genuine review"},
+        workspace:{
+          baseCwd:cwd,source:"task_session",projectId:a.projectId,workspaceId:a.pwId,
+          repoUrl:null,repoRef:null,strategy:"project_primary",
+          cwd,branchName:null,worktreePath:null,warnings:[],created:false,
+          branchCreatedByRuntime:false,
+        },
+        executionWorkspaceId:a.ewId,adapterEnv:{},
+        config:{workspaceRuntime:{services:[service]},desiredState:"running"},
+      });
+      writerTask=runner;
+      void runner.catch(()=>undefined);
+    };
+    const startReconcile=()=>{
+      const runner=realReconcile(writer).reconcileExecutionWorkspaceBranch(a.ewId,{
+        mode:quarantine?"quarantine_restore":"forward",
+        reason:"W009 bounded test of real branch reconciliation under review",
+        actor:{actorType:"system",actorId:"workspace_runtime",agentId:null,runId:a.runId},
+      });
+      writerTask=runner;void runner.catch(()=>undefined);
+    };
+    const startWriter=async()=>{
+      if(reconcile)startReconcile();else await startRuntime();
+    };
+    const firstCommitted=async()=>{
+      const limit=Date.now()+12_000;
+      while(Date.now()<limit) {
+        const rows=await observer.select().from(workspaceRuntimeServices)
+          .where(eq(workspaceRuntimeServices.executionWorkspaceId,a.ewId));
+        const first=rows.find(r=>r.status==="starting");
+        if(first && spawnCount===1 && first.port===port) {
+          emit("FIRST_STARTING_COMMITTED",{rowId:first.id,port:first.port});
+          return first;
+        }
+        await new Promise<void>(resolve=>setTimeout(resolve,20));
+      }
+      throw new Error("W009_INVALID_RETRY: first starting row not committed before collision");
+    };
+    // Only data collected *before* releasing the fence counts as lock evidence.
+    if(dFirst) {
+      if(retry) {
+        await startWriter();
+        await firstCommitted();
+      }
+      await launchGate();
+      launchD();
+      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-gate"));
+      if(!retry)await startWriter();
+      else {foreignReleased=true;foreignOwner.resolve(99001);}
+      lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-D"));
+      releaseGate.resolve();
+    } else {
+      if(reconcile) {
+        await launchGate();
+        await startWriter();
+        lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-gate"));
+      } else {
+        await startWriter();
+        if(retry) {
+          await firstCommitted();
+          foreignReleased=true;foreignOwner.resolve(99001);
+        }
+        await logEntered.promise; // real TX has already acquired PW/EW
+      }
+      launchD();
+      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-writer"));
+      if(reconcile)releaseGate.resolve();else releaseLog.resolve();
+    }
+    if(!dTask||!writerTask)throw new Error("W009_INVALID_LAUNCH: missing real contender");
+    const [dResult,writerResult]=await Promise.all([
+      dTask,writerTask.then(v=>({ok:true,value:v}),e=>({
+        ok:false,error:e instanceof Error?e.message:String(e),
+        code:(e as {details?:{code?:unknown}})?.details?.code??null,
+      })),
+    ]);
+    const [afterIssue]=await a.db.select().from(issues).where(eq(issues.id,a.issueId));
+    const accepted=await a.db.select().from(activityLog).where(and(
+      eq(activityLog.entityId,a.issueId),
+      eq(activityLog.action,"issue.governed_acceptance_decided.v1"),
+    ));
+    const runs=await a.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId,a.companyId));
+    const serviceRows=await a.db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.executionWorkspaceId,a.ewId));
+    const finding={mode,caseSha:process.env.GITHUB_SHA??null,
+      sourceRunId:a.runId,candidateId:a.candidateId,candidateVersion:a.candidateVersion,
+      dHttp:dResult.status,dBody:dResult.body,writerResult,originalAdapterCalls:a.originalAdapterCalls,
+      runIds:runs.map(r=>r.id),finalStatus:afterIssue?.status,finalVersion:afterIssue?.statusVersion,
+      acceptedAuditRows:accepted.length,spawnCount,
+      serviceRows:serviceRows.map(r=>({id:r.id,status:r.status,port:r.port})),
+      lockEvidence,events};
+    console.info("INT2_W009_LOCK_"+mode+" "+JSON.stringify(finding));
+    if(process.env.INT2_W009_EVIDENCE_DIR) {
+      writeFileSync(process.env.INT2_W009_EVIDENCE_DIR+"/lock-"+mode+".json",
+        JSON.stringify(finding,null,2)+"\n",{encoding:"utf8",flag:"wx"});
+    }
+    expect(lockEvidence.length,JSON.stringify(finding)).toBe(dFirst?2:1);
+    expect(lockEvidence.every(x=>x.proven),JSON.stringify(finding)).toBe(true);
+    expect(runs.map(r=>r.id),JSON.stringify(finding)).toContain(a.runId);
+    if(reconcile&&!dFirst){
+      expect(dResult.status,JSON.stringify(finding)).toBe(409);
+      expect(afterIssue?.status,JSON.stringify(finding)).toBe("in_review");
+      expect(accepted,JSON.stringify(finding)).toHaveLength(0);
+    } else {
+      expect(dResult.status,JSON.stringify(finding)).toBe(200);
+      expect(afterIssue?.status,JSON.stringify(finding)).toBe("done");
+      expect(accepted,JSON.stringify(finding)).toHaveLength(1);
+    }
+    if(retry) {
+      expect(spawnCount,JSON.stringify(finding)).toBe(2);
+      expect(events.some(e=>e.name==="FIRST_STARTING_COMMITTED")).toBe(true);
+      expect(serviceRows.filter(r=>r.status==="stopped").length,JSON.stringify(finding))
+        .toBeGreaterThan(0);
+      expect(serviceRows.some(r=>r.port!==port),JSON.stringify(finding)).toBe(true);
+    } else if(!reconcile)expect(spawnCount).toBe(1);
+    if(quarantine)expect(events.some(e=>e.name==="PRE_TX_RESCUE_STUB")).toBe(true);
+  } finally {
+    releaseLog.resolve();
+    releaseGate.resolve();
+    foreignReleased=true;foreignOwner.resolve(99001);
+    // Settle ALL launched promises before unmock and PG teardown.
+    await Promise.allSettled([dTask,writerTask,gateTask].filter(
+      (p):p is Promise<unknown>=>p!==null,
+    ));
+    await runtimeForStop?.resetRuntimeServicesForTests({terminateProcesses:true});
+    if(probe&&!probeClosed) {
+      await new Promise<void>(resolve=>{
+        try{probe!.close(()=>resolve());}catch{resolve();}
+      });
+    }
+    if(mocksInstalled) {
+      vi.doUnmock("node:child_process");
+      vi.doUnmock("../services/local-service-supervisor.js");
+      vi.doUnmock("../services/workspace-git-operation-scheduler.js");
+      vi.doUnmock("../services/workspace-runtime.js");
+      vi.resetModules();
+    }
+    if(beforeHttps===undefined)delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+    else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS=beforeHttps;
+    // The enclosing authentic BCD fixture still owns a.db and PG cleanup.
+    // Its finally closes the registered clients before cluster cleanup.
+  }
+}
