@@ -2556,6 +2556,11 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
           return child;
         },
         execFile: () => { throw new Error("W008_UNEXPECTED_GIT_OR_SHELL_EXECFILE"); },
+        exec:()=>{throw new Error("W008_UNEXPECTED_EXEC");},
+        execSync:()=>{throw new Error("W008_UNEXPECTED_EXEC_SYNC");},
+        execFileSync:()=>{throw new Error("W008_UNEXPECTED_EXECFILE_SYNC");},
+        spawnSync:()=>{throw new Error("W008_UNEXPECTED_SPAWN_SYNC");},
+        fork:()=>{throw new Error("W008_UNEXPECTED_FORK");},
       }));
       vi.doMock("../services/local-service-supervisor.js", async importOriginal => ({
         ...(await importOriginal<typeof import("../services/local-service-supervisor.js")>()),
@@ -2799,6 +2804,9 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       (execFileFake as unknown as Record<symbol,unknown>)[promisify.custom]=
         async (binary:unknown,argv:unknown)=>({stdout:fakeGitOutput(binary,argv),stderr:""});
       return {...actual,execFile:execFileFake,
+        exec:()=>failOs("exec"),execSync:()=>failOs("execSync"),
+        execFileSync:()=>failOs("execFileSync"),
+        fork:()=>failOs("fork"),spawnSync:()=>failOs("spawnSync"),
         spawn:(binary:unknown,argv:unknown)=>{
           if(reconcile || typeof binary!=="string"||!Array.isArray(argv)||
              argv.length!==2||argv[0]!=="-lc"||
@@ -3160,6 +3168,11 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         ...(await importOriginal<typeof import("node:child_process")>()),
         spawn:()=>{spawnCalls++;throw new Error("W009_UNSAFE_SPAWN_AFTER_PARENT_DRIFT");},
         execFile:()=>{throw new Error("W009_UNSAFE_EXECFILE_AFTER_PARENT_DRIFT");},
+        exec:()=>{throw new Error("W009_UNSAFE_EXEC");},
+        execSync:()=>{throw new Error("W009_UNSAFE_EXEC_SYNC");},
+        execFileSync:()=>{throw new Error("W009_UNSAFE_EXECFILE_SYNC");},
+        spawnSync:()=>{throw new Error("W009_UNSAFE_SPAWN_SYNC");},
+        fork:()=>{throw new Error("W009_UNSAFE_FORK");},
       }));
       runtime=await import("../services/workspace-runtime.js");
       startTask=runtime.startRuntimeServicesForWorkspaceControl({
