@@ -1540,7 +1540,7 @@ describeEmbeddedPostgres("P04 INT2 governed native same-transaction", () => {
           completionContractSha256: `fixture-contract:${runId}`,
         });
         await db.insert(completionContracts).values({
-          id: contractId, companyId, issueId, revision: 1,
+          id: contractId, companyId, issueId, revision: runs.length + 1,
           schemaVersion: "paperclip.completion-contract.v1",
           policyVersion: "phase6-v1", risk: "standard",
           completionAuthority: "server_arbiter",
@@ -1675,8 +1675,22 @@ describeEmbeddedPostgres("P04 INT2 governed native same-transaction", () => {
               WHEN (NEW.effect_kind = 'issue_status_projection')
               EXECUTE FUNCTION int2_native_abort_effect();
             `));
-            await expect(commit(first, "done"))
-              .rejects.toThrow("int2_native_forced_post_projection_abort");
+            // drizzle's Failed-query wrapper hides the PostgreSQL trigger
+            // message on the top-level Error. Inspect the actual nested
+            // driver cause rather than weakening the enforced error oracle.
+            const thrown = await commit(first, "done").then(
+              () => null, error => error as unknown,
+            );
+            expect(thrown).toBeInstanceOf(Error);
+            const messages: string[] = [];
+            let current: unknown = thrown;
+            for (let depth = 0; current && depth < 8; depth += 1) {
+              const e = current as Error & { cause?: unknown };
+              messages.push(String(e.message ?? e));
+              current = e.cause;
+            }
+            expect(messages.join(" | ")).toContain("int2_native_forced_post_projection_abort");
+            expect(messages.join(" | ")).not.toContain("int2_native_projection_not_visible_before_abort");
           } else {
             const result = await commit(first, "done");
             expect(result.replayed).toBe(false);
