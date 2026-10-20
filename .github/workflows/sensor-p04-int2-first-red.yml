@@ -1,28 +1,19 @@
-# Historical first RED remains on its original branch. This is GREEN evaluation only.
-name: Sensor P04 INT2 isolated acceptance
+# W01-002: one isolated application-HTTP ABA probe; no production change.
+name: Sensor P04 INT2 W01-002 HTTP ABA
 on:
   push:
-    branches: [codex/p04-int2-acceptance-fix]
+    branches: [codex/w01-002-int2-http-aba]
     paths:
       - .github/workflows/sensor-p04-int2-first-red.yml
-      - packages/shared/src/validators/issue.ts
-      - server/src/routes/issues.ts
-      - server/src/services/issues.ts
-      - server/src/services/heartbeat.ts
-      - server/src/services/execution-recovery-resolution.ts
-      - server/src/services/issue-tree-control.ts
-      - server/src/services/execution-workspaces.ts
-      - server/src/routes/execution-workspaces.ts
       - server/src/__tests__/issue-stalled-review-decision-routes.test.ts
-      - server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-int2-acceptance-fix
+  group: sensor-p04-int2-w01-002-http-aba
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/p04-int2-acceptance-fix'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-002-int2-http-aba'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -30,37 +21,39 @@ jobs:
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
       NO_COLOR: '1'
     steps:
-      - name: Checkout pinned candidate
+      - name: Checkout isolated exact candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 40
-      - name: Verify ancestry and exact allowed diff
+      - name: Validate exact SHA ancestry and two-file allowlist
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p .int2-evidence "$RUNNER_TEMP/p04-int2-home"
           echo "PAPERCLIP_HOME=$RUNNER_TEMP/p04-int2-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git merge-base --is-ancestor af05d88bc3064639f69cbc87932cc17cfba9dbd2 HEAD
-          git diff --name-only af05d88bc3064639f69cbc87932cc17cfba9dbd2 HEAD | tee .int2-evidence/changed-files.txt
+          git merge-base --is-ancestor f5a92c492ac48909fc6d867345a80becc50bc2c1 HEAD
+          git diff --name-only f5a92c492ac48909fc6d867345a80becc50bc2c1 HEAD | tee .int2-evidence/changed-files.txt
           while IFS= read -r f; do
             case "$f" in
-              packages/shared/src/validators/issue.ts|server/src/routes/issues.ts|server/src/services/issues.ts|server/src/services/heartbeat.ts|server/src/services/execution-recovery-resolution.ts|server/src/services/issue-tree-control.ts|server/src/services/execution-workspaces.ts|server/src/routes/execution-workspaces.ts|server/src/__tests__/issue-stalled-review-decision-routes.test.ts|server/src/__tests__/heartbeat-sensor-direct-admission.integration.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_WRITE_SET $f" >&2; exit 1 ;;
+              server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
+              *) echo "OUTSIDE_W01_002_WRITE_SET $f" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
-          echo "BASE=af05d88bc3064639f69cbc87932cc17cfba9dbd2 SHA=$GITHUB_SHA RUN=$GITHUB_RUN_ID" > .int2-evidence/identity.txt
-      - name: Setup Node 24
+          test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
+          echo "BASE=f5a92c492ac48909fc6d867345a80becc50bc2c1 SHA=$GITHUB_SHA RUN=$GITHUB_RUN_ID" > .int2-evidence/identity.txt
+      - name: Set up Node 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Setup pnpm 9.15.4
+      - name: Set up pnpm 9.15.4
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9.15.4
           run_install: false
-      - name: Frozen install and SDK
+      - name: Frozen install and SDK build dependencies
         run: |
           set -euo pipefail
           node --version
@@ -68,10 +61,11 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           test -f server/node_modules/vitest/vitest.mjs
-      - name: Compile and probe rejected-heartbeat review fencing
+      - name: Run typecheck, HTTP ABA target, and positive BCD documentary control
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p .int2-evidence
           set +e
           pnpm --filter @paperclipai/server typecheck > .int2-evidence/typecheck.stdout 2> .int2-evidence/typecheck.stderr
           tsc=$?
@@ -79,104 +73,105 @@ jobs:
           echo "$tsc" > .int2-evidence/typecheck.exit_code
           echo "TYPECHECK_EXIT=$tsc"
           tail -n 100 .int2-evidence/typecheck.stdout || true
-          tail -n 160 .int2-evidence/typecheck.stderr || true
+          tail -n 100 .int2-evidence/typecheck.stderr || true
+          export INT2_HTTP_ABA_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/http-aba-observation.json"
+          export INT2_POSITIVE_BCD_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/positive-document-observation.json"
           run_named () {
-            local label="$1" file="$2" pattern="$3"
+            local label="$1" pattern="$2"
             set +e
-            node server/node_modules/vitest/vitest.mjs run --root server "$file" --reporter=json --outputFile="../int2-$label.json" -t "$pattern" > ".int2-evidence/$label.stdout" 2> ".int2-evidence/$label.stderr"
+            node server/node_modules/vitest/vitest.mjs run --root server src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=json --outputFile="../int2-$label.json" -t "$pattern" > ".int2-evidence/$label.stdout" 2> ".int2-evidence/$label.stderr"
             local rc=$?
             set -e
             echo "$rc" > ".int2-evidence/$label.exit_code"
-            test ! -f "int2-$label.json" || cp "int2-$label.json" .int2-evidence/
+            if test -f "int2-$label.json"; then cp "int2-$label.json" ".int2-evidence/"; fi
+            echo "TEST_CASE=$label EXIT=$rc"
+            tail -n 90 ".int2-evidence/$label.stderr" || true
+            tail -n 90 ".int2-evidence/$label.stdout" || true
           }
-          # Historical replacement_heartbeat remains FAILED at ee6453c and
-          # is never silently reclassified green by this separate scenario.
-          export INT2_REJECTED_FENCING_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/rejected-fencing-observation.json"
-          # New narrow native committer tests, not a rerun of the rejected
-          # heartbeat scenario. The native corpus's ordinary commit+rollback
-          # is separately reported as an existing regression, not INT2 proof.
-          export INT2_NATIVE_TX_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
-          export INT2_SCOPE_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
-          # Follow-up only covers additional company/source workspace relations.
-          # Earlier R3 identity CI #39371874723 stays immutable, including RED.
-          run_named affiliation src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD (project_workspace_company_db|execution_workspace_company_db|execution_workspace_project_workspace_db|execution_workspace_source_issue_db):'
-      - name: Classify executed assertions (skips always NOT_RUN)
+          run_named target 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate'
+          run_named control 'P04 INT2 BCD document: actual admitted run and independent reviewer'
+      - name: Classify selected cases; keep semantic RED as failing CI
+        if: always()
+        shell: bash
         run: |
+          mkdir -p .int2-evidence
           node <<'NODE'
-          const fs=require("node:fs");
-          const dir=".int2-evidence";
-          const cases={
-            affiliation:["project_workspace_company_db","execution_workspace_company_db","execution_workspace_project_workspace_db","execution_workspace_source_issue_db"].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer")
+          const fs = require('node:fs');
+          const dir = '.int2-evidence';
+          const expected = {
+            target: 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate',
+            control: 'P04 INT2 BCD document: actual admitted run and independent reviewer',
           };
-          const output={};
-          let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";
-          output.typecheck=bad?"FAIL":"PASS";
-          for(const [label,names] of Object.entries(cases)){
-            const exitCode=Number(fs.readFileSync(dir+"/"+label+".exit_code","utf8"));
-            let doc=null,error=null;
-            try{doc=JSON.parse(fs.readFileSync(dir+"/int2-"+label+".json","utf8"))}catch(e){error=String(e)}
-            const assertions=(doc?.testResults??[]).flatMap(x=>x.assertionResults??[]);
-            const checks=names.map(name=>{
-              const found=assertions.filter(x=>x.fullName?.includes(name));
-              const status=found[0]?.status??null;
-              const messages=found.flatMap(x=>x.failureMessages??[]);
-              const stdout=fs.existsSync(dir+"/"+label+".stdout")?fs.readFileSync(dir+"/"+label+".stdout","utf8"):"";
-              const source=[stdout,...messages].join("\\n");
-              const observation=(source.match(/INT2_(?:BCD|REVIEW|REJECTED_FENCING)_OBSERVATION\\s+(\\{[^\\n]+\\})/)??[])[1]??null;
-              let classification=found.length!==1||status==="pending"||status==="skipped"?"NOT_RUN":
-                (status==="passed"?"PASS":
-                 status==="failed"?(observation?"FAIL":"INVALID_FIXTURE"):"INVALID_FIXTURE");
-              // The historical first RED remains immutable. Should it ever
-              // reproduce, classify the observed regression separately; it
-              // is NOT a GREEN pass and never conceals a fixture error.
-              if(label==="board"&&classification==="FAIL"&&observation) {
-                try {
-                  const o=JSON.parse(observation);
-                  if(o.httpStatus===200&&o.dbStatus==="done")classification="EXPECTED_RED";
-                }catch{}
-              }
-              return {name,classification,status,count:found.length,failureMessages:messages,observation};
-            });
-            // A group may fail with eight other selected assertions passing.
-            // Preserve both the per-test and whole-group outcomes.
-            const groupFailed=exitCode!==0 || (doc?.numFailedTests??0)>0 || Boolean(error);
-            if(checks.some(x=>x.classification!=="PASS")||groupFailed)bad=true;
-            output[label]={
-              exitCode,error,numPassedTests:doc?.numPassedTests??null,
-              numFailedTests:doc?.numFailedTests??null,groupFailed,checks,
-            };
+          const read = name => { try { return fs.readFileSync(dir+'/'+name,'utf8'); } catch { return null; } };
+          const asJson = name => { try { return JSON.parse(read(name)); } catch { return null; } };
+          const out = { head: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID };
+          const tsc = read('typecheck.exit_code');
+          out.typecheck = { exitCode: tsc===null ? null : Number(tsc.trim()), classification: tsc===null?'NOT_RUN':tsc.trim()==='0'?'PASS':'FAIL' };
+          let bad = out.typecheck.classification !== 'PASS';
+          for (const [label,name] of Object.entries(expected)) {
+            const doc = asJson('int2-'+label+'.json'), raw = read(label+'.exit_code');
+            const exitCode = raw===null ? null : Number(raw.trim());
+            const matches = (doc?.testResults??[]).flatMap(file=>file.assertionResults??[])
+              .filter(test=>test.fullName===('stalled review decision routes '+name) || test.fullName===('P04 INT2 bound candidate and evidence gates '+name) || test.fullName?.endsWith(name));
+            const status = matches[0]?.status ?? null;
+            const executed = (doc?.testResults??[]).flatMap(file=>file.assertionResults??[])
+              .filter(test=>test.status==='passed'||test.status==='failed');
+            const selectedOne = matches.length===1 && executed.length===1;
+            out[label] = { name, count: matches.length, selectedOne,
+              status, exitCode, numPassedTests:doc?.numPassedTests??null,
+              numFailedTests:doc?.numFailedTests??null, numTotalTests:doc?.numTotalTests??null,
+              failureMessages:matches.flatMap(test=>test.failureMessages??[]),
+              classification:'NOT_RUN' };
+            if (!selectedOne || exitCode===null || status==='pending' || status==='skipped') {
+              out[label].classification='NOT_RUN';
+            } else {
+              out[label].classification = status==='passed' && exitCode===0 &&
+                doc.numPassedTests===1 && doc.numFailedTests===0?'PASS':'FAIL';
+            }
           }
-          output.affiliationEvidence={};
-          for(const mode of ["project_workspace_company_db","execution_workspace_company_db",
-            "execution_workspace_project_workspace_db","execution_workspace_source_issue_db"]){
-            const file=dir+"/scope-"+mode+"-observation.json";
-            let row=null,error=null;
-            try{row=JSON.parse(fs.readFileSync(file,"utf8"))}catch(e){error=String(e)}
-            const companyMode=mode.endsWith("_company_db");
-            const expectedReason=mode==="project_workspace_company_db"
-              ?"Project workspace must belong to same company"
-              :"Execution workspace must belong to same company";
-            const valid=!error && row?.mode===mode &&
-              row?.reviewerHttp===(companyMode?422:409) &&
-              (companyMode?row?.response?.error===expectedReason:
-                row?.response?.details?.code==="governed_candidate_workspace_stale") &&
-              row?.after==="in_review" && row?.acceptedAuditRows===0 &&
-              row?.scopeTrace?.channel==="DB_ONLY_DEFENSE_NOT_LIFECYCLE";
-            output.affiliationEvidence[mode]={file,error,valid,
-              http:row?.reviewerHttp??null,reason:row?.response?.details?.code??row?.response?.error??null,
-              finalStatus:row?.after??null,acceptedRows:row?.acceptedAuditRows??null};
-            if(!valid)bad=true;
-          }
-          output.overall=bad?"FAIL_OR_NOT_RUN":"PASS";
-          fs.writeFileSync(dir+"/classification.json",JSON.stringify(output,null,2));
-          console.log(JSON.stringify(output,null,2));
-          if(bad)process.exitCode=1;
+          const o=asJson('http-aba-observation.json');
+          out.targetObservation=o;
+          if (o) {
+            const steps=o.steps??[];
+            const a=steps.find(x=>x.phase==='before_http_A');
+            const b=steps.find(x=>x.phase==='after_http_B');
+            const c=steps.find(x=>x.phase==='after_http_restored_A');
+            const valid=o.preconditionsValid===true && o.stage==='REVIEW_ATTEMPTED' &&
+              o.sourceRunStatus==='succeeded' && o.receiptSchema==='sensor-direct-dispatch-claim.v2' &&
+              !!o.candidateId && !!o.completionContractId && !!o.completionContractSha256 &&
+              !!o.documentaryRevisionId && !!a && !!b && !!c &&
+              b.httpStatus===200 && b.branchName===o.branchB &&
+              c.httpStatus===200 && c.branchName===o.branchA &&
+              b.issueWorkspaceId===o.workspaceId && c.issueWorkspaceId===o.workspaceId &&
+              a.issueStatus==='in_review' && b.issueStatus==='in_review' && c.issueStatus==='in_review' &&
+              o.adapterCalls?.includes(o.sourceRunId) &&
+              o.actualAdapterCalls?.includes(o.sourceRunId);
+            out.target.preconditionsValid=Boolean(valid);
+            if (!valid) out.target.classification='INVALID_REPRO';
+            else if (o.reviewerHttp===200 && o.finalStatus==='done' && o.acceptedAuditRows===1)
+              out.target.classification='REPRODUCED_GAP';
+            else if (o.reviewerHttp===409 && o.reviewerCode==='governed_candidate_stale' &&
+                     o.finalStatus==='in_review' && o.acceptedAuditRows===0 &&
+                     out.target.classification==='PASS')
+              out.target.classification='PASS';
+            else out.target.classification='FAIL_OR_OTHER_DENIAL';
+          } else out.target.classification='INVALID_REPRO';
+          const positive=asJson('positive-document-observation.json');
+          out.controlObservation=positive;
+          if (!positive || positive.mode!=='document' || positive.reviewerHttp!==200 ||
+              positive.after!=='done' || positive.acceptedAuditRows!==1 ||
+              out.control.classification!=='PASS') out.control.classification='INVALID_REPRO_OR_FAIL';
+          for (const label of ['target','control']) if (out[label].classification!=='PASS') bad=true;
+          out.overall=bad?'FAIL_OR_NOT_RUN':'PASS';
+          fs.writeFileSync(dir+'/classification.json',JSON.stringify(out,null,2)+'\n');
+          console.log(JSON.stringify(out,null,2));
+          if (bad) process.exitCode=1;
           NODE
-      - name: Upload all evidence even on failure
+      - name: Upload evidence on PASS, RED, or infrastructure failure
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: p04-int2-acceptance-evidence
+          name: p04-int2-w01-002-http-aba-evidence
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 30

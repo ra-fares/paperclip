@@ -47,6 +47,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -842,13 +843,15 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
     "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
     "replacement_heartbeat", "rejected_replacement_fencing",
     "project_aba", "project_workspace_aba", "execution_workspace_aba",
-    "workspace_settings_aba", "project_workspace_membership_db",
+    "workspace_settings_aba", "execution_workspace_branch_aba_http", "project_workspace_membership_db",
     "project_workspace_membership_aba_db", "execution_workspace_membership_db",
     "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
     "project_workspace_company_db", "execution_workspace_company_db",
     "execution_workspace_project_workspace_db", "execution_workspace_source_issue_db",
   ] as const) {
-    it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
+    it(mode === "execution_workspace_branch_aba_http"
+      ? "P04 INT2 HTTP execution workspace branch ABA must reject stale candidate"
+      : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
       const db = createDb(cluster.connectionString);
       const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
@@ -877,6 +880,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         api.use("/api", issueRoutes(db, {} as any, {
           stalledReviewDecisionEnqueueWakeup: vi.fn(async () => undefined) as any,
         }));
+        if (mode === "execution_workspace_branch_aba_http") {
+          api.use("/api", executionWorkspaceRoutes(db));
+        }
         api.use(errorHandler);
         return api;
       };
@@ -1099,6 +1105,127 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         // All D cases share the same genuine running-run B and terminal C.
         // Bounded probe of the actual issue-targeted heartbeat route in in_review.
         // No synthetic successor, no status override, no suppressed hook/adapter.
+        if (mode === "execution_workspace_branch_aba_http") {
+          // Preserve the real B->C fixture: candidate, persisted receipt,
+          // succeeded source run and exact source-authored document revision.
+          // The researched branchName writes below use authorized HTTP only.
+          const workspaceId = current!.executionWorkspaceId;
+          expect(workspaceId).toBeTruthy();
+          const [originalWorkspace] = await db.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspaceId!));
+          expect(originalWorkspace).toBeDefined();
+          const branchA = originalWorkspace!.branchName;
+          const branchB = "int2-http-aba-" + randomUUID().slice(0, 8);
+          expect(branchB).not.toBe(branchA);
+          const steps: Array<Record<string, unknown>> = [];
+          const capture = async (phase: string, httpStatus: number | null = null, responseBody: unknown = null) => {
+            const [workspace] = await db.select().from(executionWorkspaces)
+              .where(eq(executionWorkspaces.id, workspaceId!));
+            const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+            const row = {
+              phase, httpStatus, responseBody,
+              branchName: workspace?.branchName ?? null,
+              workspaceStatus: workspace?.status ?? null,
+              issueStatus: issue?.status ?? null,
+              issueVersion: issue?.statusVersion ?? null,
+              issueExecutionRunId: issue?.executionRunId ?? null,
+              issueCheckoutRunId: issue?.checkoutRunId ?? null,
+              issueWorkspaceId: issue?.executionWorkspaceId ?? null,
+            };
+            steps.push(row);
+            return row;
+          };
+          const before = await capture("before_http_A");
+          let reviewStatus: number | null = null;
+          let reviewBody: unknown = null;
+          const save = async (stage: string, preconditionsValid: boolean) => {
+            const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+            const decisions = await db.select().from(activityLog).where(and(
+              eq(activityLog.companyId, companyId), eq(activityLog.entityId, issueId),
+              eq(activityLog.action, "issue.governed_acceptance_decided.v1"),
+            ));
+            const allRuns = await db.select().from(heartbeatRuns)
+              .where(eq(heartbeatRuns.companyId, companyId));
+            const observation = {
+              mode, stage, preconditionsValid, postgresVersion: dbVersion.version,
+              companyId, issueId, workspaceId, branchA, branchB,
+              sourceRunId: run!.id, sourceRunStatus: run!.status,
+              sourceRunFinishedAt: run!.finishedAt?.toISOString() ?? null,
+              receiptSchema: (run!.runnerProfileJson?.sensorDirectDispatchClaim as
+                Record<string, unknown> | undefined)?.schema ?? null,
+              completionContractId: run!.completionContractId,
+              completionContractSha256: run!.completionContractSha256,
+              candidateId: createdAnchor!.id,
+              candidateStatusVersion: createdAnchor!.details.issueStatusVersion,
+              initialIssueVersion: before.issueVersion,
+              documentaryRevisionId: revisionId, documentaryRef: ref,
+              steps, reviewerHttp: reviewStatus, reviewerBody: reviewBody,
+              reviewerCode: (reviewBody as { details?: { code?: string } } | null)?.details?.code ?? null,
+              finalStatus: issue?.status ?? null,
+              finalStatusVersion: issue?.statusVersion ?? null,
+              acceptedAuditRows: decisions.length,
+              allRuns: allRuns.map(row => ({
+                id: row.id, status: row.status, retryOfRunId: row.retryOfRunId,
+                contextIssueId: row.contextSnapshot?.issueId ?? null,
+              })),
+              admissionChecks: seenAdmissionIds, adapterCalls: seenAdapterIds,
+              actualAdapterCalls: execute.mock.calls.map(([input]) => input.runId),
+            };
+            console.info("INT2_HTTP_ABA_OBSERVATION " + JSON.stringify(observation));
+            if (process.env.INT2_HTTP_ABA_OBSERVATION_PATH) {
+              writeFileSync(process.env.INT2_HTTP_ABA_OBSERVATION_PATH,
+                JSON.stringify(observation, null, 2) + "\n",
+                { encoding: "utf8", flag: "wx" });
+            }
+            return observation;
+          };
+          const changed = await request(board(requesterId))
+            .patch("/api/execution-workspaces/" + workspaceId).send({ branchName: branchB });
+          const middle = await capture("after_http_B", changed.status, changed.body);
+          const firstValid = changed.status === 200 && middle.branchName === branchB &&
+            middle.issueWorkspaceId === workspaceId && middle.issueStatus === "in_review";
+          if (!firstValid) {
+            const observation = await save("INVALID_REPRO_FIRST_PATCH", false);
+            expect(firstValid, JSON.stringify(observation)).toBe(true);
+            return;
+          }
+          const restored = await request(board(requesterId))
+            .patch("/api/execution-workspaces/" + workspaceId).send({ branchName: branchA });
+          const afterRestore = await capture("after_http_restored_A", restored.status, restored.body);
+          const bothValid = restored.status === 200 && afterRestore.branchName === branchA &&
+            afterRestore.issueWorkspaceId === workspaceId && afterRestore.issueStatus === "in_review";
+          if (!bothValid) {
+            const observation = await save("INVALID_REPRO_SECOND_PATCH", false);
+            expect(bothValid, JSON.stringify(observation)).toBe(true);
+            return;
+          }
+          const reviewed = await request(board(reviewerId))
+            .patch("/api/issues/" + issueId).send({
+              status: "done",
+              governedReviewDecision: {
+                candidateId: createdAnchor!.id,
+                candidateIssueStatusVersion: createdAnchor!.details.issueStatusVersion,
+                criteriaVerdicts: [{
+                  criterionId: "objective", ref,
+                  bodySha256: createHash("sha256").update(evidenceBody, "utf8").digest("hex"),
+                  verdict: "accepted",
+                  rationale: "Independent human reviewed the genuine pinned handoff revision.",
+                }],
+              },
+            });
+          reviewStatus = reviewed.status;
+          reviewBody = reviewed.body;
+          await capture("after_reviewer_D", reviewed.status, reviewed.body);
+          const observation = await save("REVIEW_ATTEMPTED", true);
+          // Safety oracle remains 409. 200/done/accepted1 is a genuine
+          // application ABA RED, never made green by editing the assertion.
+          expect(reviewed.status, JSON.stringify(observation)).toBe(409);
+          expect(reviewed.body.details?.code, JSON.stringify(observation))
+            .toBe("governed_candidate_stale");
+          expect(observation.finalStatus, JSON.stringify(observation)).toBe("in_review");
+          expect(observation.acceptedAuditRows, JSON.stringify(observation)).toBe(0);
+          return;
+        }
         if (mode === "replacement_heartbeat" || mode === "rejected_replacement_fencing") {
           const originalCandidateVersion = createdAnchor!.details.issueStatusVersion as number;
           expect(originalCandidateVersion).toBe(current!.statusVersion);
@@ -1688,6 +1815,11 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           acceptedAuditRows: basis.length, scopeTrace,
         };
         console.info("INT2_BCD_OBSERVATION " + JSON.stringify(result));
+        if (mode === "document" && process.env.INT2_POSITIVE_BCD_OBSERVATION_PATH) {
+          writeFileSync(process.env.INT2_POSITIVE_BCD_OBSERVATION_PATH,
+            JSON.stringify(result, null, 2) + "\n",
+            { encoding: "utf8", flag: "wx" });
+        }
         if (scopeTrace && process.env.INT2_SCOPE_EVIDENCE_DIR) {
           writeFileSync(
             `${process.env.INT2_SCOPE_EVIDENCE_DIR}/scope-${mode}-observation.json`,
