@@ -842,7 +842,12 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
 describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   for (const mode of [
     "missing", "document", "pre_revision_candidate", "release", "successor", "assignee_aba",
-    "workspace_aba", "config_drift", "replay", "indirect_parent_pw_change_db",
+    "workspace_aba", "config_drift", "replay",
+    "lock_runtime_d_first", "lock_runtime_writer_first",
+    "lock_retry_d_first", "lock_retry_writer_first",
+    "lock_forward_d_first", "lock_forward_writer_first",
+    "lock_quarantine_d_first", "lock_quarantine_writer_first",
+    "indirect_parent_pw_change_db",
     "indirect_parent_pw_aba_db", "concurrent", "rollback", "generic",
     "replacement_heartbeat", "rejected_replacement_fencing",
     "project_aba", "project_workspace_aba", "execution_workspace_aba",
@@ -855,9 +860,12 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   ] as const) {
     it(mode === "execution_workspace_branch_aba_http"
       ? "P04 INT2 HTTP execution workspace branch ABA must reject stale candidate"
-      : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
+      : mode.startsWith("lock_")
+        ? `P04 INT2 W009 ${mode}: genuine BCD and PG lock`
+        : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
-      const db = createDb(cluster.connectionString);
+      const db = createDb(cluster.connectionString, mode.startsWith("lock_")
+        ? { maxConnections: 1, applicationName: "w009-source" } : undefined);
       const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
       const requesterId = randomUUID(), reviewerId = randomUUID(), projectId = randomUUID();
       const evidenceBody = "Handoff memorandum: the project's delivered scope and review criteria are documented in this revision.";
@@ -922,7 +930,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           mode === "project_workspace_membership_db" ||
           mode === "project_workspace_membership_aba_db" ||
           mode === "project_workspace_company_db" ||
-          mode === "project_workspace_identity_revision_aba_db";
+          mode === "project_workspace_identity_revision_aba_db" || mode.startsWith("lock_");
         const originalProjectWorkspaceId = projectWorkspaceMembershipMode ? randomUUID() : null;
         if (originalProjectWorkspaceId) {
           // The bound project workspace MUST exist at original genuine B:
@@ -961,6 +969,16 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(run?.completionContractId).toBe(receipt?.completionContractId);
           expect(run?.completionContractSha256).toBe(receipt?.completionContractSha256);
           if (!createdAnchor) {
+            if (mode.startsWith("lock_")) {
+              // Prepare reconciliation branch and harmless fake worktree path
+              // while the authentic original is still running, BEFORE B pins
+              // the EW material revision. The true B transaction remains real.
+              const [boundIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+              const ewPath = "/tmp/w009-nongit-" + issueId;
+              await db.update(executionWorkspaces).set({
+                branchName: "w009-old", cwd: ewPath,
+              }).where(eq(executionWorkspaces.id, boundIssue!.executionWorkspaceId!));
+            }
             if (indirectParentMode) {
               // SQL fixture binds the inherited EW parent BEFORE genuine B.
               // Does NOT prove this mutation is reachable through HTTP.
@@ -1902,6 +1920,17 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         };
         const decide = () => request(board(reviewerId))
           .patch(`/api/issues/${issueId}`).send(decisionPayload);
+        if (mode.startsWith("lock_")) {
+          await w009ExerciseGenuineContention({
+            mode, connectionString: cluster.connectionString, db,
+            companyId, projectId, issueId, agentId,
+            pwId: originalProjectWorkspaceId!, ewId: current!.executionWorkspaceId!,
+            reviewerId, runId: run!.id, candidateId: createdAnchor!.id,
+            candidateVersion: current!.statusVersion, decisionPayload,
+            originalAdapterCalls: [...seenAdapterIds],
+          });
+          return;
+        }
         let reviewed: Awaited<ReturnType<typeof decide>>;
         const competing: number[] = [];
         if (mode === "concurrent") {
