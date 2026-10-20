@@ -92,14 +92,20 @@ jobs:
           # Historical replacement_heartbeat remains FAILED at ee6453c and
           # is never silently reclassified green by this separate scenario.
           export INT2_REJECTED_FENCING_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/rejected-fencing-observation.json"
-          run_named rejected src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD rejected_replacement_fencing: actual admitted run and independent reviewer'
+          # New narrow native committer tests, not a rerun of the rejected
+          # heartbeat scenario. The native corpus's ordinary commit+rollback
+          # is separately reported as an existing regression, not INT2 proof.
+          export INT2_NATIVE_TX_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
+          run_named nativegoverned src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 NATIVE_TX'
+          run_named nativebaseline src/__tests__/native-status-arbiter-corpus.test.ts 'retires a proven automatic review and applies the current successful completion exactly once'
       - name: Classify executed assertions (skips always NOT_RUN)
         run: |
           node <<'NODE'
           const fs=require("node:fs");
           const dir=".int2-evidence";
           const cases={
-            rejected:["P04 INT2 BCD rejected_replacement_fencing: actual admitted run and independent reviewer"]
+            nativegoverned:["positive","wrong_authority","rollback"].map(mode=>"P04 INT2 NATIVE_TX "+mode+": committer-owned governed status decision"),
+            nativebaseline:["retires a proven automatic review and applies the current successful completion exactly once"]
           };
           const output={};
           let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";
@@ -139,31 +145,25 @@ jobs:
               numFailedTests:doc?.numFailedTests??null,groupFailed,checks,
             };
           }
-          // The selected test may pass while JSON reporter hides console.info.
-          // Fail closed when the actual persisted run/version/adaptor trace
-          // is unavailable, malformed, or disagrees with the rejection gate.
-          const evidencePath=dir+"/rejected-fencing-observation.json";
-          let observed=null,observationError=null;
-          try{observed=JSON.parse(fs.readFileSync(evidencePath,"utf8"))}
-          catch(e){observationError=String(e)}
-          output.rejectedEvidence={
-            file:evidencePath,observationError,
-            originalCandidateVersion:observed?.storedCandidateVersion??null,
-            sentCandidateVersion:observed?.sentCandidateVersion??null,
-            reviewerHttp:observed?.reviewerHttp??null,
-            reviewerCode:observed?.reviewerCode??null,
-            finalStatus:observed?.finalStatus??null,
-            acceptedAuditRows:observed?.acceptedAuditRows??null,
-            observedRunCount:observed?.allRunsAfterDecision?.length??null,
-            observedAdapterCallCount:observed?.allAdapterCallsAfterDecision?.length??null,
-          };
-          if(observationError || observed?.reviewerHttp!==409 ||
-             observed?.reviewerCode!=="governed_candidate_stale" ||
-             observed?.finalStatus!=="in_review" ||
-             observed?.acceptedAuditRows!==0 ||
-             observed?.storedCandidateVersion!==observed?.sentCandidateVersion ||
-             observed?.allRunsAfterDecision?.length!==2 ||
-             observed?.allAdapterCallsAfterDecision?.length!==1) bad=true;
+          // Native observations are required even though Vitest JSON reporter
+          // hides passing test console messages. One file for each real mode.
+          output.nativeEvidence={};
+          for(const mode of ["positive","wrong_authority","rollback"]){
+            let row=null,error=null;
+            const file=dir+"/native-"+mode+"-observation.json";
+            try{row=JSON.parse(fs.readFileSync(file,"utf8"))}catch(e){error=String(e)}
+            const expectedDone=mode==="positive";
+            const valid=!error && row?.mode===mode &&
+              row?.issueStatus===(expectedDone?"done":"in_review") &&
+              row?.issueStatusVersion===(expectedDone?1:0) &&
+              row?.decisions?.length===(mode==="wrong_authority"?1:expectedDone?1:0) &&
+              row?.coordinators?.length===(mode==="wrong_authority"?2:1) &&
+              (expectedDone ? row?.effects?.some(e=>e.effectKind==="issue_status_projection") : row?.effects?.length===0);
+            output.nativeEvidence[mode]={file,error,valid,issueStatus:row?.issueStatus,
+              issueStatusVersion:row?.issueStatusVersion,
+              decisions:row?.decisions?.length??null,effects:row?.effects?.length??null};
+            if(!valid)bad=true;
+          }
           output.overall=bad?"FAIL_OR_NOT_RUN":"PASS";
           fs.writeFileSync(dir+"/classification.json",JSON.stringify(output,null,2));
           console.log(JSON.stringify(output,null,2));

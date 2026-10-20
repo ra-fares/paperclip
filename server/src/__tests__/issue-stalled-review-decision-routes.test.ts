@@ -26,12 +26,22 @@ import {
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
+  nativeRunFinalizations,
+  nativeRunResults,
   projects,
+  statusDecisions,
+  statusDecisionEffects,
+  workAssessments,
 } from "@paperclipai/db";
 import type { ServerAdapterModule } from "../adapters/index.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
+import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
+import {
+  NATIVE_STATUS_ARBITER_POLICY_VERSION,
+  type NativeStatusDecision,
+} from "../services/native-runtime/status-arbiter.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { errorHandler } from "../middleware/index.js";
@@ -1486,6 +1496,284 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         if (h) await drainHeartbeatRunsToQuiescence(db, h);
         unregisterServerAdapter("cline_local");
         await cluster.cleanup();
+      }
+    }, 120_000);
+  }
+});
+
+
+/**
+ * INT2 KT3 — Existing native corpus covers ordinary commit and rollback,
+ * not a governed issue's status authority inside the native committer's
+ * *same* SQL transaction. These are new, precisely scoped integration cases:
+ *
+ * positive: actual committer inserts decision then its issueService projection;
+ * wrong_authority: two real committer calls produce a divergent decision
+ *                 ledger version, never a fabricated preexisting authority;
+ * rollback: a PostgreSQL trigger aborts AFTER native issue projection and
+ *           verifies in-transaction decision+done visibility first.
+ */
+describeEmbeddedPostgres("P04 INT2 governed native same-transaction", () => {
+  for (const mode of ["positive", "wrong_authority", "rollback"] as const) {
+    it(`P04 INT2 NATIVE_TX ${mode}: committer-owned governed status decision`, async () => {
+      const temporary = await startEmbeddedPostgresTestDatabase(`p04-int2-native-${mode}-`);
+      const db = createDb(temporary.connectionString);
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+      const runs: Array<{ runId: string; assessmentId: string }> = [];
+      const decision = (statusAction: "done" | "preserve"): NativeStatusDecision => ({
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction, toStatus: statusAction === "done" ? "done" : "in_review",
+        reasonCode: statusAction === "done"
+          ? "completion_claim_policy_accepted"
+          : "native_review_unresolved",
+        unblockDescriptor: null, effects: [],
+      });
+      const addNativeInput = async (label: string) => {
+        const runId = randomUUID(), assessmentId = randomUUID();
+        const contractId = randomUUID(), resultId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId, companyId, agentId,
+          status: "succeeded", runtimeMode: "native",
+          runtimeModeResolvedAt: new Date(), nativeIssueId: issueId,
+          contextSnapshot: { issueId, testLane: label },
+          completionContractId: contractId,
+          completionContractSha256: `fixture-contract:${runId}`,
+        });
+        await db.insert(completionContracts).values({
+          id: contractId, companyId, issueId, revision: 1,
+          schemaVersion: "paperclip.completion-contract.v1",
+          policyVersion: "phase6-v1", risk: "standard",
+          completionAuthority: "server_arbiter",
+          incompleteCriteriaPolicy: "preserve_non_terminal",
+          contractJson: { revision: "native-int2", criteria: [
+            { id: "objective", requirement: "Publish complete native assessment" },
+          ] },
+          canonicalSha256: `fixture-contract:${runId}`,
+          createdByActorType: "system", createdByActorId: "int2-fixture",
+        });
+        await db.insert(nativeRunResults).values({
+          id: resultId, companyId, issueId, runId,
+          completionContractId: contractId,
+          serverFingerprint: `fixture:${runId}`,
+          schemaStatus: "accepted",
+          resultJson: { result: { summary: "Safe native assessment fixture" } },
+          canonicalSha256: `fixture-result:${runId}`,
+        });
+        await db.insert(workAssessments).values({
+          id: assessmentId, companyId, issueId, runId,
+          contractId, resultId,
+          triggerKind: "native_result", triggerActorCompanyId: companyId,
+          priorIssueStatus: "in_review", priorStatusVersion: 0,
+          policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+          assessmentJson: { lane: label, safeNoProvider: true },
+          inputDigest: `fixture-assessment:${runId}`,
+        });
+        await db.insert(nativeRunFinalizations).values({
+          runId, companyId, issueId, phase: "assessing",
+          resultId, assessmentId,
+        });
+        runs.push({ runId, assessmentId });
+        return { runId, assessmentId };
+      };
+      const commit = (run: { runId: string; assessmentId: string },
+                      action: "done" | "preserve") =>
+        commitNativeStatusDecision({
+          db, companyId, issueId, runId: run.runId,
+          assessmentId: run.assessmentId,
+          priorStatus: "in_review", priorStatusVersion: 0,
+          priorDecisionId: null,
+          decision: decision(action),
+        });
+
+      try {
+        const [postgres] = await db.select({ version: sql<string>`version()` })
+          .from(sql`(select 1) as postgres_probe`);
+        await db.insert(companies).values({
+          id: companyId, name: "Governed native same-transaction CI",
+          issuePrefix: "GNTX",
+        });
+        await db.insert(agents).values({
+          id: agentId, companyId, name: "No-provider native fixture",
+          adapterType: "codex_local", status: "idle",
+        });
+        await db.insert(issues).values({
+          id: issueId, companyId, title: "Governed native final status",
+          assigneeAgentId: agentId, status: "in_review",
+          sensorGovernedAt: new Date(), reviewPolicy: "human_only",
+        });
+
+        // PostgreSQL observes the decision from the SAME transaction during
+        // the actual issue status UPDATE, before the outer commit. No
+        // precommitted decision or actor/system-override route is used.
+        await db.execute(sql.raw(`
+          CREATE FUNCTION int2_native_tx_authority() RETURNS trigger
+          LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW.status = 'done' AND OLD.status IS DISTINCT FROM 'done' THEN
+              IF NOT EXISTS (
+                SELECT 1 FROM status_decisions d
+                WHERE d.id = NEW.last_status_decision_id
+                  AND d.company_id = NEW.company_id
+                  AND d.issue_id = NEW.id
+                  AND d.from_status = OLD.status
+                  AND d.to_status = 'done'
+                  AND d.decision_version = NEW.status_version
+                  AND d.assessment_id IS NOT NULL
+                  AND length(d.decision_digest) > 0
+              ) THEN RAISE EXCEPTION 'int2_native_same_tx_authority_missing'; END IF;
+            END IF;
+            RETURN NEW;
+          END;
+          $$;
+        `));
+        await db.execute(sql.raw(`
+          CREATE TRIGGER int2_native_tx_authority_trigger
+          BEFORE UPDATE ON issues FOR EACH ROW
+          EXECUTE FUNCTION int2_native_tx_authority();
+        `));
+
+        const first = await addNativeInput(mode + "-source");
+        expect(await db.select().from(statusDecisions)
+          .where(eq(statusDecisions.issueId, issueId))).toHaveLength(0);
+        if (mode === "wrong_authority") {
+          // A real native committer "preserve" creates version 1 in the
+          // decision ledger without incrementing issue.statusVersion 0.
+          // The second legitimate committer's done authority must not match
+          // the expected version 1; it will create version 2 *in its own tx*
+          // and issueService must reject it before commit.
+          const firstCommit = await commit(first, "preserve");
+          expect(firstCommit.decision.decisionVersion).toBe(1);
+          const second = await addNativeInput(mode + "-second");
+          await expect(commit(second, "done"))
+            .rejects.toThrow("A current source-run review candidate is required");
+        } else {
+          if (mode === "rollback") {
+            // Later than status projection: the issue is already changed to
+            // done inside the same transaction when this trigger checks it.
+            await db.execute(sql.raw(`
+              CREATE FUNCTION int2_native_abort_effect() RETURNS trigger
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                IF NOT EXISTS (
+                  SELECT 1 FROM issues i
+                  JOIN status_decisions d ON d.id = NEW.decision_id
+                  WHERE i.id = NEW.issue_id
+                    AND i.status = 'done'
+                    AND i.status_version = 1
+                    AND i.last_status_decision_id = d.id
+                    AND d.to_status = 'done'
+                ) THEN
+                  RAISE EXCEPTION 'int2_native_projection_not_visible_before_abort';
+                END IF;
+                RAISE EXCEPTION 'int2_native_forced_post_projection_abort';
+              END;
+              $$;
+            `));
+            await db.execute(sql.raw(`
+              CREATE TRIGGER int2_native_abort_effect_trigger
+              BEFORE INSERT ON status_decision_effects FOR EACH ROW
+              WHEN (NEW.effect_kind = 'issue_status_projection')
+              EXECUTE FUNCTION int2_native_abort_effect();
+            `));
+            await expect(commit(first, "done"))
+              .rejects.toThrow("int2_native_forced_post_projection_abort");
+          } else {
+            const result = await commit(first, "done");
+            expect(result.replayed).toBe(false);
+            expect(result.decision).toMatchObject({
+              runId: first.runId, assessmentId: first.assessmentId,
+              fromStatus: "in_review", toStatus: "done",
+              decisionVersion: 1, applicationState: "applied",
+            });
+            expect(result.issue).toMatchObject({
+              status: "done", statusVersion: 1,
+              lastStatusDecisionId: result.decision.id,
+            });
+          }
+        }
+
+        const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const persisted = await db.select().from(statusDecisions)
+          .where(eq(statusDecisions.issueId, issueId));
+        const effects = await db.select().from(statusDecisionEffects)
+          .where(eq(statusDecisionEffects.issueId, issueId));
+        const coordinators = await db.select().from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.issueId, issueId));
+        const activity = await db.select().from(activityLog).where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.updated"),
+        ));
+        const observation = {
+          mode, pg: postgres.version, issueId,
+          issueStatus: issue?.status, issueStatusVersion: issue?.statusVersion,
+          lastStatusDecisionId: issue?.lastStatusDecisionId,
+          decisions: persisted.map(d => ({
+            id: d.id, runId: d.runId, assessmentId: d.assessmentId,
+            fromStatus: d.fromStatus, toStatus: d.toStatus,
+            decisionVersion: d.decisionVersion,
+            applicationState: d.applicationState,
+          })),
+          effects: effects.map(e => ({
+            id: e.id, decisionId: e.decisionId,
+            effectKind: e.effectKind, deliveryState: e.deliveryState,
+          })),
+          coordinators: coordinators.map(c => ({
+            runId: c.runId, phase: c.phase, decisionId: c.decisionId,
+          })),
+          activityCount: activity.length,
+          fixtureRunIds: runs.map(r => r.runId),
+        };
+        console.info("INT2_NATIVE_TX_OBSERVATION " + JSON.stringify(observation));
+        if (process.env.INT2_NATIVE_TX_EVIDENCE_DIR) {
+          writeFileSync(
+            `${process.env.INT2_NATIVE_TX_EVIDENCE_DIR}/native-${mode}-observation.json`,
+            JSON.stringify(observation, null, 2) + "\n",
+            { encoding: "utf8", flag: "wx" },
+          );
+        }
+        if (mode === "positive") {
+          expect(issue?.status, JSON.stringify(observation)).toBe("done");
+          expect(issue?.statusVersion).toBe(1);
+          expect(persisted).toHaveLength(1);
+          expect(issue?.lastStatusDecisionId).toBe(persisted[0].id);
+          expect(persisted[0]).toMatchObject({
+            runId: first.runId, assessmentId: first.assessmentId,
+            fromStatus: "in_review", toStatus: "done",
+            applicationState: "applied", decisionVersion: 1,
+          });
+          expect(effects.some(e => e.effectKind === "issue_status_projection")).toBe(true);
+          expect(coordinators).toMatchObject([{
+            runId: first.runId, phase: "committed", decisionId: persisted[0].id,
+          }]);
+          expect(activity.length).toBeGreaterThan(0);
+        } else if (mode === "wrong_authority") {
+          expect(issue).toMatchObject({
+            status: "in_review", statusVersion: 0, lastStatusDecisionId: null,
+          });
+          expect(persisted).toHaveLength(1);
+          expect(persisted[0]).toMatchObject({
+            runId: first.runId, toStatus: "in_review",
+            decisionVersion: 1,
+          });
+          expect(coordinators).toHaveLength(2);
+          const aborted = coordinators.find(c => c.runId === runs[1].runId);
+          expect(aborted).toMatchObject({ phase: "assessing", decisionId: null });
+          expect(effects).toHaveLength(0);
+          expect(activity).toHaveLength(0);
+        } else {
+          expect(issue).toMatchObject({
+            status: "in_review", statusVersion: 0, lastStatusDecisionId: null,
+          });
+          expect(persisted).toHaveLength(0);
+          expect(effects).toHaveLength(0);
+          expect(coordinators).toMatchObject([{
+            runId: first.runId, phase: "assessing", decisionId: null,
+          }]);
+          expect(activity).toHaveLength(0);
+        }
+      } finally {
+        await temporary.cleanup();
       }
     }, 120_000);
   }
