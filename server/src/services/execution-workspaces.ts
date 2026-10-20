@@ -3463,6 +3463,28 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         Boolean(input.actor.runId);
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        // Canonical issue -> parent PW -> EW -> runtime services lock order.
+        // The inspected row is only a lock-set hint. Refuse drift after EW lock;
+        // never take a newly discovered parent lock after acquiring EW.
+        if (input.mode === "quarantine_restore" && existingRow.sourceIssueId) {
+          const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+            eq(issues.id, existingRow.sourceIssueId),
+            eq(issues.companyId, existingRow.companyId),
+          )).for("update").limit(1);
+          if (!source) throw conflict("Reconcile source issue changed", {
+            code: "workspace_reconcile_source_stale",
+          });
+        }
+        if (existingRow.projectWorkspaceId) {
+          const [parent] = await tx.select({ id: projectWorkspaces.id })
+            .from(projectWorkspaces).where(and(
+              eq(projectWorkspaces.id, existingRow.projectWorkspaceId),
+              eq(projectWorkspaces.companyId, existingRow.companyId),
+            )).for("update").limit(1);
+          if (!parent) throw conflict("Reconcile project workspace changed", {
+            code: "workspace_reconcile_parent_stale",
+          });
+        }
         // Runtime-service activation takes this same row lock before spawning
         // local services and persists a `starting` row before releasing it.
         const lockedRow = await tx
@@ -3479,17 +3501,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           inspection,
         });
 
-        if (usesInheritedProjectRuntimeServices(lockedRow)) {
-          await tx
-            .select({ id: projectWorkspaces.id })
-            .from(projectWorkspaces)
-            .where(
-              and(
-                eq(projectWorkspaces.companyId, lockedRow.companyId),
-                eq(projectWorkspaces.id, lockedRow.projectWorkspaceId!),
-              ),
-            )
-            .for("update");
+        if (lockedRow.projectWorkspaceId !== existingRow.projectWorkspaceId ||
+            lockedRow.sourceIssueId !== existingRow.sourceIssueId) {
+          throw conflict("Reconcile workspace parent/source changed during locking", {
+            code: "workspace_reconcile_parent_stale",
+          });
         }
 
         await tx
@@ -3512,6 +3528,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   eq(workspaceRuntimeServices.executionWorkspaceId, lockedRow.id),
                 ),
           )
+          .orderBy(asc(workspaceRuntimeServices.id))
           .for("update");
 
         const lockedRuntimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(
