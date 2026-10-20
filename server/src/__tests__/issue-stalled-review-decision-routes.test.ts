@@ -3720,7 +3720,10 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
 describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
   for(const drift of ["parent","source"] as const) {
   it("P04 INT2 W009 DB-only EW "+drift+" drift rejects before fake spawn",async()=>{
+    const stage=w011StageRecorder(drift+"_drift");
+    stage("before_pg_start",{writerPoolMaxConnections:1,runtimePoolMaxConnections:1,observerPoolMaxConnections:1});
     const cluster=await startEmbeddedPostgresTestDatabase("p04-w009-parent-drift-");
+    stage("pg_started");
     const pwWriter=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-writer"});
     const runtimeDb=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-start"});
     const observer=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-observer"});
@@ -3729,10 +3732,15 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
     const pw1=randomUUID(),pw2=randomUUID(),ewId=randomUUID();
     const gotWriterLock=w009Deferred(),releaseWriter=w009Deferred();
     let writerTask:Promise<unknown>|null=null,startTask:Promise<unknown>|null=null;
+    let writerSettled=false,startSettled=false;
     let runtime:typeof import("../services/workspace-runtime.js")|null=null;
     const previousHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
     let mocksInstalled=false,spawnCalls=0;
+    let primaryError:unknown=null;
+    const cleanupErrors:unknown[]=[];
+    stage("drift_pools_ready",{writerPoolMaxConnections:1,runtimePoolMaxConnections:1,observerPoolMaxConnections:1});
     try {
+      stage("seed_begin");
       await pwWriter.insert(companies).values({id:companyId,name:"W009 parent drift",issuePrefix:"WPD"});
       await pwWriter.insert(projects).values({id:projectId,companyId,name:"W009 parent drift project"});
       await pwWriter.insert(projectWorkspaces).values([
@@ -3750,6 +3758,7 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         name:"W009 parent drift EW",mode:"isolated_workspace",strategyType:"git_worktree",
         status:"active",cwd:"/tmp/w009-parent-old",
       });
+      stage("seed_complete",{issueId,ewId,originalParent:pw1,newParent:pw2,drift});
       writerTask=pwWriter.transaction(async tx=>{
         const [parent]=await tx.select().from(projectWorkspaces)
           .where(eq(projectWorkspaces.id,pw1)).for("update");
@@ -3760,8 +3769,21 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         gotWriterLock.resolve();
         await releaseWriter.promise;
       });
-      void writerTask.catch(()=>undefined);
-      await gotWriterLock.promise;
+      void writerTask.then(
+        ()=>{writerSettled=true;stage("drift_writer_settled",{outcome:"fulfilled"});},
+        error=>{writerSettled=true;stage("drift_writer_settled",{outcome:"rejected",error:error instanceof Error?error.message:String(error)});},
+      );
+      await w011Watchdog(
+        gotWriterLock.promise,
+        "drift_writer_lock",
+        async()=>{
+          const catalog=await w011ReadPgCatalog(observer,["w009-parent-writer"]);
+          stage("watchdog_timeout",{label:"drift_writer_lock",catalog});
+          return {catalog};
+        },
+        12_000,
+      );
+      stage("drift_writer_lock_held",{drift});
       process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
       vi.resetModules();
       mocksInstalled=true;
@@ -3776,6 +3798,8 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         fork:()=>{throw new Error("W009_UNSAFE_FORK");},
       }));
       runtime=await import("../services/workspace-runtime.js");
+      stage("module_setup_complete");
+      stage("drift_runtime_launch",{drift});
       startTask=runtime.startRuntimeServicesForWorkspaceControl({
         db:runtimeDb,actor:{id:null,name:"W009 parent drift",companyId},
         issue:{id:issueId,identifier:"WPD-1",title:"W009 parent drift"},
@@ -3791,12 +3815,39 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
           port:{type:"fixed",value:45981},readiness:{type:"none"},
         }]},desiredState:"running"},
       });
-      void startTask.catch(()=>undefined);
-      const lock=await w009ObserveWait(observer,"w009-parent-start","w009-parent-writer");
+      void startTask.then(
+        ()=>{startSettled=true;stage("drift_runtime_settled",{outcome:"fulfilled"});},
+        error=>{startSettled=true;stage("drift_runtime_settled",{outcome:"rejected",error:error instanceof Error?error.message:String(error)});},
+      );
+      const lock=await w009ObserveWait(observer,"w009-parent-start","w009-parent-writer",stage);
       expect(lock.proven).toBe(true);
+      stage("drift_writer_release");
       releaseWriter.resolve();
-      await writerTask;
-      await expect(startTask).rejects.toMatchObject({
+      await w011Watchdog(
+        writerTask,
+        "drift_writer_settlement",
+        async()=>{
+          const catalog=await w011ReadPgCatalog(observer,["w009-parent-writer","w009-parent-start"]);
+          stage("watchdog_timeout",{label:"drift_writer_settlement",catalog});
+          return {catalog};
+        },
+        12_000,
+      );
+      const startOutcome=await w011Watchdog(
+        startTask.then(
+          ()=>({ok:true as const,error:null as unknown}),
+          error=>({ok:false as const,error}),
+        ),
+        "drift_runtime_settlement",
+        async()=>{
+          const catalog=await w011ReadPgCatalog(observer,["w009-parent-writer","w009-parent-start"]);
+          stage("watchdog_timeout",{label:"drift_runtime_settlement",catalog});
+          return {catalog};
+        },
+        12_000,
+      );
+      expect(startOutcome.ok).toBe(false);
+      expect(startOutcome.error).toMatchObject({
         status:409,details:{code:"workspace_runtime_parent_stale"},
       });
       const persisted=await observer.select().from(workspaceRuntimeServices)
@@ -3810,21 +3861,56 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         JSON.stringify(evidence,null,2)+"\n",{flag:"wx",encoding:"utf8"});
       expect(spawnCalls).toBe(0);
       expect(persisted).toHaveLength(0);
+      stage("drift_assertions_complete",{drift,spawnCalls,persistedRows:persisted.length});
+    } catch(error) {
+      primaryError=error;
+      let catalog:W011CatalogRow[]=[];
+      try{catalog=await w011ReadPgCatalog(observer,["w009-parent-writer","w009-parent-start"]);}catch{}
+      stage("drift_error",{drift,error:error instanceof Error?error.message:String(error),writerSettled,startSettled,catalog});
     } finally {
+      stage("drift_cleanup_begin",{drift,writerSettled,startSettled});
       releaseWriter.resolve();
-      await Promise.allSettled([writerTask,startTask].filter(
-        (p):p is Promise<unknown>=>p!==null,
-      ));
-      await runtime?.resetRuntimeServicesForTests({terminateProcesses:true});
+      if(!writerSettled||!startSettled) {
+        try {
+          const cancelled=await w011CancelApplicationSessions(observer,["w009-parent-writer","w009-parent-start"]);
+          stage("drift_pg_cancel_requested",{cancelled});
+        } catch(error) {
+          cleanupErrors.push(error);
+          stage("drift_cleanup_error",{phase:"pg_cancel",error:error instanceof Error?error.message:String(error)});
+        }
+      }
+      if(writerTask&&!writerSettled)await w011SettleAfterCancellation(writerTask,pwWriter,stage,"drift_writer");
+      if(startTask&&!startSettled)await w011SettleAfterCancellation(startTask,runtimeDb,stage,"drift_runtime");
+      try{await runtime?.resetRuntimeServicesForTests({terminateProcesses:true});}
+      catch(error){
+        cleanupErrors.push(error);
+        stage("drift_cleanup_error",{phase:"runtime_reset",error:error instanceof Error?error.message:String(error)});
+      }
       if(mocksInstalled){
         vi.doUnmock("node:child_process");
         vi.resetModules();
+        stage("drift_mocks_removed");
       }
       if(previousHttps===undefined)delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
       else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS=previousHttps;
-      await closeRegisteredClients(cluster.connectionString);
-      await cluster.cleanup();
+      try{await closeRegisteredClients(cluster.connectionString);stage("drift_clients_closed");}
+      catch(error){
+        cleanupErrors.push(error);
+        stage("drift_cleanup_error",{phase:"close_clients",error:error instanceof Error?error.message:String(error)});
+      }
+      try{await cluster.cleanup();stage("drift_cluster_cleaned");}
+      catch(error){
+        cleanupErrors.push(error);
+        stage("drift_cleanup_error",{phase:"cluster_cleanup",error:error instanceof Error?error.message:String(error)});
+      }
+      stage("drift_cleanup_complete",{
+        drift,writerSettled,startSettled,
+        cleanupErrors:cleanupErrors.map(error=>error instanceof Error?error.message:String(error)),
+        primaryError:primaryError instanceof Error?primaryError.message:primaryError?String(primaryError):null,
+      });
     }
+    if(primaryError)throw primaryError;
+    if(cleanupErrors.length>0)throw cleanupErrors[0];
   },120_000);
   }
 });
