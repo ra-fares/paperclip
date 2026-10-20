@@ -3106,12 +3106,14 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
  * is reachable by HTTP; does exercise REAL runtime parent probe/row locks.
  */
 describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
-  it("P04 INT2 W009 DB-only EW parent drift rejects before fake spawn",async()=>{
+  for(const drift of ["parent","source"] as const) {
+  it("P04 INT2 W009 DB-only EW "+drift+" drift rejects before fake spawn",async()=>{
     const cluster=await startEmbeddedPostgresTestDatabase("p04-w009-parent-drift-");
     const pwWriter=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-writer"});
     const runtimeDb=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-start"});
     const observer=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-observer"});
     const companyId=randomUUID(),projectId=randomUUID(),issueId=randomUUID();
+    const otherIssueId=randomUUID();
     const pw1=randomUUID(),pw2=randomUUID(),ewId=randomUUID();
     const gotWriterLock=w009Deferred(),releaseWriter=w009Deferred();
     let writerTask:Promise<unknown>|null=null,startTask:Promise<unknown>|null=null;
@@ -3125,10 +3127,12 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         {id:pw1,companyId,projectId,name:"W009 old parent",sourceType:"local_path",cwd:"/tmp/w009-parent-old"},
         {id:pw2,companyId,projectId,name:"W009 new parent",sourceType:"local_path",cwd:"/tmp/w009-parent-new"},
       ]);
-      await pwWriter.insert(issues).values({
-        id:issueId,companyId,projectId,projectWorkspaceId:pw1,
-        title:"W009 DB-only stale parent probe",status:"in_review",
-      });
+      await pwWriter.insert(issues).values([
+        {id:issueId,companyId,projectId,projectWorkspaceId:pw1,
+         title:"W009 DB-only stale parent probe",status:"in_review"},
+        {id:otherIssueId,companyId,projectId,projectWorkspaceId:pw1,
+         title:"W009 DB-only alternate source issue",status:"in_review"},
+      ]);
       await pwWriter.insert(executionWorkspaces).values({
         id:ewId,companyId,projectId,projectWorkspaceId:pw1,sourceIssueId:issueId,
         name:"W009 parent drift EW",mode:"isolated_workspace",strategyType:"git_worktree",
@@ -3138,8 +3142,9 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
         const [parent]=await tx.select().from(projectWorkspaces)
           .where(eq(projectWorkspaces.id,pw1)).for("update");
         expect(parent).toBeDefined();
-        await tx.update(executionWorkspaces).set({projectWorkspaceId:pw2})
-          .where(eq(executionWorkspaces.id,ewId));
+        await tx.update(executionWorkspaces).set(
+          drift==="parent"?{projectWorkspaceId:pw2}:{sourceIssueId:otherIssueId},
+        ).where(eq(executionWorkspaces.id,ewId));
         gotWriterLock.resolve();
         await releaseWriter.promise;
       });
@@ -3179,11 +3184,12 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
       });
       const persisted=await observer.select().from(workspaceRuntimeServices)
         .where(eq(workspaceRuntimeServices.executionWorkspaceId,ewId));
-      const evidence={writerKind:"FIXTURE_DB_ONLY_PARENT_CHANGE",issueId,ewId,
-        originalParent:pw1,newParent:pw2,lock,spawnCalls,persistedRows:persisted.length};
+      const evidence={writerKind:"FIXTURE_DB_ONLY_"+drift.toUpperCase()+"_CHANGE",
+        issueId,otherIssueId,ewId,originalParent:pw1,newParent:pw2,
+        lock,spawnCalls,persistedRows:persisted.length};
       console.info("INT2_W009_PARENT_DRIFT "+JSON.stringify(evidence));
       if(process.env.INT2_W009_EVIDENCE_DIR)writeFileSync(
-        process.env.INT2_W009_EVIDENCE_DIR+"/parent-drift.json",
+        process.env.INT2_W009_EVIDENCE_DIR+"/"+drift+"-drift.json",
         JSON.stringify(evidence,null,2)+"\n",{flag:"wx",encoding:"utf8"});
       expect(spawnCalls).toBe(0);
       expect(persisted).toHaveLength(0);
@@ -3203,4 +3209,5 @@ describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
       await cluster.cleanup();
     }
   },120_000);
+  }
 });
