@@ -15,6 +15,7 @@ import {
   completionContracts,
   companyMemberships,
   createDb,
+  closeRegisteredClients,
   documentRevisions,
   documents,
   executionWorkspaces,
@@ -2422,6 +2423,9 @@ describeEmbeddedPostgres("P04 INT2 W01-005 workspace revision database", () => {
       };
       console.info("INT2_W01_005_REVISION_DB " + JSON.stringify(observations));
     } finally {
+      if (exposureBefore === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+      else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = exposureBefore;
+      await closeRegisteredClients(cluster.connectionString);
       await cluster.cleanup();
     }
   }, 120_000);
@@ -2455,6 +2459,10 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
     const fakeRegistry = new Map<string, unknown>();
     let mocksInstalled = false;
     let runtimeForCleanup: typeof import("../services/workspace-runtime.js") | null = null;
+    let pendingStart: Promise<unknown> | null = null;
+    let portProbe: import("node:net").Server | null = null;
+    let portProbeClosed = false;
+    const exposureBefore = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
     const selectRows = () => observer.select().from(workspaceRuntimeServices)
       .where(eq(workspaceRuntimeServices.executionWorkspaceId, ewId));
     try {
@@ -2477,6 +2485,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
 
       // Temporary allowed loopback port probe; never starts a dev-server.
       const probe = net.createServer();
+      portProbe = probe;
       const port = await new Promise<number>((resolve, reject) => {
         probe.once("error", reject);
         probe.listen(0, "127.0.0.1", () => {
@@ -2486,7 +2495,9 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         });
       });
       await new Promise<void>((resolve, reject) => probe.close(err => err ? reject(err) : resolve()));
+      portProbeClosed = true;
       expect(port).toBeGreaterThan(0);
+      process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "off";
 
       // Real entrypoint and PRIVATE bind-collision class remain untouched.
       // Only operating-system service side effects are replaced.
@@ -2571,6 +2582,9 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         executionWorkspaceId: ewId, adapterEnv: {},
         config: { workspaceRuntime: { services: [service] }, desiredState: "running" },
       });
+      pendingStart = started;
+      // Promise rejection is observed immediately, including on setup/observer failure.
+      void started.catch(() => undefined);
       // Read through INDEPENDENT connection; only a committed 'starting' row
       // can release the foreign-owner gate. Polling is scheduling, not proof.
       let first: Awaited<ReturnType<typeof selectRows>>[number] | undefined;
@@ -2614,7 +2628,15 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
       expect(events.some(x => x.event === "REGISTRY_REMOVE")).toBe(true);
       expect(finalRefs.map(x => x.id)).toContain(newRunning!.id);
     } finally {
-      resolveForeignOwner?.(99001); // unblock promise if fixture failed before gate release
+      resolveForeignOwner?.(99001);
+      // Always drain before undoing mocks and closing the PG cluster, regardless
+      // of which setup/query/assertion failed. No detached startup survives.
+      if (pendingStart) await pendingStart.catch(() => undefined);
+      if (portProbe && !portProbeClosed) {
+        await new Promise<void>(resolve => {
+          try { portProbe!.close(() => resolve()); } catch { resolve(); }
+        });
+      }
       if (mocksInstalled) {
         // Runtime stop uses the mocked supervisor, never the host process table.
         await runtimeForCleanup?.resetRuntimeServicesForTests({ terminateProcesses: true });
