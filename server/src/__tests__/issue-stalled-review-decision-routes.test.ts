@@ -2699,15 +2699,16 @@ async function w009ObserveWait(
   let latest: unknown = null;
   while (Date.now() < deadline) {
     const names = [waiterName, blockerName];
-    const rows = await observer.execute(sql<{
+    const rows = await observer.execute(sql.raw(
+      "SELECT a.pid,a.application_name,pg_blocking_pids(a.pid) AS blocking_pids," +
+      " a.wait_event_type,a.wait_event,a.state,LEFT(a.query,220) AS active_sql" +
+      " FROM pg_stat_activity AS a WHERE a.datname=current_database()" +
+      " AND a.application_name IN (" + names.map(n=>"'" + n.replaceAll("'","''") + "'").join(",") + ")"
+    )) as unknown as Array<{
       pid: number; application_name: string; blocking_pids: number[];
       wait_event_type: string | null; wait_event: string | null;
       state: string; active_sql: string;
-    }>"SELECT a.pid,a.application_name,pg_blocking_pids(a.pid) AS blocking_pids," +
-       " a.wait_event_type,a.wait_event,a.state,LEFT(a.query,220) AS active_sql" +
-       " FROM pg_stat_activity AS a WHERE a.datname=current_database()" +
-       " AND a.application_name IN (" + names.map(n=>"'" + n.replaceAll("'","''") + "'").join(",") + ")"
-       as never);
+    }>;
     const waiter = rows.find(r=>r.application_name===waiterName);
     const blocker = rows.find(r=>r.application_name===blockerName);
     latest = {waiter,blocker};
@@ -2716,7 +2717,7 @@ async function w009ObserveWait(
        waiter.blocking_pids.map(Number).includes(Number(blocker.pid))) {
       const locks = await observer.execute(sql.raw(
         "SELECT locktype,granted FROM pg_locks WHERE pid="+Number(waiter.pid)+" AND granted=false"
-      ));
+      )) as unknown as Array<{locktype:string;granted:boolean}>;
       if (locks.length) return {
         waiterName,blockerName,waiterPid:waiter.pid,blockerPid:blocker.pid,
         waitEvent:waiter.wait_event,blockingLockTypes:locks.map(x=>x.locktype),
