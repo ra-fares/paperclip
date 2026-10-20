@@ -1333,8 +1333,34 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             }
             return observation;
           };
-          const changed = await request(board(requesterId))
+          stage("http_aba_first_patch_enter", { workspaceId, branchB });
+          const changedRequest = request(board(requesterId))
             .patch("/api/execution-workspaces/" + workspaceId).send({ branchName: branchB });
+          const changedTask = changedRequest.then((response) => response);
+          let changed: Awaited<typeof changedTask>;
+          try {
+            changed = await w011Watchdog(
+              changedTask,
+              "http_aba_first_patch",
+              async () => {
+                const catalog = w011Observer
+                  ? await w011ReadPgCatalog(w011Observer, [sourceApplicationName])
+                  : [];
+                stage("watchdog_timeout", { label: "http_aba_first_patch", catalog });
+                return { catalog };
+              },
+              15_000,
+            );
+          } catch (error) {
+            try { changedRequest.abort(); } catch {}
+            const cancelled = w011Observer
+              ? await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => [])
+              : [];
+            stage("http_aba_first_patch_cancelled", { cancelled });
+            await w011SettleAfterCancellation(changedTask, db, stage, "http_aba_first_patch");
+            throw error;
+          }
+          stage("http_aba_first_patch_result", { httpStatus: changed.status });
           const middle = await capture("after_http_B", changed.status, changed.body);
           const firstValid = changed.status === 200 && middle.branchName === branchB &&
             middle.issueWorkspaceId === workspaceId && middle.issueStatus === "in_review";
@@ -1343,8 +1369,34 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             expect(firstValid, JSON.stringify(observation)).toBe(true);
             return;
           }
-          const restored = await request(board(requesterId))
+          stage("http_aba_restore_patch_enter", { workspaceId, branchA });
+          const restoredRequest = request(board(requesterId))
             .patch("/api/execution-workspaces/" + workspaceId).send({ branchName: branchA });
+          const restoredTask = restoredRequest.then((response) => response);
+          let restored: Awaited<typeof restoredTask>;
+          try {
+            restored = await w011Watchdog(
+              restoredTask,
+              "http_aba_restore_patch",
+              async () => {
+                const catalog = w011Observer
+                  ? await w011ReadPgCatalog(w011Observer, [sourceApplicationName])
+                  : [];
+                stage("watchdog_timeout", { label: "http_aba_restore_patch", catalog });
+                return { catalog };
+              },
+              15_000,
+            );
+          } catch (error) {
+            try { restoredRequest.abort(); } catch {}
+            const cancelled = w011Observer
+              ? await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => [])
+              : [];
+            stage("http_aba_restore_patch_cancelled", { cancelled });
+            await w011SettleAfterCancellation(restoredTask, db, stage, "http_aba_restore_patch");
+            throw error;
+          }
+          stage("http_aba_restore_patch_result", { httpStatus: restored.status });
           const afterRestore = await capture("after_http_restored_A", restored.status, restored.body);
           const bothValid = restored.status === 200 && afterRestore.branchName === branchA &&
             afterRestore.issueWorkspaceId === workspaceId && afterRestore.issueStatus === "in_review";
@@ -1353,7 +1405,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             expect(bothValid, JSON.stringify(observation)).toBe(true);
             return;
           }
-          const reviewed = await request(board(reviewerId))
+          stage("D_request_enter", { reviewerId, label: "http_aba_D_request" });
+          const reviewRequest = request(board(reviewerId))
             .patch("/api/issues/" + issueId).send({
               status: "done",
               governedReviewDecision: {
@@ -1367,6 +1420,31 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 }],
               },
             });
+          const reviewTask = reviewRequest.then((response) => response);
+          let reviewed: Awaited<typeof reviewTask>;
+          try {
+            reviewed = await w011Watchdog(
+              reviewTask,
+              "http_aba_D_request",
+              async () => {
+                const catalog = w011Observer
+                  ? await w011ReadPgCatalog(w011Observer, [sourceApplicationName])
+                  : [];
+                stage("watchdog_timeout", { label: "http_aba_D_request", catalog });
+                return { catalog };
+              },
+              15_000,
+            );
+          } catch (error) {
+            try { reviewRequest.abort(); } catch {}
+            const cancelled = w011Observer
+              ? await w011CancelApplicationSessions(w011Observer, [sourceApplicationName]).catch(() => [])
+              : [];
+            stage("D_request_cancelled", { label: "http_aba_D_request", cancelled });
+            await w011SettleAfterCancellation(reviewTask, db, stage, "http_aba_D_request");
+            throw error;
+          }
+          stage("D_request_result", { label: "http_aba_D_request", httpStatus: reviewed.status });
           reviewStatus = reviewed.status;
           reviewBody = reviewed.body;
           await capture("after_reviewer_D", reviewed.status, reviewed.body);
