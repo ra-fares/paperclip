@@ -2702,42 +2702,164 @@ async function w009Watchdog<T>(promise:Promise<T>,label:string):Promise<T> {
   });
 }
 
-/** Poll PG catalog to PROVE a real blocked transaction, never infer it from delay. */
+type W011StageWriter = (stage: string, details?: Record<string, unknown>) => void;
+
+function w011StageRecorder(mode: string): W011StageWriter {
+  const dir = process.env.INT2_W011_EVIDENCE_DIR;
+  const output = dir ? `${dir}/stages-${mode}.jsonl` : null;
+  let sequence = 0;
+  return (stage, details = {}) => {
+    const event = {
+      schema: "p04-int2-w011-stage.v1",
+      sequence: ++sequence,
+      at: new Date().toISOString(),
+      mode,
+      stage,
+      ...details,
+    };
+    console.info("INT2_W011_STAGE " + JSON.stringify(event));
+    if (output) {
+      writeFileSync(output, JSON.stringify(event) + "\n", { encoding: "utf8", flag: "a" });
+    }
+  };
+}
+
+type W011CatalogRow = {
+  pid: number;
+  application_name: string;
+  blocking_pids: number[];
+  wait_event_type: string | null;
+  wait_event: string | null;
+  state: string;
+  query: string;
+  query_start: string | Date | null;
+  xact_start: string | Date | null;
+};
+
+async function w011ReadPgCatalog(
+  observer: ReturnType<typeof createDb>,
+  applicationNames: string[],
+): Promise<W011CatalogRow[]> {
+  const quoted = applicationNames.map((name) => "'" + name.replaceAll("'", "''") + "'").join(",");
+  return await observer.execute(sql.raw(
+    "SELECT a.pid,a.application_name,pg_blocking_pids(a.pid) AS blocking_pids," +
+    " a.wait_event_type,a.wait_event,a.state,LEFT(a.query,500) AS query," +
+    " a.query_start,a.xact_start FROM pg_stat_activity AS a" +
+    " WHERE a.datname=current_database() AND a.application_name IN (" + quoted + ")" +
+    " ORDER BY a.application_name,a.pid"
+  )) as unknown as W011CatalogRow[];
+}
+
+function w011PendingTaskState(input: {
+  dSettled: boolean;
+  writerSettled: boolean;
+  gateSettled: boolean;
+}) {
+  return {
+    d: input.dSettled ? "settled" : "pending",
+    writer: input.writerSettled ? "settled" : "pending",
+    gate: input.gateSettled ? "settled" : "pending",
+  };
+}
+
+async function w011Watchdog<T>(
+  promise: Promise<T>,
+  label: string,
+  onTimeout: () => Promise<Record<string, unknown>>,
+  timeoutMs = 12_000,
+): Promise<T> {
+  return await new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      void (async () => {
+        if (settled) return;
+        let diagnostics: Record<string, unknown>;
+        try { diagnostics = await onTimeout(); }
+        catch (error) {
+          diagnostics = { diagnosticError: error instanceof Error ? error.message : String(error) };
+        }
+        reject(new Error("W011_FIXTURE_WATCHDOG " + label + " " + JSON.stringify(diagnostics)));
+      })();
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Poll PG catalog to PROVE the actual blocked PID, never infer it from delay or role label. */
 async function w009ObserveWait(
-  observer: ReturnType<typeof createDb>, waiterName: string, blockerName: string,
+  observer: ReturnType<typeof createDb>,
+  waiterName: string,
+  blockerName: string,
+  stage?: W011StageWriter,
 ) {
   const deadline = Date.now() + 12_000;
-  let latest: unknown = null;
+  let latest: W011CatalogRow[] = [];
   while (Date.now() < deadline) {
-    const names = [waiterName, blockerName];
-    const rows = await observer.execute(sql.raw(
-      "SELECT a.pid,a.application_name,pg_blocking_pids(a.pid) AS blocking_pids," +
-      " a.wait_event_type,a.wait_event,a.state,LEFT(a.query,220) AS active_sql" +
-      " FROM pg_stat_activity AS a WHERE a.datname=current_database()" +
-      " AND a.application_name IN (" + names.map(n=>"'" + n.replaceAll("'","''") + "'").join(",") + ")"
-    )) as unknown as Array<{
-      pid: number; application_name: string; blocking_pids: number[];
-      wait_event_type: string | null; wait_event: string | null;
-      state: string; active_sql: string;
-    }>;
-    const waiter = rows.find(r=>r.application_name===waiterName);
-    const blocker = rows.find(r=>r.application_name===blockerName);
-    latest = {waiter,blocker};
-    if(waiter && blocker && waiter.wait_event_type==="Lock" &&
-       Array.isArray(waiter.blocking_pids) &&
-       waiter.blocking_pids.map(Number).includes(Number(blocker.pid))) {
-      const locks = await observer.execute(sql.raw(
-        "SELECT locktype,granted FROM pg_locks WHERE pid="+Number(waiter.pid)+" AND granted=false"
-      )) as unknown as Array<{locktype:string;granted:boolean}>;
-      if (locks.length) return {
-        waiterName,blockerName,waiterPid:waiter.pid,blockerPid:blocker.pid,
-        waitEvent:waiter.wait_event,blockingLockTypes:locks.map(x=>x.locktype),
-        waitSql:waiter.active_sql,blockerState:blocker.state,proven:true as const,
-      };
+    const rows = await w011ReadPgCatalog(observer, [waiterName, blockerName]);
+    latest = rows;
+    const waiters = rows.filter((row) =>
+      row.application_name === waiterName &&
+      row.wait_event_type === "Lock" &&
+      Array.isArray(row.blocking_pids) &&
+      row.blocking_pids.length > 0
+    );
+    const candidates: Array<{ waiter: W011CatalogRow; blocker: W011CatalogRow }> = [];
+    for (const waiter of waiters) {
+      for (const blockerPid of waiter.blocking_pids.map(Number)) {
+        const blocker = rows.find((row) =>
+          Number(row.pid) === blockerPid && row.application_name === blockerName
+        );
+        if (blocker) candidates.push({ waiter, blocker });
+      }
     }
-    await new Promise<void>(resolve=>setTimeout(resolve,20));
+    if (candidates.length > 1) {
+      stage?.("wait_oracle_ambiguous", { waiterName, blockerName, catalog: rows });
+      throw new Error("W011_AMBIGUOUS_WAIT_ORACLE " + JSON.stringify({
+        waiterName, blockerName,
+        candidates: candidates.map(({ waiter, blocker }) => ({ waiterPid: waiter.pid, blockerPid: blocker.pid })),
+        catalog: rows,
+      }));
+    }
+    if (candidates.length === 1) {
+      const { waiter, blocker } = candidates[0];
+      const locks = await observer.execute(sql.raw(
+        "SELECT locktype,mode,granted FROM pg_locks WHERE pid=" + Number(waiter.pid) + " AND granted=false"
+      )) as unknown as Array<{ locktype: string; mode: string; granted: boolean }>;
+      if (locks.length > 0) {
+        const evidence = {
+          waiterName,
+          blockerName,
+          waiterPid: waiter.pid,
+          blockerPid: blocker.pid,
+          waitEvent: waiter.wait_event,
+          blockingLockTypes: locks.map((row) => row.locktype),
+          blockingLockModes: locks.map((row) => row.mode),
+          waitSql: waiter.query,
+          waiterState: waiter.state,
+          blockerState: blocker.state,
+          blockerSql: blocker.query,
+          catalog: rows,
+          proven: true as const,
+        };
+        stage?.("wait_observed", evidence);
+        return evidence;
+      }
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error("W009_INVALID_WAIT_ORACLE "+JSON.stringify(latest));
+  stage?.("wait_oracle_timeout", { waiterName, blockerName, catalog: latest });
+  throw new Error("W011_INVALID_WAIT_ORACLE " + JSON.stringify({ waiterName, blockerName, catalog: latest }));
 }
 
 type W009ContentionArgs = {
