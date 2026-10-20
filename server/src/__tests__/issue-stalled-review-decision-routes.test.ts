@@ -863,9 +863,22 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       : mode.startsWith("lock_")
         ? `P04 INT2 W009 ${mode}: genuine BCD and PG lock`
         : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
+      const w011Selected = mode === "lock_runtime_d_first" || mode === "document";
+      const stage = w011StageRecorder(mode);
+      stage("before_pg_start", {
+        sourcePoolMaxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default",
+        rationale: w011Selected
+          ? "one request transaction plus one existing out-of-transaction instance-settings read"
+          : "historical topology outside W011 selected scope",
+      });
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
-      const db = createDb(cluster.connectionString, mode.startsWith("lock_")
-        ? { maxConnections: 1, applicationName: "w009-source" } : undefined);
+      stage("pg_started");
+      const db = createDb(cluster.connectionString, w011Selected
+        ? { maxConnections: 2, applicationName: "w011-source" }
+        : mode.startsWith("lock_")
+          ? { maxConnections: 1, applicationName: "w009-source" }
+          : undefined);
+      stage("source_pool_ready", { maxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default" });
       const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
       const requesterId = randomUUID(), reviewerId = randomUUID(), projectId = randomUUID();
       const evidenceBody = "Handoff memorandum: the project's delivered scope and review criteria are documented in this revision.";
@@ -884,6 +897,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       const execute = vi.fn<ServerAdapterModule["execute"]>();
       let h: ReturnType<typeof heartbeatService> | null = null;
       let createdAnchor: { id: string; details: Record<string, unknown> } | undefined;
+      let bodySucceeded = false;
       const inheritedParentId = randomUUID();
       const indirectParentMode = mode === "indirect_parent_pw_change_db" ||
         mode === "indirect_parent_pw_aba_db";
@@ -908,6 +922,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       });
 
       try {
+        stage("seed_begin");
         const now = new Date();
         await db.insert(authUsers).values([requesterId, reviewerId].map(id => ({
           id, name: "INT2 fixture authorized human", email: `int2-bcd-${id}@example.invalid`,
@@ -950,8 +965,10 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           assigneeAgentId: agentId, status: "in_progress", reviewPolicy: "human_only",
         });
         await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+        stage("seed_complete", { sourcePoolMaxConnections: w011Selected ? 2 : mode.startsWith("lock_") ? 1 : "default" });
 
         execute.mockImplementation(async input => {
+          stage("adapter_enter", { runId: input.runId });
           seenAdapterIds.push(input.runId);
           const [atEntry] = await db.select().from(issues).where(eq(issues.id, issueId));
           adapterBindings.push({
@@ -1001,11 +1018,13 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
               addresseeUserId: reviewerId,
               payload: { version: 1, prompt: "Review the exact handoff document revision." },
             }).returning();
+            stage("B_request_enter", { runId: input.runId });
             const submitted = await request(app({
               type: "agent", source: "agent_key", companyId, agentId, runId: input.runId,
             })).patch(`/api/issues/${issueId}`).send({
               status: "in_review", reviewInteractionId: interaction.id,
             });
+            stage("B_request_result", { runId: input.runId, httpStatus: submitted.status });
             expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
             const [candidate] = await db.select().from(activityLog).where(and(
               eq(activityLog.companyId, companyId),
@@ -1032,6 +1051,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             createdAnchor = {
               id: candidate!.id, details: candidate!.details as Record<string, unknown>,
             };
+            stage("B_candidate_persisted", { runId: input.runId, candidateId: candidate!.id });
             if (mode !== "missing") {
               await db.insert(documents).values({
                 id: documentId, companyId, title: "Reviewable handoff",
@@ -1069,6 +1089,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         });
         h = heartbeatService(db, {
           beforeDirectSensorAdmissionCheck: async ({ runId, issueId: actualIssueId }) => {
+            stage("admission_enter", { runId });
             seenAdmissionIds.push(runId);
             expect(actualIssueId).toBe(issueId);
             const [linked] = await db.select().from(issueDocuments).where(and(
@@ -1128,13 +1149,18 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             await db.insert(issueDocuments).values({
               companyId, issueId, documentId: admissionDocumentId, key: "sensor-admission",
             });
+            stage("admission_ready", { runId, workspaceId });
           },
         });
+        stage("heartbeat_invoke_enter");
         const queued = await h.invoke(agentId, "on_demand", {
           issueId, taskKey: issueId, skipIssueComment: true,
         }, "manual");
+        stage("heartbeat_invoke_result", { runId: queued?.id ?? null });
         expect(queued).not.toBeNull();
+        stage("C_drain_enter", { runId: queued!.id });
         await drainHeartbeatRunsToQuiescence(db, h);
+        stage("C_settled", { runId: queued!.id });
         const [dbVersion] = await db.select({ version: sql<string>`version()` })
           .from(sql`(select 1) as probe`);
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
@@ -1927,8 +1953,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             pwId: originalProjectWorkspaceId!, ewId: current!.executionWorkspaceId!,
             reviewerId, runId: run!.id, candidateId: createdAnchor!.id,
             candidateVersion: current!.statusVersion, decisionPayload,
-            originalAdapterCalls: [...seenAdapterIds],
+            originalAdapterCalls: [...seenAdapterIds], stage,
           });
+          bodySucceeded = true;
           return;
         }
         let reviewed: Awaited<ReturnType<typeof decide>>;
@@ -1938,9 +1965,11 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           competing.push(...race.filter(r => r.status !== 200).map(r => r.status));
           reviewed = race.find(r => r.status === 200) ?? race[0];
         } else {
+          if (mode === "document") stage("D_request_enter", { reviewerId });
           reviewed = mode === "generic"
             ? await request(board(reviewerId)).patch(`/api/issues/${issueId}`).send({ status: "done" })
             : await decide();
+          if (mode === "document") stage("D_request_result", { httpStatus: reviewed.status });
           if (mode === "replay" && reviewed.status === 200) {
             competing.push((await decide()).status);
           }
@@ -2043,11 +2072,34 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             expect(competing.sort(), JSON.stringify(result)).toEqual([409]);
           }
         }
+        bodySucceeded = true;
       } finally {
-        if (h) await drainHeartbeatRunsToQuiescence(db, h);
+        stage("outer_cleanup_begin", { bodySucceeded });
+        let cleanupError: unknown = null;
+        try {
+          if (h) await drainHeartbeatRunsToQuiescence(db, h);
+          stage("outer_heartbeat_drained");
+        } catch (error) {
+          cleanupError ??= error;
+          stage("outer_cleanup_error", { phase: "heartbeat_drain", error: error instanceof Error ? error.message : String(error) });
+        }
         unregisterServerAdapter("cline_local");
-        await closeRegisteredClients(cluster.connectionString);
-        await cluster.cleanup();
+        try {
+          await closeRegisteredClients(cluster.connectionString);
+          stage("outer_clients_closed");
+        } catch (error) {
+          cleanupError ??= error;
+          stage("outer_cleanup_error", { phase: "close_clients", error: error instanceof Error ? error.message : String(error) });
+        }
+        try {
+          await cluster.cleanup();
+          stage("outer_cluster_cleaned");
+        } catch (error) {
+          cleanupError ??= error;
+          stage("outer_cleanup_error", { phase: "cluster_cleanup", error: error instanceof Error ? error.message : String(error) });
+        }
+        stage("outer_cleanup_complete", { cleanupError: cleanupError instanceof Error ? cleanupError.message : cleanupError ? String(cleanupError) : null });
+        if (bodySucceeded && cleanupError) throw cleanupError;
       }
     }, 120_000);
   }
