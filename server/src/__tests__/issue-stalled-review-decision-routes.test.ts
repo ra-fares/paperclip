@@ -840,7 +840,8 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
 describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   for (const mode of [
     "missing", "document", "pre_revision_candidate", "release", "successor", "assignee_aba",
-    "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
+    "workspace_aba", "config_drift", "replay", "indirect_parent_pw_change_db",
+    "indirect_parent_pw_aba_db", "concurrent", "rollback", "generic",
     "replacement_heartbeat", "rejected_replacement_fencing",
     "project_aba", "project_workspace_aba", "execution_workspace_aba",
     "workspace_settings_aba", "execution_workspace_branch_aba_http", "project_workspace_membership_db",
@@ -873,6 +874,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       const execute = vi.fn<ServerAdapterModule["execute"]>();
       let h: ReturnType<typeof heartbeatService> | null = null;
       let createdAnchor: { id: string; details: Record<string, unknown> } | undefined;
+      const inheritedParentId = randomUUID();
+      const indirectParentMode = mode === "indirect_parent_pw_change_db" ||
+        mode === "indirect_parent_pw_aba_db";
 
       const app = (actor: Record<string, unknown>) => {
         const api = express();
@@ -955,6 +959,21 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(run?.completionContractId).toBe(receipt?.completionContractId);
           expect(run?.completionContractSha256).toBe(receipt?.completionContractSha256);
           if (!createdAnchor) {
+            if (indirectParentMode) {
+              // SQL fixture binds the inherited EW parent BEFORE genuine B.
+              // Does NOT prove this mutation is reachable through HTTP.
+              const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+              expect(sourceIssue?.projectWorkspaceId).toBeNull();
+              await db.insert(projectWorkspaces).values({
+                id: inheritedParentId, companyId, projectId, name: "W01-006 inherited PW",
+                sourceType: "local_path", cwd: process.cwd(),
+              });
+              const [bound] = await db.update(executionWorkspaces)
+                .set({ projectWorkspaceId: inheritedParentId })
+                .where(eq(executionWorkspaces.id, sourceIssue!.executionWorkspaceId!))
+                .returning();
+              expect(bound?.projectWorkspaceId).toBe(inheritedParentId);
+            }
             const [interaction] = await db.insert(issueThreadInteractions).values({
               companyId, issueId, kind: "request_confirmation", status: "pending",
               continuationPolicy: "wake_assignee",
@@ -979,6 +998,16 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             expect(candidate?.details?.completionContractId).toBe(run?.completionContractId);
             expect(candidate?.details?.completionContractSha256).toBe(run?.completionContractSha256);
             expect(candidate?.details?.sourceRunId).toBe(run?.id);
+            if (indirectParentMode) {
+              expect(candidate?.details?.directPW).toBeNull();
+              expect(candidate?.details?.executionParentPW).toEqual({
+                id: inheritedParentId, revision: "0",
+              });
+              const [boundIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+              expect(candidate?.details?.executionWorkspace).toMatchObject({
+                id: boundIssue!.executionWorkspaceId,
+              });
+            }
             expect(during?.status).toBe("in_review");
             createdAnchor = {
               id: candidate!.id, details: candidate!.details as Record<string, unknown>,
@@ -1790,6 +1819,40 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                   ? "governed_candidate_workspace_stale" : "governed_candidate_stale",
           };
         }
+        if (indirectParentMode) {
+          const [beforeParent] = await db.select().from(projectWorkspaces)
+            .where(eq(projectWorkspaces.id, inheritedParentId));
+          expect(beforeParent).toBeDefined();
+          expect(current!.projectWorkspaceId).toBeNull();
+          expect(createdAnchor!.details.executionParentPW).toEqual({
+            id: inheritedParentId, revision: beforeParent!.identityRevision,
+          });
+          await db.update(projectWorkspaces)
+            .set({ cwd: "/tmp/w01-006-alternate-parent" })
+            .where(eq(projectWorkspaces.id, inheritedParentId));
+          if (mode === "indirect_parent_pw_aba_db") {
+            await db.update(projectWorkspaces).set({ cwd: beforeParent!.cwd })
+              .where(eq(projectWorkspaces.id, inheritedParentId));
+          }
+          const [afterParent] = await db.select().from(projectWorkspaces)
+            .where(eq(projectWorkspaces.id, inheritedParentId));
+          expect(afterParent?.identityRevision).toBe(
+            (BigInt(beforeParent!.identityRevision) +
+              (mode === "indirect_parent_pw_aba_db" ? 2n : 1n)).toString(),
+          );
+          if (mode === "indirect_parent_pw_aba_db") expect(afterParent!.cwd).toBe(beforeParent!.cwd);
+          const [afterIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(afterIssue?.statusVersion).toBe(current!.statusVersion);
+          scopeTrace = {
+            mode, channel: "FIXTURE_SQL_INDIRECT_PARENT_ONLY",
+            directPW: afterIssue?.projectWorkspaceId,
+            ewId: afterIssue?.executionWorkspaceId,
+            parentId: inheritedParentId,
+            revisionB: beforeParent!.identityRevision,
+            revisionD: afterParent!.identityRevision,
+            expectedCode: "governed_candidate_stale",
+          };
+        }
         if (mode === "config_drift") {
           // Live config drift after admission must not revoke frozen B.
           await db.update(agents).set({ adapterConfig: { int2NewPreference: "after_admission" } })
@@ -1913,7 +1976,27 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         } else if (mode === "rollback") {
           expect(reviewed.status, JSON.stringify(result)).toBeGreaterThanOrEqual(500);
           expect(after?.status).toBe("in_review");
+          expect(after?.statusVersion).toBe(current!.statusVersion);
           expect(basis).toHaveLength(0);
+          const [sourceAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+          const [documentAfter] = await db.select().from(documentRevisions)
+            .where(eq(documentRevisions.id, revisionId));
+          const [candidateAfter] = await db.select().from(activityLog)
+            .where(eq(activityLog.id, createdAnchor!.id));
+          expect(sourceAfter?.status).toBe("succeeded");
+          expect(sourceAfter?.runnerProfileJson?.sensorDirectDispatchClaim).toMatchObject({
+            schema: "sensor-direct-dispatch-claim.v2", runId: run!.id,
+          });
+          expect(documentAfter).toMatchObject({
+            id: revisionId, createdByRunId: run!.id, body: evidenceBody,
+          });
+          expect(candidateAfter?.details).toMatchObject({
+            sourceRunId: run!.id,
+            workspaceRevisionSchema: "p04-workspace-identity-revision.v1",
+          });
+          const projectedDecisions = await db.select().from(statusDecisions)
+            .where(eq(statusDecisions.issueId, issueId));
+          expect(projectedDecisions).toHaveLength(0);
         } else {
           expect(reviewed.status, JSON.stringify(result)).toBe(200);
           expect(after?.status).toBe("done");
