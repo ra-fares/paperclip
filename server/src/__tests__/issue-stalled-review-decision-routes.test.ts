@@ -2677,3 +2677,202 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
     }
   }, 120_000);
 });
+
+
+type W009ContentionMode =
+  | "lock_runtime_d_first" | "lock_runtime_writer_first"
+  | "lock_retry_d_first" | "lock_retry_writer_first"
+  | "lock_forward_d_first" | "lock_forward_writer_first"
+  | "lock_quarantine_d_first" | "lock_quarantine_writer_first";
+
+function w009Deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(yes => { resolve = yes; });
+  return { promise, resolve };
+}
+
+/** Poll PG catalog to PROVE a real blocked transaction, never infer it from delay. */
+async function w009ObserveWait(
+  observer: ReturnType<typeof createDb>, waiterName: string, blockerName: string,
+) {
+  const deadline = Date.now() + 12_000;
+  let latest: unknown = null;
+  while (Date.now() < deadline) {
+    const names = [waiterName, blockerName];
+    const rows = await observer.execute(sql<{
+      pid: number; application_name: string; blocking_pids: number[];
+      wait_event_type: string | null; wait_event: string | null;
+      state: string; active_sql: string;
+    }>"SELECT a.pid,a.application_name,pg_blocking_pids(a.pid) AS blocking_pids," +
+       " a.wait_event_type,a.wait_event,a.state,LEFT(a.query,220) AS active_sql" +
+       " FROM pg_stat_activity AS a WHERE a.datname=current_database()" +
+       " AND a.application_name IN (" + names.map(n=>"'" + n.replaceAll("'","''") + "'").join(",") + ")"
+       as never);
+    const waiter = rows.find(r=>r.application_name===waiterName);
+    const blocker = rows.find(r=>r.application_name===blockerName);
+    latest = {waiter,blocker};
+    if(waiter && blocker && waiter.wait_event_type==="Lock" &&
+       Array.isArray(waiter.blocking_pids) &&
+       waiter.blocking_pids.map(Number).includes(Number(blocker.pid))) {
+      const locks = await observer.execute(sql.raw(
+        "SELECT locktype,granted FROM pg_locks WHERE pid="+Number(waiter.pid)+" AND granted=false"
+      ));
+      if (locks.length) return {
+        waiterName,blockerName,waiterPid:waiter.pid,blockerPid:blocker.pid,
+        waitEvent:waiter.wait_event,blockingLockTypes:locks.map(x=>x.locktype),
+        waitSql:waiter.active_sql,blockerState:blocker.state,proven:true as const,
+      };
+    }
+    await new Promise<void>(resolve=>setTimeout(resolve,20));
+  }
+  throw new Error("W009_INVALID_WAIT_ORACLE "+JSON.stringify(latest));
+}
+
+type W009ContentionArgs = {
+  mode:string; connectionString:string; db:ReturnType<typeof createDb>;
+  companyId:string; projectId:string; issueId:string; agentId:string;
+  pwId:string; ewId:string; reviewerId:string; runId:string;
+  candidateId:string; candidateVersion:number;
+  decisionPayload:Record<string,unknown>; originalAdapterCalls:string[];
+};
+
+/** Runs only AFTER the historical real heartbeat/issue routes pinned authentic B and terminal C. */
+async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
+  const mode=a.mode as W009ContentionMode;
+  const retry=mode.includes("retry");
+  const reconcile=mode.includes("forward")||mode.includes("quarantine");
+  const quarantine=mode.includes("quarantine");
+  const dFirst=mode.endsWith("d_first");
+  const {EventEmitter}=await import("node:events");
+  const {promisify}=await import("node:util");
+  const net=await import("node:net");
+  const writer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-writer"});
+  const reviewerDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-D"});
+  const observer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-observer"});
+  const gateDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-gate"});
+  const gateEntered=w009Deferred(),releaseGate=w009Deferred();
+  const logEntered=w009Deferred(),releaseLog=w009Deferred();
+  const foreignOwner=w009Deferred<number>();
+  const events:Array<Record<string,unknown>>=[];
+  let gateTask:Promise<unknown>|null=null, writerTask:Promise<unknown>|null=null;
+  let dTask:Promise<{status:number;body:Record<string,unknown>}>|null=null;
+  let runtimeForStop:typeof import("../services/workspace-runtime.js")|null=null;
+  let probe:import("node:net").Server|null=null,probeClosed=true;
+  let spawnCount=0,logCount=0,port=0,foreignReleased=false,mocksInstalled=false;
+  const children:Array<EventEmitter & {pid:number;exitCode:null;signalCode:null;kill:()=>boolean}>=[];
+  const beforeHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+  const fakeRegistry=new Map<string,unknown>();
+  const lockEvidence:Array<Awaited<ReturnType<typeof w009ObserveWait>>>=[];
+  const key=806000+Math.floor(Math.random()*10000);
+  const emit=(name:string,details:Record<string,unknown>={})=>events.push({name,...details});
+  const failOs=(description:string):never=>{throw new Error("W009_UNEXPECTED_OS_ACTION "+description);};
+  const fakeGitOutput=(binary:unknown,argv:unknown):string=>{
+    if(binary!=="git"||!Array.isArray(argv)||argv[0]!=="-C"||
+       typeof argv[1]!=="string"||!(argv[1] as string).startsWith("/tmp/w009-nongit-")) {
+      return failOs("git prefix "+JSON.stringify({binary,argv}));
+    }
+    const op=(argv as string[]).slice(2).join(" ");
+    const answers:Record<string,string>={
+      "rev-parse --show-toplevel":argv[1] as string,
+      "symbolic-ref --quiet --short HEAD":"w009-next",
+      "rev-parse --verify --quiet refs/heads/w009-old^{commit}":"a".repeat(40),
+      "rev-parse --verify --quiet refs/heads/w009-next^{commit}":"b".repeat(40),
+      "rev-parse HEAD":"b".repeat(40),
+    };
+    answers["merge-base --is-ancestor "+"a".repeat(40)+" "+"b".repeat(40)]="";
+    if(!(op in answers))return failOs("unknown git read "+op);
+    emit("FAKE_GIT_READ",{op});
+    return answers[op];
+  };
+  try {
+    process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
+    vi.resetModules();
+    vi.doMock("node:child_process",async importOriginal=>{
+      const actual=await importOriginal<typeof import("node:child_process")>();
+      const execFileFake=(...args:unknown[])=>{
+        const cb=args.at(-1),output=fakeGitOutput(args[0],args[1]);
+        if(typeof cb!=="function")return failOs("execFile missing callback");
+        queueMicrotask(()=>(cb as (...p:unknown[])=>void)(null,output,""));
+        return {pid:null};
+      };
+      (execFileFake as unknown as Record<symbol,unknown>)[promisify.custom]=
+        async (binary:unknown,argv:unknown)=>({stdout:fakeGitOutput(binary,argv),stderr:""});
+      return {...actual,execFile:execFileFake,
+        spawn:(binary:unknown,argv:unknown)=>{
+          if(reconcile || typeof binary!=="string"||!Array.isArray(argv)||
+             argv.length!==2||argv[0]!=="-lc"||
+             argv[1]!=="W008_INERT_COMMAND_MUST_NOT_EXECUTE") {
+            return failOs("unplanned spawn "+JSON.stringify({binary,argv}));
+          }
+          if(++spawnCount>(retry?2:1))return failOs("spawn count exceeded");
+          const child=Object.assign(new EventEmitter(),{
+            pid:89000+spawnCount,exitCode:null as null,signalCode:null as null,kill:()=>true,
+          });
+          children.push(child);emit("FAKE_SPAWN",{pid:child.pid,number:spawnCount});
+          return child;
+        },
+      };
+    });
+    vi.doMock("../services/local-service-supervisor.js",async importOriginal=>({
+      ...(await importOriginal<typeof import("../services/local-service-supervisor.js")>()),
+      openLocalServiceLogFile:async()=>{
+        if(reconcile)return failOs("runtime log in reconcile");
+        ++logCount;emit("LOG_WITH_LOCKS",{count:logCount});
+        if(!dFirst&&((!retry&&logCount===1)||(retry&&logCount===2))) {
+          logEntered.resolve();await releaseLog.promise;
+        }
+        return {handle:{fd:2,close:async()=>undefined},logPath:"/dev/null",startOffset:0};
+      },
+      findLocalServiceRegistryRecordByRuntimeServiceId:async()=>null,
+      findAdoptableLocalService:async()=>null,
+      readLocalServicePortOwner:async (lookedUpPort:number)=>{
+        if(reconcile)return failOs("port lookup in reconcile");
+        if(spawnCount===0)return null;
+        if(retry&&spawnCount===1&&lookedUpPort===port&&!foreignReleased){
+          emit("PRIVATE_BIND_CHECK_ENTERED",{port:lookedUpPort});
+          return await foreignOwner.promise;
+        }
+        if(retry&&spawnCount===1)return null;
+        if(!children.at(-1))return failOs("owner query without fake child");
+        return children.at(-1)!.pid;
+      },
+      isLocalServiceProcessOwnedBy:async (actualPid:number,childPid:number)=>actualPid===childPid,
+      isLocalServiceProcessInWorkspace:async()=>false,
+      readLocalServiceProcessCwd:async()=>null,
+      readLocalServiceProcessGroupId:async()=>null,
+      writeLocalServiceRegistryRecord:async (x:{serviceKey:string})=>{
+        fakeRegistry.set(x.serviceKey,x);emit("FAKE_REGISTRY_WRITE");
+      },
+      removeLocalServiceRegistryRecord:async (name:string)=>{
+        fakeRegistry.delete(name);emit("FAKE_REGISTRY_REMOVE");
+      },
+      touchLocalServiceRegistryRecord:async()=>undefined,
+      terminateLocalService:async()=>{emit("FAKE_TERMINATE");},
+    }));
+    vi.doMock("../services/workspace-git-operation-scheduler.js",async importOriginal=>({
+      ...(await importOriginal<typeof import("../services/workspace-git-operation-scheduler.js")>()),
+      workspaceGitOperationScheduler:{
+        run:async (input:{operation:string;args:readonly string[];workspacePath:string})=>{
+          if(input.operation!=="execution_workspaces.branch_reconcile_status"||
+             input.args.join(" ")!=="status --porcelain --untracked-files=all"||
+             !input.workspacePath.startsWith("/tmp/w009-nongit-")) {
+            return failOs("unexpected git scheduler "+JSON.stringify(input));
+          }
+          emit("FAKE_GIT_STATUS",{dirty:quarantine});
+          return {stdout:quarantine?" M w009-dirty-file\n":"",stderr:"",
+            canonicalWorkspacePath:input.workspacePath,workspaceHash:"w009",
+            cacheHit:false,singleFlightJoined:false};
+        }
+      },
+    }));
+    if(quarantine)vi.doMock("../services/workspace-runtime.js",async importOriginal=>({
+      ...(await importOriginal<typeof import("../services/workspace-runtime.js")>()),
+      ensureGitWorktreeBranchCoherent:async()=>{
+        emit("PRE_TX_RESCUE_STUB");
+        return {dirtyQuarantineRepair:{
+          rescueBranch:"w009-rescue",rescueCommitSha:"c".repeat(40),fileCount:1,
+          sourceAuditCommentId:null,claimantAuditCommentId:null,
+        }};
+      },
+    }));
+    mocksInstalled=true;
