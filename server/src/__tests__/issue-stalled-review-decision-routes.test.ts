@@ -29,6 +29,7 @@ import {
   nativeRunFinalizations,
   nativeRunResults,
   projects,
+  projectWorkspaces,
   statusDecisions,
   statusDecisionEffects,
   workAssessments,
@@ -840,6 +841,10 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
     "missing", "document", "release", "successor", "assignee_aba",
     "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
     "replacement_heartbeat", "rejected_replacement_fencing",
+    "project_aba", "project_workspace_aba", "execution_workspace_aba",
+    "workspace_settings_aba", "project_workspace_membership_db",
+    "project_workspace_membership_aba_db", "execution_workspace_membership_db",
+    "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
   ] as const) {
     it(`P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
@@ -898,8 +903,24 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           status: "idle", adapterType: "cline_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
         });
         await db.insert(projects).values({ id: projectId, companyId, name: "INT2 safe project" });
+        const projectWorkspaceMembershipMode =
+          mode === "project_workspace_membership_db" ||
+          mode === "project_workspace_membership_aba_db";
+        const originalProjectWorkspaceId = projectWorkspaceMembershipMode ? randomUUID() : null;
+        if (originalProjectWorkspaceId) {
+          // The bound project workspace MUST exist at original genuine B:
+          // changing a newly attached post-B row alone would test the
+          // candidate's NULL binding, not project-workspace membership.
+          await db.insert(projectWorkspaces).values({
+            id: originalProjectWorkspaceId, companyId, projectId,
+            name: "INT2 bound project workspace", sourceType: "local_path",
+            cwd: process.cwd(),
+          });
+        }
         await db.insert(issues).values({
-          id: issueId, companyId, projectId, title: "Produce a reviewable handoff document",
+          id: issueId, companyId, projectId,
+          projectWorkspaceId: originalProjectWorkspaceId,
+          title: "Produce a reviewable handoff document",
           description: "Document the project handoff memorandum and its delivered scope.",
           assigneeAgentId: agentId, status: "in_progress", reviewPolicy: "human_only",
         });
@@ -1396,6 +1417,164 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(again!.executionWorkspacePreference).toBe(initialPreference);
           expect(again!.statusVersion).toBeGreaterThan(current!.statusVersion);
         }
+        const identityModes = [
+          "project_aba", "project_workspace_aba", "execution_workspace_aba",
+          "workspace_settings_aba", "project_workspace_membership_db",
+          "project_workspace_membership_aba_db", "execution_workspace_membership_db",
+          "execution_workspace_identity_db", "execution_workspace_identity_aba_db",
+        ] as const;
+        type IdentityMode = (typeof identityModes)[number];
+        const isIdentity = (value: string): value is IdentityMode =>
+          (identityModes as readonly string[]).includes(value);
+        let scopeTrace: Record<string, unknown> | null = null;
+        if (isIdentity(mode)) {
+          const mutations: Array<Record<string, unknown>> = [];
+          const initialVersion = current!.statusVersion;
+          const initial = {
+            projectId: current!.projectId,
+            projectWorkspaceId: current!.projectWorkspaceId,
+            executionWorkspaceId: current!.executionWorkspaceId,
+            executionWorkspacePreference: current!.executionWorkspacePreference,
+            executionWorkspaceSettings: current!.executionWorkspaceSettings,
+          };
+          const capture = async (phase: string) => {
+            const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+            const snapshot = {
+              phase, status: row!.status, statusVersion: row!.statusVersion,
+              projectId: row!.projectId, projectWorkspaceId: row!.projectWorkspaceId,
+              executionWorkspaceId: row!.executionWorkspaceId,
+              executionWorkspacePreference: row!.executionWorkspacePreference,
+              executionWorkspaceSettings: row!.executionWorkspaceSettings,
+            };
+            mutations.push(snapshot);
+            return row!;
+          };
+          const patchHttp = async (phase: string, fields: Record<string, unknown>) => {
+            const response = await request(board(requesterId)).patch(`/api/issues/${issueId}`).send(fields);
+            mutations.push({ phase: phase + "_HTTP", responseStatus: response.status, responseBody: response.body });
+            expect(response.status, JSON.stringify(mutations)).toBe(200);
+            return capture(phase);
+          };
+          await capture("before_identity_change");
+
+          if (mode === "project_aba") {
+            const otherProjectId = randomUUID();
+            await db.insert(projects).values({ id: otherProjectId, companyId, name: "INT2 alternate project" });
+            const middle = await patchHttp("changed_project", {
+              projectId: otherProjectId, projectWorkspaceId: null, executionWorkspaceId: null,
+            });
+            expect(middle.projectId).toBe(otherProjectId);
+            const restored = await patchHttp("restored_project", {
+              projectId, projectWorkspaceId: initial.projectWorkspaceId,
+              executionWorkspaceId: initial.executionWorkspaceId,
+            });
+            expect(restored.projectId).toBe(initial.projectId);
+            expect(restored.executionWorkspaceId).toBe(initial.executionWorkspaceId);
+          } else if (mode === "project_workspace_aba") {
+            expect(initial.projectWorkspaceId).toBeNull();
+            const pw = randomUUID();
+            await db.insert(projectWorkspaces).values({
+              id: pw, companyId, projectId, name: "INT2 alternate PW",
+              sourceType: "local_path", cwd: process.cwd(),
+            });
+            const middle = await patchHttp("attached_project_workspace", { projectWorkspaceId: pw });
+            expect(middle.projectWorkspaceId).toBe(pw);
+            const restored = await patchHttp("restored_project_workspace", { projectWorkspaceId: null });
+            expect(restored.projectWorkspaceId).toBeNull();
+          } else if (mode === "execution_workspace_aba") {
+            expect(initial.executionWorkspaceId).toBeTruthy();
+            const [source] = await db.select().from(executionWorkspaces)
+              .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+            expect(source).toBeDefined();
+            const alternate = randomUUID();
+            await db.insert(executionWorkspaces).values({
+              ...source!, id: alternate, name: "INT2 alternate execution workspace",
+              branchName: "int2-alternate-workspace",
+            });
+            const middle = await patchHttp("attached_execution_workspace", { executionWorkspaceId: alternate });
+            expect(middle.executionWorkspaceId).toBe(alternate);
+            const restored = await patchHttp("restored_execution_workspace", {
+              executionWorkspaceId: initial.executionWorkspaceId,
+            });
+            expect(restored.executionWorkspaceId).toBe(initial.executionWorkspaceId);
+          } else if (mode === "workspace_settings_aba") {
+            const settings = {
+              ...(initial.executionWorkspaceSettings ?? {}),
+              workspaceRuntime: {
+                ...((initial.executionWorkspaceSettings as
+                  Record<string, unknown> | null)?.workspaceRuntime as Record<string, unknown> ?? {}),
+                int2WorkspaceSettingsMarker: "alternate",
+              },
+            };
+            const middle = await patchHttp("changed_workspace_settings", { executionWorkspaceSettings: settings });
+            expect(middle.executionWorkspaceSettings).not.toEqual(initial.executionWorkspaceSettings);
+            const restored = await patchHttp("restored_workspace_settings", {
+              executionWorkspaceSettings: initial.executionWorkspaceSettings,
+            });
+            expect(restored.executionWorkspaceSettings).toEqual(initial.executionWorkspaceSettings);
+          } else {
+            // DB-only defense probe. It never proves an authorized mutation
+            // lifecycle and deliberately does not bump issues.statusVersion.
+            const otherProjectId = randomUUID();
+            if (mode.includes("membership")) {
+              await db.insert(projects).values({
+                id: otherProjectId, companyId, name: "INT2 DB relation foreign project",
+              });
+            }
+            if (mode.startsWith("project_workspace_membership")) {
+              expect(originalProjectWorkspaceId).toBeTruthy();
+              await db.update(projectWorkspaces).set({ projectId: otherProjectId })
+                .where(eq(projectWorkspaces.id, originalProjectWorkspaceId!));
+              mutations.push({ phase: "db_project_workspace_relation_changed", projectId: otherProjectId });
+              if (mode === "project_workspace_membership_aba_db") {
+                await db.update(projectWorkspaces).set({ projectId })
+                  .where(eq(projectWorkspaces.id, originalProjectWorkspaceId!));
+                mutations.push({ phase: "db_project_workspace_relation_restored", projectId });
+              }
+            } else {
+              expect(initial.executionWorkspaceId).toBeTruthy();
+              if (mode === "execution_workspace_membership_db") {
+                await db.update(executionWorkspaces).set({ projectId: otherProjectId })
+                  .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+                mutations.push({ phase: "db_execution_workspace_project_changed", projectId: otherProjectId });
+              } else {
+                const [workspace] = await db.select().from(executionWorkspaces)
+                  .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+                const alternateBranch = workspace!.branchName === "int2-alternate-identity"
+                  ? "int2-other-identity" : "int2-alternate-identity";
+                await db.update(executionWorkspaces).set({ branchName: alternateBranch })
+                  .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+                mutations.push({ phase: "db_execution_workspace_identity_changed", branchName: alternateBranch });
+                if (mode === "execution_workspace_identity_aba_db") {
+                  await db.update(executionWorkspaces).set({ branchName: workspace!.branchName })
+                    .where(eq(executionWorkspaces.id, initial.executionWorkspaceId!));
+                  mutations.push({ phase: "db_execution_workspace_identity_restored", branchName: workspace!.branchName });
+                }
+              }
+            }
+            const afterDb = await capture("after_db_defense_probe");
+            expect(afterDb.statusVersion).toBe(initialVersion);
+          }
+          const finalScope = await capture("after_all_mutations");
+          if (mode.endsWith("_aba") || mode.endsWith("_aba_db")) {
+            expect(finalScope.projectId).toBe(initial.projectId);
+            expect(finalScope.projectWorkspaceId).toBe(initial.projectWorkspaceId);
+            expect(finalScope.executionWorkspaceId).toBe(initial.executionWorkspaceId);
+            expect(finalScope.executionWorkspacePreference).toBe(initial.executionWorkspacePreference);
+            expect(finalScope.executionWorkspaceSettings).toEqual(initial.executionWorkspaceSettings);
+          }
+          if (!mode.endsWith("_db")) {
+            expect(finalScope.statusVersion, JSON.stringify(mutations)).toBeGreaterThan(initialVersion);
+          }
+          scopeTrace = {
+            channel: mode.endsWith("_db") ? "DB_ONLY_DEFENSE_NOT_LIFECYCLE" : "AUTHORIZED_HTTP_PATCH",
+            originalCandidateId: createdAnchor!.id,
+            originalCandidateVersion: initialVersion,
+            initial, mutations,
+            expectedCode: mode.endsWith("_db") && !mode.endsWith("_aba_db")
+              ? "governed_candidate_workspace_stale" : "governed_candidate_stale",
+          };
+        }
         if (mode === "config_drift") {
           // Live config drift after admission must not revoke frozen B.
           await db.update(agents).set({ adapterConfig: { int2NewPreference: "after_admission" } })
@@ -1461,16 +1640,29 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           observedRuns: observedRunsAfter.map(r => ({ id: r.id, status: r.status })), competing,
           adapterCalls: seenAdapterIds, admissionChecks: seenAdmissionIds,
           reviewerHttp: reviewed.status, response: reviewed.body,
-          after: after?.status, acceptedAuditRows: basis.length,
+          after: after?.status, afterVersion: after?.statusVersion,
+          acceptedAuditRows: basis.length, scopeTrace,
         };
         console.info("INT2_BCD_OBSERVATION " + JSON.stringify(result));
+        if (scopeTrace && process.env.INT2_SCOPE_EVIDENCE_DIR) {
+          writeFileSync(
+            `${process.env.INT2_SCOPE_EVIDENCE_DIR}/scope-${mode}-observation.json`,
+            JSON.stringify(result, null, 2) + "\n",
+            { encoding: "utf8", flag: "wx" },
+          );
+        }
         if (mode === "missing") {
           expect(reviewed.status, JSON.stringify(result)).toBe(422);
           expect(reviewed.body.details?.code, JSON.stringify(result)).toBe("criterion_evidence_missing");
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);
-        } else if (mode === "successor" || mode === "assignee_aba" || mode === "workspace_aba" || mode === "generic") {
+        } else if (mode === "successor" || mode === "assignee_aba" ||
+            mode === "workspace_aba" || mode === "generic" || scopeTrace) {
           expect(reviewed.status, JSON.stringify(result)).toBe(409);
+          if (mode === "workspace_aba" || scopeTrace) {
+            expect(reviewed.body.details?.code, JSON.stringify(result))
+              .toBe(scopeTrace?.expectedCode ?? "governed_candidate_stale");
+          }
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);
         } else if (mode === "rollback") {

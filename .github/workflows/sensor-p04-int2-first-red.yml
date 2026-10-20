@@ -96,16 +96,17 @@ jobs:
           # heartbeat scenario. The native corpus's ordinary commit+rollback
           # is separately reported as an existing regression, not INT2 proof.
           export INT2_NATIVE_TX_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
-          run_named nativegoverned src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 NATIVE_TX'
-          run_named nativebaseline src/__tests__/native-status-arbiter-corpus.test.ts 'retires a proven automatic review and applies the current successful completion exactly once'
+          export INT2_SCOPE_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
+          run_named scope src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD (project_aba|project_workspace_aba|execution_workspace_aba|workspace_settings_aba|project_workspace_membership_db|project_workspace_membership_aba_db|execution_workspace_membership_db|execution_workspace_identity_db|execution_workspace_identity_aba_db):'
+          run_named controls src/__tests__/issue-stalled-review-decision-routes.test.ts 'P04 INT2 BCD (document|config_drift|workspace_aba):'
       - name: Classify executed assertions (skips always NOT_RUN)
         run: |
           node <<'NODE'
           const fs=require("node:fs");
           const dir=".int2-evidence";
           const cases={
-            nativegoverned:["positive","wrong_authority","rollback"].map(mode=>"P04 INT2 NATIVE_TX "+mode+": committer-owned governed status decision"),
-            nativebaseline:["retires a proven automatic review and applies the current successful completion exactly once"]
+            scope:["project_aba","project_workspace_aba","execution_workspace_aba","workspace_settings_aba","project_workspace_membership_db","project_workspace_membership_aba_db","execution_workspace_membership_db","execution_workspace_identity_db","execution_workspace_identity_aba_db"].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer"),
+            controls:["document","config_drift","workspace_aba"].map(mode=>"P04 INT2 BCD "+mode+": actual admitted run and independent reviewer")
           };
           const output={};
           let bad=fs.readFileSync(dir+"/typecheck.exit_code","utf8").trim()!=="0";
@@ -145,23 +146,26 @@ jobs:
               numFailedTests:doc?.numFailedTests??null,groupFailed,checks,
             };
           }
-          // Native observations are required even though Vitest JSON reporter
-          // hides passing test console messages. One file for each real mode.
-          output.nativeEvidence={};
-          for(const mode of ["positive","wrong_authority","rollback"]){
+          // Save and classify each completed scope observation; a failed
+          // test is never rewritten as PASS. A missing trace is NOT_RUN.
+          output.scopeEvidence={};
+          for(const mode of ["project_aba","project_workspace_aba","execution_workspace_aba","workspace_settings_aba","project_workspace_membership_db","project_workspace_membership_aba_db","execution_workspace_membership_db","execution_workspace_identity_db","execution_workspace_identity_aba_db"]){
+            const file=dir+"/scope-"+mode+"-observation.json";
             let row=null,error=null;
-            const file=dir+"/native-"+mode+"-observation.json";
             try{row=JSON.parse(fs.readFileSync(file,"utf8"))}catch(e){error=String(e)}
-            const expectedDone=mode==="positive";
-            const valid=!error && row?.mode===mode &&
-              row?.issueStatus===(expectedDone?"done":"in_review") &&
-              row?.issueStatusVersion===(expectedDone?1:0) &&
-              row?.decisions?.length===(mode==="wrong_authority"?1:expectedDone?1:0) &&
-              row?.coordinators?.length===(mode==="wrong_authority"?2:1) &&
-              (expectedDone ? row?.effects?.some(e=>e.effectKind==="issue_status_projection") : row?.effects?.length===0);
-            output.nativeEvidence[mode]={file,error,valid,issueStatus:row?.issueStatus,
-              issueStatusVersion:row?.issueStatusVersion,
-              decisions:row?.decisions?.length??null,effects:row?.effects?.length??null};
+            const httpMode=!mode.endsWith("_db");
+            const expectedCode=httpMode?"governed_candidate_stale":
+              mode.endsWith("_aba_db")?"governed_candidate_stale":"governed_candidate_workspace_stale";
+            const valid=!error && row?.mode===mode && row?.reviewerHttp===409 &&
+              row?.response?.details?.code===expectedCode &&
+              row?.acceptedAuditRows===0 && row?.after==="in_review" &&
+              row?.candidateStatusVersion===row?.scopeTrace?.originalCandidateVersion &&
+              row?.scopeTrace?.channel===(httpMode?"AUTHORIZED_HTTP_PATCH":"DB_ONLY_DEFENSE_NOT_LIFECYCLE");
+            output.scopeEvidence[mode]={file,error,valid,expectedCode,
+              code:row?.response?.details?.code??null,
+              reviewerHttp:row?.reviewerHttp??null,
+              finalStatus:row?.after??null,finalVersion:row?.afterVersion??null,
+              observations:row?.scopeTrace?.mutations?.length??null};
             if(!valid)bad=true;
           }
           output.overall=bad?"FAIL_OR_NOT_RUN":"PASS";
