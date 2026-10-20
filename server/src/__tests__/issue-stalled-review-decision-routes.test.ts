@@ -1069,6 +1069,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
               });
             }
           }
+          stage("adapter_return",{runId:input.runId});
           return {
             exitCode: 0, signal: null, timedOut: false,
             provider: "cline", model: "safe-spy-only",
@@ -1953,7 +1954,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             pwId: originalProjectWorkspaceId!, ewId: current!.executionWorkspaceId!,
             reviewerId, runId: run!.id, candidateId: createdAnchor!.id,
             candidateVersion: current!.statusVersion, decisionPayload,
-            originalAdapterCalls: [...seenAdapterIds], stage,
+            originalAdapterCalls: [...seenAdapterIds],
+            sourcePoolMaxConnections: w011Selected ? 2 : 1,
+            stage,
           });
           bodySucceeded = true;
           return;
@@ -2830,6 +2833,8 @@ async function w011Watchdog<T>(
         catch (error) {
           diagnostics = { diagnosticError: error instanceof Error ? error.message : String(error) };
         }
+        if (settled) return;
+        settled = true;
         reject(new Error("W011_FIXTURE_WATCHDOG " + label + " " + JSON.stringify(diagnostics)));
       })();
     }, timeoutMs);
@@ -2920,6 +2925,7 @@ type W009ContentionArgs = {
   pwId:string; ewId:string; reviewerId:string; runId:string;
   candidateId:string; candidateVersion:number;
   decisionPayload:Record<string,unknown>; originalAdapterCalls:string[];
+  sourcePoolMaxConnections:number;
   stage: W011StageWriter;
 };
 
@@ -2939,7 +2945,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const observer=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-observer"});
   const gateDb=createDb(a.connectionString,{maxConnections:1,applicationName:"w009-gate"});
   stage("contention_pools_ready", {
-    sourcePoolMaxConnections: 2,
+    sourcePoolMaxConnections: a.sourcePoolMaxConnections,
     writerPoolMaxConnections: 1,
     reviewerPoolMaxConnections: 2,
     observerPoolMaxConnections: 1,
@@ -3377,10 +3383,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
 
     const rolePools=[reviewerDb,writer,gateDb];
     let forcedPoolsClosed=false;
+    let forcedCloseTask:Promise<unknown>|null=null;
     const forceCloseTimer=setTimeout(()=>{
       forcedPoolsClosed=true;
       stage("contention_role_pool_force_close",{pending:pendingState()});
-      void Promise.all(rolePools.map((roleDb)=>roleDb.$client.end({timeout:1}).catch((error:unknown)=>{
+      forcedCloseTask=Promise.all(rolePools.map((roleDb)=>roleDb.$client.end({timeout:1}).catch((error:unknown)=>{
         cleanupErrors.push(error);
         stage("contention_cleanup_error",{phase:"role_pool_force_close",error:error instanceof Error?error.message:String(error)});
       })));
@@ -3389,6 +3396,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     const launched=[dTask,writerTask,gateTask].filter((p):p is Promise<unknown>=>p!==null);
     const settlements=await Promise.allSettled(launched);
     clearTimeout(forceCloseTimer);
+    if(forcedCloseTask)await forcedCloseTask;
     stage("contention_tasks_settled",{pending:pendingState(),forcedPoolsClosed,settlements:settlements.map((result)=>result.status)});
 
     try{await runtimeForStop?.resetRuntimeServicesForTests({terminateProcesses:true});}
