@@ -1,17 +1,17 @@
-# W01-009 single saved CI run: full 16-case scoped PostgreSQL lock acceptance.
-name: Sensor P04 W01-009 native lock fences
+# W01-010 fresh single CI run: full 16-case scoped PostgreSQL lock acceptance.
+name: Sensor P04 W01-010 fixture verification
 on:
   push:
-    branches: [codex/w01-009-int2-lock-fences]
+    branches: [codex/w01-010-int2-fixture-verification]
     paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-w01-009-final
+  group: sensor-p04-w01-010-final
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-009-int2-lock-fences'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-010-int2-fixture-verification'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -28,11 +28,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence "$RUNNER_TEMP/w01-009-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-009-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence "$RUNNER_TEMP/w01-010-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-010-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git merge-base --is-ancestor 4ad68c2f2f273e24ee7a217ec115fa6d5ef72edc HEAD
-          git diff --name-only 4ad68c2f2f273e24ee7a217ec115fa6d5ef72edc HEAD | tee .int2-evidence/changed-files.txt
+          git merge-base --is-ancestor 16a445dd424026ed9a6e692925852aeb2eb8c511 HEAD
+          git diff --name-only 16a445dd424026ed9a6e692925852aeb2eb8c511 HEAD | tee .int2-evidence/changed-files.txt
           while IFS= read -r p; do
             case "$p" in
               server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
@@ -40,8 +40,8 @@ jobs:
             esac
           done < .int2-evidence/changed-files.txt
           test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
-          test -z "$(git diff --diff-filter=D --name-only 4ad68c2f2f273e24ee7a217ec115fa6d5ef72edc HEAD)"
-          printf 'BASE=4ad68c2f2f273e24ee7a217ec115fa6d5ef72edc\nSHA=%s\nRUN=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > .int2-evidence/identity.txt
+          test -z "$(git diff --diff-filter=D --name-only 16a445dd424026ed9a6e692925852aeb2eb8c511 HEAD)"
+          printf 'BASE=16a445dd424026ed9a6e692925852aeb2eb8c511\nSHA=%s\nRUN=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > .int2-evidence/identity.txt
           git status --short --untracked-files=all > .int2-evidence/initial-git-status.txt
           sha256sum server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
       - name: Set up Node 24
@@ -60,8 +60,16 @@ jobs:
           set -euo pipefail
           node --version | tee .int2-evidence/node-version.txt
           pnpm --version | tee .int2-evidence/pnpm-version.txt
-          pnpm install --frozen-lockfile > .int2-evidence/install.stdout 2> .int2-evidence/install.stderr
-          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps > .int2-evidence/sdk.stdout 2> .int2-evidence/sdk.stderr
+          set +e
+          pnpm install --frozen-lockfile 2>&1 | tee .int2-evidence/install.log
+          install_code=${PIPESTATUS[0]}
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps 2>&1 | tee .int2-evidence/sdk.log
+          sdk_code=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$install_code" > .int2-evidence/install.exit_code
+          printf '%s\n' "$sdk_code" > .int2-evidence/sdk.exit_code
+          test "$install_code" -eq 0
+          test "$sdk_code" -eq 0
           test -f server/node_modules/vitest/vitest.mjs
       - name: Migration integrity, server typecheck and sixteen exact real-PG selectors
         shell: bash
@@ -158,17 +166,26 @@ jobs:
               failures:matches.flatMap(t=>t.failureMessages??[])};
             if(!pass)invalid=true;
           }
-          for(const mode of ['lock_runtime_d_first','lock_runtime_writer_first',
-              'lock_retry_d_first','lock_retry_writer_first',
-              'lock_forward_d_first','lock_forward_writer_first',
-              'lock_quarantine_d_first','lock_quarantine_writer_first']){
+          const expectedRoles={
+            lock_runtime_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
+            lock_retry_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
+            lock_forward_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
+            lock_quarantine_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
+            lock_runtime_writer_first:[['w009-D','w009-writer']],
+            lock_retry_writer_first:[['w009-D','w009-writer']],
+            lock_forward_writer_first:[['w009-writer','w009-gate'],['w009-D','w009-writer']],
+            lock_quarantine_writer_first:[['w009-writer','w009-gate'],['w009-D','w009-writer']],
+          };
+          for(const [mode,roles] of Object.entries(expectedRoles)){
             const d=json('lock-'+mode+'.json'),locks=d?.lockEvidence??[];
-            const expected=mode.endsWith('d_first')?2:1;
+            const observed=Array.isArray(locks)
+              ? locks.map(l=>[l.waiterName,l.blockerName]) : [];
+            const roleMatch=JSON.stringify(observed)===JSON.stringify(roles);
             const okay=d?.mode===mode&&d?.sourceRunId&&d?.candidateId&&
-              Array.isArray(locks)&&locks.length===expected&&locks.every(l=>
+              Array.isArray(locks)&&locks.length===roles.length&&roleMatch&&locks.every(l=>
                 l.proven===true&&Number(l.waiterPid)>0&&Number(l.blockerPid)>0&&
                 Array.isArray(l.blockingLockTypes)&&l.blockingLockTypes.length>0);
-            out.lockOracles[mode]=Boolean(okay);
+            out.lockOracles[mode]={okay:Boolean(okay),expectedRoles:roles,observedRoles:observed};
             if(!okay)invalid=true;
           }
           for(const name of ['parent','source']){
@@ -208,11 +225,12 @@ jobs:
             documentOracle:out.documentOracle},null,2));
           if(invalid)process.exitCode=1;
           NODE
-      - name: Always upload W009 original evidence, including failure and NOT_RUN
+          find .int2-evidence -type f ! -name evidence-sha256.txt -print0 | sort -z | xargs -0 sha256sum > .int2-evidence/evidence-sha256.txt
+      - name: Always upload W010 original evidence, including failure and NOT_RUN
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: w01-009-final-evidence
+          name: w01-010-final-evidence
           path: .int2-evidence/
           include-hidden-files: true
           if-no-files-found: warn
