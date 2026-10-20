@@ -1,6 +1,7 @@
 import {
   boolean,
   index,
+  customType,
   jsonb,
   pgTable,
   text,
@@ -15,6 +16,12 @@ export const projectWorkspaces = pgTable(
   "project_workspaces",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    // DB trigger owns this monotonic token. Keep INT8 lossless across JSON/API boundaries.
+    identityRevision: customType<{ data: string; driverData: string }>({
+      dataType: () => "bigint",
+      fromDriver: (value) => String(value),
+      toDriver: (value) => value,
+    })("identity_revision").notNull().default("0"),
     companyId: uuid("company_id").notNull().references(() => companies.id),
     projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
