@@ -2489,7 +2489,11 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
 
       // Real entrypoint and PRIVATE bind-collision class remain untouched.
       // Only operating-system service side effects are replaced.
+      const { existsSync } = await import("node:fs");
+      const syntheticCwd = "/tmp/w008-nongit-" + pwId;
+      expect(existsSync(syntheticCwd)).toBe(false);
       vi.resetModules();
+      mocksInstalled = true;
       vi.doMock("node:child_process", async importOriginal => ({
         ...(await importOriginal<typeof import("node:child_process")>()),
         spawn: (...args: unknown[]) => {
@@ -2544,9 +2548,8 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         readLocalServiceProcessCwd: async () => null,
         readLocalServiceProcessGroupId: async () => null,
       }));
-      mocksInstalled = true;
       const runtime = await import("../services/workspace-runtime.js");
-      const cwd = "/tmp/w008-nongit-" + pwId;
+      const cwd = syntheticCwd;
       const service = {
         name: "w008-inert-safe-process",
         command: "W008_INERT_COMMAND_MUST_NOT_EXECUTE",
@@ -2596,6 +2599,12 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
           id: x.id, status: x.status, port: x.port, healthStatus: x.healthStatus,
         })) };
       console.info("INT2_W008_NATIVE_COLLISION " + JSON.stringify(diagnostics));
+      // CI evidence is written only by the later approved workflow if this
+      // selector is actually executed and observed; never treat absence as PASS.
+      if (process.env.INT2_W008_COLLISION_OBSERVATION_PATH) {
+        writeFileSync(process.env.INT2_W008_COLLISION_OBSERVATION_PATH,
+          JSON.stringify(diagnostics, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
+      }
       expect(spawnCount, JSON.stringify(diagnostics)).toBe(2);
       expect(failed?.status, JSON.stringify(diagnostics)).toBe("stopped");
       expect(newRunning?.port, JSON.stringify(diagnostics)).not.toBe(port);
