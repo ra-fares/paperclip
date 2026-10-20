@@ -2046,6 +2046,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       } finally {
         if (h) await drainHeartbeatRunsToQuiescence(db, h);
         unregisterServerAdapter("cline_local");
+        await closeRegisteredClients(cluster.connectionString);
         await cluster.cleanup();
       }
     }, 120_000);
@@ -2695,6 +2696,13 @@ function w009Deferred<T = void>() {
   const promise = new Promise<T>(yes => { resolve = yes; });
   return { promise, resolve };
 }
+async function w009Watchdog<T>(promise:Promise<T>,label:string):Promise<T> {
+  return await new Promise<T>((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error("W009_FIXTURE_WATCHDOG "+label)),12000);
+    promise.then(value=>{clearTimeout(timer);resolve(value);},
+      error=>{clearTimeout(timer);reject(error);});
+  });
+}
 
 /** Poll PG catalog to PROVE a real blocked transaction, never infer it from delay. */
 async function w009ObserveWait(
@@ -2793,6 +2801,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   try {
     process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
     vi.resetModules();
+    mocksInstalled=true;
     vi.doMock("node:child_process",async importOriginal=>{
       const actual=await importOriginal<typeof import("node:child_process")>();
       const execFileFake=(...args:unknown[])=>{
@@ -2884,7 +2893,6 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         }};
       },
     }));
-    mocksInstalled=true;
 
     const dynamicRoutes = (await import("../routes/issues.js")).issueRoutes;
     const realReconcile = (await import("../services/execution-workspaces.js")).executionWorkspaceService;
@@ -2922,7 +2930,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         finally {await tx.execute(sql.raw("SELECT pg_advisory_unlock("+key+")"));}
       });
       void gateTask.catch(()=>undefined);
-      await gateEntered.promise;
+      await w009Watchdog(gateEntered.promise,"advisory_gate_claim");
     };
     const condition="NEW.id = '"+a.issueId+"'::uuid";
     if(dFirst) {
@@ -3030,7 +3038,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
           await firstCommitted();
           foreignReleased=true;foreignOwner.resolve(99001);
         }
-        await logEntered.promise; // real TX has already acquired PW/EW
+        await w009Watchdog(logEntered.promise,"real_parent_locked_log_hook"); // TX locks already acquired
       }
       launchD();
       lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-writer"));
@@ -3066,6 +3074,9 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     expect(lockEvidence.length,JSON.stringify(finding)).toBe(dFirst?2:1);
     expect(lockEvidence.every(x=>x.proven),JSON.stringify(finding)).toBe(true);
     expect(runs.map(r=>r.id),JSON.stringify(finding)).toContain(a.runId);
+    const issueScopedRuns=runs.filter(r=>r.contextSnapshot?.issueId===a.issueId);
+    expect(issueScopedRuns.map(r=>r.id),JSON.stringify(finding)).toEqual([a.runId]);
+    expect(a.originalAdapterCalls.filter(id=>id===a.runId),JSON.stringify(finding)).toHaveLength(1);
     if(reconcile&&!dFirst){
       expect(dResult.status,JSON.stringify(finding)).toBe(409);
       expect(afterIssue?.status,JSON.stringify(finding)).toBe("in_review");
