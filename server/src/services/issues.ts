@@ -6677,6 +6677,80 @@ function int2WorkspaceIdentity(row: typeof executionWorkspaces.$inferSelect) {
   });
 }
 
+
+const INT2_WORKSPACE_REVISION_SCHEMA = "p04-workspace-identity-revision.v1";
+type Int2WorkspaceToken = { id: string; revision: string } | null;
+type Int2WorkspaceSnapshot = {
+  directPW: Int2WorkspaceToken;
+  executionParentPW: Int2WorkspaceToken;
+  executionWorkspace: Int2WorkspaceToken;
+};
+function int2WorkspaceToken(row: { id: string; identityRevision: string } | null): Int2WorkspaceToken {
+  return row ? { id: row.id, revision: row.identityRevision } : null;
+}
+function isInt2RevisionToken(value: unknown): value is Int2WorkspaceToken {
+  if (value === null) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const token = value as Record<string, unknown>;
+  if (typeof token.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(token.id) ||
+      typeof token.revision !== "string" || !/^(0|[1-9][0-9]*)$/.test(token.revision)) return false;
+  return BigInt(token.revision) <= 9223372036854775807n;
+}
+function sameInt2WorkspaceToken(a: Int2WorkspaceToken, b: Int2WorkspaceToken) {
+  return a?.id === b?.id && a?.revision === b?.revision;
+}
+// Each candidate and verdict holds its issue lock before entering. The
+// unprotected EW probe is only a lock-order hint, never an identity authority.
+// Lock both direct and inherited PW IDs in UUID order BEFORE EW; recheck parent.
+async function captureInt2WorkspaceSnapshotInTx(
+  tx: Db,
+  issue: Pick<GovernedIssue, "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId">,
+  staleCode: string,
+): Promise<{ snapshot: Int2WorkspaceSnapshot; digest: string | null }> {
+  const [probe] = issue.executionWorkspaceId
+    ? await tx.select({ projectWorkspaceId: executionWorkspaces.projectWorkspaceId })
+        .from(executionWorkspaces).where(and(
+          eq(executionWorkspaces.id, issue.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, issue.companyId),
+        )).limit(1)
+    : [];
+  if (issue.executionWorkspaceId && !probe) {
+    throw conflict("Linked execution workspace vanished", { code: staleCode });
+  }
+  const parentIds = [...new Set([
+    issue.projectWorkspaceId, probe?.projectWorkspaceId ?? null,
+  ].filter((id): id is string => id !== null))].sort();
+  const parents = new Map<string, typeof projectWorkspaces.$inferSelect>();
+  for (const id of parentIds) {
+    const [row] = await tx.select().from(projectWorkspaces).where(and(
+      eq(projectWorkspaces.id, id), eq(projectWorkspaces.companyId, issue.companyId),
+    )).for("share").limit(1);
+    if (!row || row.projectId !== issue.projectId) {
+      throw conflict("Linked project workspace is stale", { code: staleCode });
+    }
+    parents.set(id, row);
+  }
+  const [workspace] = issue.executionWorkspaceId
+    ? await tx.select().from(executionWorkspaces).where(and(
+        eq(executionWorkspaces.id, issue.executionWorkspaceId),
+        eq(executionWorkspaces.companyId, issue.companyId),
+      )).for("share").limit(1)
+    : [];
+  if (issue.executionWorkspaceId && (!workspace || workspace.projectId !== issue.projectId ||
+      workspace.status !== "active" ||
+      workspace.projectWorkspaceId !== (probe?.projectWorkspaceId ?? null))) {
+    throw conflict("Linked execution workspace changed during locking", { code: staleCode });
+  }
+  const snapshot: Int2WorkspaceSnapshot = {
+    directPW: int2WorkspaceToken(issue.projectWorkspaceId
+      ? (parents.get(issue.projectWorkspaceId) ?? null) : null),
+    executionParentPW: int2WorkspaceToken(workspace?.projectWorkspaceId
+      ? (parents.get(workspace.projectWorkspaceId) ?? null) : null),
+    executionWorkspace: int2WorkspaceToken(workspace ?? null),
+  };
+  return { snapshot, digest: workspace ? int2WorkspaceIdentity(workspace) : null };
+}
+
 async function assertInt2NativeDecisionInTx(
   tx: Db, issue: GovernedIssue, decisionId: string | null | undefined,
   version: number | undefined,
@@ -6718,6 +6792,14 @@ async function prepareInt2AcceptanceInTx(
       details.issueStatusVersion !== issue.statusVersion ||
       decision.candidateIssueStatusVersion !== issue.statusVersion) {
     throw conflict("The governed review cycle changed or has no authentic candidate", {
+      code: "governed_candidate_stale",
+    });
+  }
+  if (details.workspaceRevisionSchema !== INT2_WORKSPACE_REVISION_SCHEMA ||
+      !isInt2RevisionToken(details.directPW) ||
+      !isInt2RevisionToken(details.executionParentPW) ||
+      !isInt2RevisionToken(details.executionWorkspace)) {
+    throw conflict("Candidate predates durable workspace identity history", {
       code: "governed_candidate_stale",
     });
   }
@@ -6809,25 +6891,16 @@ async function prepareInt2AcceptanceInTx(
       issue.conversationAgentId != null) {
     throw conflict("The governed issue scope or assignee changed", { code: "governed_candidate_scope_stale" });
   }
-  if (issue.projectWorkspaceId) {
-    const [projectWorkspace] = await tx.select().from(projectWorkspaces).where(and(
-      eq(projectWorkspaces.id, issue.projectWorkspaceId),
-      eq(projectWorkspaces.companyId, issue.companyId),
-    )).for("share").limit(1);
-    if (!projectWorkspace || projectWorkspace.projectId !== issue.projectId) {
-      throw conflict("Project workspace no longer belongs to issue scope", { code: "governed_candidate_workspace_stale" });
-    }
-  }
-  if (issue.executionWorkspaceId) {
-    const [workspace] = await tx.select().from(executionWorkspaces).where(and(
-      eq(executionWorkspaces.id, issue.executionWorkspaceId),
-      eq(executionWorkspaces.companyId, issue.companyId),
-    )).for("share").limit(1);
-    if (!workspace || workspace.status !== "active" ||
-        workspace.projectId !== issue.projectId ||
-        int2WorkspaceIdentity(workspace) !== details.executionWorkspaceIdentityDigest) {
-      throw conflict("Execution workspace identity is no longer valid", { code: "governed_candidate_workspace_stale" });
-    }
+  const lockedWorkspace = await captureInt2WorkspaceSnapshotInTx(
+    tx, issue, "governed_candidate_stale",
+  );
+  if (!sameInt2WorkspaceToken(lockedWorkspace.snapshot.directPW, details.directPW) ||
+      !sameInt2WorkspaceToken(lockedWorkspace.snapshot.executionParentPW, details.executionParentPW) ||
+      !sameInt2WorkspaceToken(lockedWorkspace.snapshot.executionWorkspace, details.executionWorkspace) ||
+      lockedWorkspace.digest !== details.executionWorkspaceIdentityDigest) {
+    throw conflict("The candidate workspace identity revision changed", {
+      code: "governed_candidate_stale",
+    });
   }
 
   const reviewerId = reviewer.userId ?? reviewer.agentId;
@@ -11305,6 +11378,7 @@ export function issueService(db: Db) {
           sourceAgentId: string;
           receipt: GovernedReceipt;
           executionWorkspaceIdentityDigest: string | null;
+          workspaceSnapshot: Int2WorkspaceSnapshot;
         } | null = null;
         if (governedIssue && patch.status === "done") {
           const nativeAuthority =
@@ -11369,23 +11443,14 @@ export function issueService(db: Db) {
               code: "governed_review_contract_stale",
             });
           }
-          let executionWorkspaceIdentityDigest: string | null = null;
-          if (receiptExisting.executionWorkspaceId) {
-            const [workspace] = await tx.select().from(executionWorkspaces).where(and(
-              eq(executionWorkspaces.id, receiptExisting.executionWorkspaceId),
-              eq(executionWorkspaces.companyId, receiptExisting.companyId),
-            )).for("share").limit(1);
-            if (!workspace || workspace.status !== "active" ||
-                workspace.projectId !== receiptExisting.projectId) {
-              throw conflict("Source workspace is not valid", {
-                code: "governed_review_workspace_stale",
-              });
-            }
-            executionWorkspaceIdentityDigest = int2WorkspaceIdentity(workspace);
-          }
+          const lockedWorkspace = await captureInt2WorkspaceSnapshotInTx(
+            tx, receiptExisting, "governed_review_workspace_stale",
+          );
           candidateSource = {
             sourceRunId: sourceRun.id, sourceAgentId: sourceRun.agentId,
-            receipt: sourceReceipt, executionWorkspaceIdentityDigest,
+            receipt: sourceReceipt,
+            executionWorkspaceIdentityDigest: lockedWorkspace.digest,
+            workspaceSnapshot: lockedWorkspace.snapshot,
           };
           // A running original must stay bound while it settles. Otherwise
           // ordinary in_review side effects detach it before C.
@@ -11454,6 +11519,8 @@ export function issueService(db: Db) {
               executionWorkspaceSettingsDigest:
                 nativeSha256(receiptExisting.executionWorkspaceSettings ?? null),
               executionWorkspaceIdentityDigest: candidateSource.executionWorkspaceIdentityDigest,
+              workspaceRevisionSchema: INT2_WORKSPACE_REVISION_SCHEMA,
+              ...candidateSource.workspaceSnapshot,
               assigneeAgentId: receiptExisting.assigneeAgentId,
               assigneeUserId: receiptExisting.assigneeUserId,
               reviewInteractionId: governedReviewInteractionId ?? null,
