@@ -33,6 +33,7 @@ import {
   statusDecisions,
   statusDecisionEffects,
   workAssessments,
+  workspaceRuntimeServices,
 } from "@paperclipai/db";
 import type { ServerAdapterModule } from "../adapters/index.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
@@ -2492,7 +2493,9 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
       vi.doMock("node:child_process", async importOriginal => ({
         ...(await importOriginal<typeof import("node:child_process")>()),
         spawn: (...args: unknown[]) => {
-          if (args.length !== 3 || args[0] !== "/bin/sh" || !Array.isArray(args[1])) {
+          if (args.length !== 3 || !Array.isArray(args[1]) ||
+              !String(args[0]).startsWith("/") ||
+              (args[1] as string[]).join(" ") !== "-lc W008_INERT_COMMAND_MUST_NOT_EXECUTE") {
             throw new Error("W008_UNEXPECTED_PROCESS_SPAWN " + JSON.stringify(args));
           }
           spawnCount += 1;
@@ -2517,10 +2520,12 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         readLocalServicePortOwner: async (requested: number) => {
           if (spawnCount === 0) return null;
           postSpawnLookups += 1;
-          if (spawnCount === 1) {
+          if (spawnCount === 1 && requested === port) {
             events.push({ event: "FIRST_POST_SPAWN_BIND_CHECK", port: requested });
             return await foreignOwnerGate;
           }
+          // Retry allocator probes fresh candidate ports BEFORE second fake spawn.
+          if (spawnCount === 1) return null;
           events.push({ event: "SECOND_OWNER_READ", port: requested });
           return children[1]!.pid;
         },
@@ -2600,6 +2605,8 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
     } finally {
       resolveForeignOwner?.(99001); // unblock promise if fixture failed before gate release
       if (mocksInstalled) {
+        // The imported runtime instance is retained solely for test-side cleanup;
+        // real process termination is still intercepted by local supervisor mock.
         vi.doUnmock("node:child_process");
         vi.doUnmock("../services/local-service-supervisor.js");
         vi.resetModules();
