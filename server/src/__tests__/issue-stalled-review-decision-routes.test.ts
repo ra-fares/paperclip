@@ -1048,7 +1048,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 try { bRequest.abort(); } catch {}
                 const cancelled = await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => []);
                 stage("B_request_cancelled", { cancelled });
-                await bTask.catch(() => undefined);
+                await w011SettleAfterCancellation(bTask, db, stage, "B_request");
                 throw error;
               }
             } else {
@@ -1190,7 +1190,28 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         stage("heartbeat_invoke_result", { runId: queued?.id ?? null });
         expect(queued).not.toBeNull();
         stage("C_drain_enter", { runId: queued!.id });
-        await drainHeartbeatRunsToQuiescence(db, h);
+        const cDrainTask = drainHeartbeatRunsToQuiescence(db, h);
+        if (w011Selected && w011Observer) {
+          try {
+            await w011Watchdog(
+              cDrainTask,
+              "C_drain",
+              async () => {
+                const catalog = await w011ReadPgCatalog(w011Observer, ["w011-source"]);
+                stage("watchdog_timeout", { label: "C_drain", runId: queued!.id, catalog });
+                return { runId: queued!.id, catalog };
+              },
+              30_000,
+            );
+          } catch (error) {
+            const cancelled = await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => []);
+            stage("C_drain_cancelled", { runId: queued!.id, cancelled });
+            await w011SettleAfterCancellation(cDrainTask, db, stage, "C_drain");
+            throw error;
+          }
+        } else {
+          await cDrainTask;
+        }
         stage("C_settled", { runId: queued!.id });
         const [dbVersion] = await db.select({ version: sql<string>`version()` })
           .from(sql`(select 1) as probe`);
@@ -2022,7 +2043,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
                 ? await w011CancelApplicationSessions(w011Observer, ["w011-source"]).catch(() => [])
                 : [];
               stage("D_request_cancelled", { cancelled });
-              await docTask.catch(() => undefined);
+              await w011SettleAfterCancellation(docTask, db, stage, "document_D_request");
               throw error;
             }
             stage("D_request_result", { httpStatus: reviewed.status });
@@ -2807,14 +2828,6 @@ function w009Deferred<T = void>() {
   const promise = new Promise<T>(yes => { resolve = yes; });
   return { promise, resolve };
 }
-async function w009Watchdog<T>(promise:Promise<T>,label:string):Promise<T> {
-  return await new Promise<T>((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(new Error("W009_FIXTURE_WATCHDOG "+label)),12000);
-    promise.then(value=>{clearTimeout(timer);resolve(value);},
-      error=>{clearTimeout(timer);reject(error);});
-  });
-}
-
 type W011StageWriter = (stage: string, details?: Record<string, unknown>) => void;
 
 function w011StageRecorder(mode: string): W011StageWriter {
@@ -2875,6 +2888,28 @@ async function w011CancelApplicationSessions(
     " AND application_name IN (" + quoted + ")" +
     " AND pid<>pg_backend_pid() ORDER BY application_name,pid"
   )) as unknown as Array<Record<string, unknown>>;
+}
+
+async function w011SettleAfterCancellation(
+  task: Promise<unknown>,
+  sourceDb: ReturnType<typeof createDb>,
+  stage: W011StageWriter,
+  label: string,
+) {
+  let forcedCloseTask: Promise<unknown> | null = null;
+  const forceCloseTimer = setTimeout(() => {
+    stage("source_pool_force_close", { label });
+    forcedCloseTask = sourceDb.$client.end({ timeout: 1 }).catch((error: unknown) => {
+      stage("source_pool_force_close_error", {
+        label,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, 2_000);
+  await task.catch(() => undefined);
+  clearTimeout(forceCloseTimer);
+  if (forcedCloseTask) await forcedCloseTask;
+  stage("cancelled_task_settled", { label });
 }
 
 function w011PendingTaskState(input: {
