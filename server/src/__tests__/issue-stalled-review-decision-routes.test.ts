@@ -3099,3 +3099,108 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     // Its finally closes the registered clients before cluster cleanup.
   }
 }
+
+
+/**
+ * W01-009 DB-only parent drift oracle. Not proof that direct SQL mutation
+ * is reachable by HTTP; does exercise REAL runtime parent probe/row locks.
+ */
+describeEmbeddedPostgres("P04 INT2 W009 parent probe-to-lock drift",()=>{
+  it("P04 INT2 W009 DB-only EW parent drift rejects before fake spawn",async()=>{
+    const cluster=await startEmbeddedPostgresTestDatabase("p04-w009-parent-drift-");
+    const pwWriter=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-writer"});
+    const runtimeDb=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-start"});
+    const observer=createDb(cluster.connectionString,{maxConnections:1,applicationName:"w009-parent-observer"});
+    const companyId=randomUUID(),projectId=randomUUID(),issueId=randomUUID();
+    const pw1=randomUUID(),pw2=randomUUID(),ewId=randomUUID();
+    const gotWriterLock=w009Deferred(),releaseWriter=w009Deferred();
+    let writerTask:Promise<unknown>|null=null,startTask:Promise<unknown>|null=null;
+    let runtime:typeof import("../services/workspace-runtime.js")|null=null;
+    const previousHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+    let mocksInstalled=false,spawnCalls=0;
+    try {
+      await pwWriter.insert(companies).values({id:companyId,name:"W009 parent drift",issuePrefix:"WPD"});
+      await pwWriter.insert(projects).values({id:projectId,companyId,name:"W009 parent drift project"});
+      await pwWriter.insert(projectWorkspaces).values([
+        {id:pw1,companyId,projectId,name:"W009 old parent",sourceType:"local_path",cwd:"/tmp/w009-parent-old"},
+        {id:pw2,companyId,projectId,name:"W009 new parent",sourceType:"local_path",cwd:"/tmp/w009-parent-new"},
+      ]);
+      await pwWriter.insert(issues).values({
+        id:issueId,companyId,projectId,projectWorkspaceId:pw1,
+        title:"W009 DB-only stale parent probe",status:"in_review",
+      });
+      await pwWriter.insert(executionWorkspaces).values({
+        id:ewId,companyId,projectId,projectWorkspaceId:pw1,sourceIssueId:issueId,
+        name:"W009 parent drift EW",mode:"isolated_workspace",strategyType:"git_worktree",
+        status:"active",cwd:"/tmp/w009-parent-old",
+      });
+      writerTask=pwWriter.transaction(async tx=>{
+        const [parent]=await tx.select().from(projectWorkspaces)
+          .where(eq(projectWorkspaces.id,pw1)).for("update");
+        expect(parent).toBeDefined();
+        await tx.update(executionWorkspaces).set({projectWorkspaceId:pw2})
+          .where(eq(executionWorkspaces.id,ewId));
+        gotWriterLock.resolve();
+        await releaseWriter.promise;
+      });
+      void writerTask.catch(()=>undefined);
+      await gotWriterLock.promise;
+      process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
+      vi.resetModules();
+      mocksInstalled=true;
+      vi.doMock("node:child_process",async importOriginal=>({
+        ...(await importOriginal<typeof import("node:child_process")>()),
+        spawn:()=>{spawnCalls++;throw new Error("W009_UNSAFE_SPAWN_AFTER_PARENT_DRIFT");},
+        execFile:()=>{throw new Error("W009_UNSAFE_EXECFILE_AFTER_PARENT_DRIFT");},
+      }));
+      runtime=await import("../services/workspace-runtime.js");
+      startTask=runtime.startRuntimeServicesForWorkspaceControl({
+        db:runtimeDb,actor:{id:null,name:"W009 parent drift",companyId},
+        issue:{id:issueId,identifier:"WPD-1",title:"W009 parent drift"},
+        workspace:{
+          baseCwd:"/tmp/w009-parent-old",source:"task_session",projectId,workspaceId:pw1,
+          repoUrl:null,repoRef:null,strategy:"project_primary",cwd:"/tmp/w009-parent-old",
+          branchName:null,worktreePath:null,warnings:[],created:false,
+          branchCreatedByRuntime:false,
+        },
+        executionWorkspaceId:ewId,adapterEnv:{},
+        config:{workspaceRuntime:{services:[{
+          name:"w009-never-start",command:"W008_INERT_COMMAND_MUST_NOT_EXECUTE",
+          port:{type:"fixed",value:45981},readiness:{type:"none"},
+        }]},desiredState:"running"},
+      });
+      void startTask.catch(()=>undefined);
+      const lock=await w009ObserveWait(observer,"w009-parent-start","w009-parent-writer");
+      expect(lock.proven).toBe(true);
+      releaseWriter.resolve();
+      await writerTask;
+      await expect(startTask).rejects.toMatchObject({
+        status:409,details:{code:"workspace_runtime_parent_stale"},
+      });
+      const persisted=await observer.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.executionWorkspaceId,ewId));
+      const evidence={writerKind:"FIXTURE_DB_ONLY_PARENT_CHANGE",issueId,ewId,
+        originalParent:pw1,newParent:pw2,lock,spawnCalls,persistedRows:persisted.length};
+      console.info("INT2_W009_PARENT_DRIFT "+JSON.stringify(evidence));
+      if(process.env.INT2_W009_EVIDENCE_DIR)writeFileSync(
+        process.env.INT2_W009_EVIDENCE_DIR+"/parent-drift.json",
+        JSON.stringify(evidence,null,2)+"\n",{flag:"wx",encoding:"utf8"});
+      expect(spawnCalls).toBe(0);
+      expect(persisted).toHaveLength(0);
+    } finally {
+      releaseWriter.resolve();
+      await Promise.allSettled([writerTask,startTask].filter(
+        (p):p is Promise<unknown>=>p!==null,
+      ));
+      await runtime?.resetRuntimeServicesForTests({terminateProcesses:true});
+      if(mocksInstalled){
+        vi.doUnmock("node:child_process");
+        vi.resetModules();
+      }
+      if(previousHttps===undefined)delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+      else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS=previousHttps;
+      await closeRegisteredClients(cluster.connectionString);
+      await cluster.cleanup();
+    }
+  },120_000);
+});
