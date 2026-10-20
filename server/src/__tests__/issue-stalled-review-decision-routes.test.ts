@@ -2201,3 +2201,116 @@ describeEmbeddedPostgres("P04 INT2 governed native same-transaction", () => {
     }, 120_000);
   }
 });
+
+/**
+ * W01-005 schema regression: actual disposable PostgreSQL and its triggers.
+ * This is not a substitute for the genuine HTTP B->C->D oracle above.
+ */
+describeEmbeddedPostgres("P04 INT2 W01-005 workspace revision database", () => {
+  it("W01-005 REAL PG identity revision: metadata, no-op, A-B-A, rollback, and BIGINT", async () => {
+    const cluster = await startEmbeddedPostgresTestDatabase("p04-int2-w01-005-revision-");
+    const db = createDb(cluster.connectionString);
+    const companyId = randomUUID(), projectId = randomUUID();
+    const pwId = randomUUID(), ewId = randomUUID();
+    try {
+      await db.insert(companies).values({
+        id: companyId, name: "W01-005 DB revision scope", issuePrefix: "WRV",
+      });
+      await db.insert(projects).values({
+        id: projectId, companyId, name: "W01-005 DB revision project",
+      });
+      await db.insert(projectWorkspaces).values({
+        id: pwId, companyId, projectId,
+        name: "Parent", sourceType: "local_path", cwd: "/tmp/w01-005",
+        isPrimary: true,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: ewId, companyId, projectId, projectWorkspaceId: pwId,
+        name: "Execution child", mode: "isolated_workspace", strategyType: "git_worktree",
+        status: "active", branchName: null,
+        metadata: { reopenPendingConsumption: true, reopenPendingConsumptionSince: "2026-10-20T10:00:00Z" },
+      });
+      const readEW = async () => {
+        const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, ewId));
+        expect(row).toBeDefined();
+        return row!;
+      };
+      const readPW = async () => {
+        const [row] = await db.select().from(projectWorkspaces).where(eq(projectWorkspaces.id, pwId));
+        expect(row).toBeDefined();
+        return row!;
+      };
+      expect((await readEW()).identityRevision).toBe("0");
+      expect((await readPW()).identityRevision).toBe("0");
+      await db.update(executionWorkspaces).set({
+        metadata: { reopenPendingConsumption: true, reopenPendingConsumptionSince: "2026-10-20T10:03:00Z" },
+      }).where(eq(executionWorkspaces.id, ewId));
+      expect((await readEW()).identityRevision).toBe("0");
+      await db.update(executionWorkspaces).set({
+        metadata: { reopenPendingConsumption: true, reopenPendingConsumptionSince: "2026-10-20T10:03:00Z",
+          unclassifiedAuthorityKey: { changed: true } },
+      }).where(eq(executionWorkspaces.id, ewId));
+      expect((await readEW()).identityRevision).toBe("1");
+      await db.update(executionWorkspaces).set({
+        metadata: { reopenPendingConsumption: true, reopenPendingConsumptionSince: "2026-10-20T10:03:00Z",
+          unclassifiedAuthorityKey: { changed: true }, lifecycleGeneration: 1 },
+      }).where(eq(executionWorkspaces.id, ewId));
+      expect((await readEW()).identityRevision).toBe("2");
+      // A semantic SQL no-op, including supplied stale revision, cannot reset history.
+      await db.update(executionWorkspaces).set({
+        identityRevision: "0", updatedAt: new Date(),
+      }).where(eq(executionWorkspaces.id, ewId));
+      expect((await readEW()).identityRevision).toBe("2");
+      await db.update(executionWorkspaces).set({ branchName: "int2-branch-B" })
+        .where(eq(executionWorkspaces.id, ewId));
+      await db.update(executionWorkspaces).set({ branchName: null })
+        .where(eq(executionWorkspaces.id, ewId));
+      expect((await readEW()).identityRevision).toBe("4");
+      await expect(db.transaction(async tx => {
+        await tx.update(executionWorkspaces).set({ branchName: "rolled-back-branch" })
+          .where(eq(executionWorkspaces.id, ewId));
+        throw new Error("forced-revision-rollback");
+      })).rejects.toThrow("forced-revision-rollback");
+      expect((await readEW()).identityRevision).toBe("4");
+      expect((await readEW()).branchName).toBeNull();
+      await db.update(projectWorkspaces).set({ cwd: "/tmp/w01-005-changed" })
+        .where(eq(projectWorkspaces.id, pwId));
+      await db.update(projectWorkspaces).set({ cwd: "/tmp/w01-005" })
+        .where(eq(projectWorkspaces.id, pwId));
+      expect((await readPW()).identityRevision).toBe("2");
+      await db.update(projectWorkspaces).set({ isPrimary: false })
+        .where(eq(projectWorkspaces.id, pwId));
+      await db.update(projectWorkspaces).set({ isPrimary: true })
+        .where(eq(projectWorkspaces.id, pwId));
+      // Already-primary API false->true has this intentionally conservative cost.
+      expect((await readPW()).identityRevision).toBe("4");
+      // Seed a >2^53 BIGINT in this disposable fixture ONLY, re-enable trigger
+      // before any assertion or material mutation. Never assert DB-admin tamperproof.
+      await db.execute(sql.raw(
+        "ALTER TABLE execution_workspaces DISABLE TRIGGER p04_execution_workspace_identity_revision_guard",
+      ));
+      try {
+        await db.execute(sql.raw(
+          "UPDATE execution_workspaces SET identity_revision = 9007199254740993 WHERE id = '" + ewId + "'",
+        ));
+      } finally {
+        await db.execute(sql.raw(
+          "ALTER TABLE execution_workspaces ENABLE TRIGGER p04_execution_workspace_identity_revision_guard",
+        ));
+      }
+      expect((await readEW()).identityRevision).toBe("9007199254740993");
+      await db.update(executionWorkspaces).set({ branchName: "new-after-bigint", identityRevision: "0" })
+        .where(eq(executionWorkspaces.id, ewId));
+      expect((await readEW()).identityRevision).toBe("9007199254740994");
+      const observations = {
+        schema: "p04-workspace-identity-revision.v1", companyId, projectId, pwId, ewId,
+        pwRevision: (await readPW()).identityRevision,
+        ewRevision: (await readEW()).identityRevision,
+        actualPostgres: true,
+      };
+      console.info("INT2_W01_005_REVISION_DB " + JSON.stringify(observations));
+    } finally {
+      await cluster.cleanup();
+    }
+  }, 120_000);
+});
