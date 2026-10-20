@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
@@ -1238,6 +1239,17 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
               allAdapterCallsAfterDecision: execute.mock.calls.map(([input]) => input.runId),
             };
             console.info("INT2_REJECTED_FENCING_OBSERVATION " + JSON.stringify(outcome));
+            // Vitest's JSON reporter suppresses console.info for passed
+            // assertions. Persist the exact execution observation in a
+            // dedicated CI artifact before assertions, including failures.
+            // No additional runs, status mutations or provider calls.
+            if (process.env.INT2_REJECTED_FENCING_OBSERVATION_PATH) {
+              writeFileSync(
+                process.env.INT2_REJECTED_FENCING_OBSERVATION_PATH,
+                JSON.stringify(outcome, null, 2) + "\n",
+                { encoding: "utf8", flag: "wx" },
+              );
+            }
             const diagnostic = JSON.stringify(outcome);
             expect(review.status, diagnostic).toBe(409);
             expect(review.body.details?.code, diagnostic).toBe("governed_candidate_stale");
