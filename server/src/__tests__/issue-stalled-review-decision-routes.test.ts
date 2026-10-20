@@ -2453,8 +2453,6 @@ describeEmbeddedPostgres("P04 INT2 W01-005 workspace revision database", () => {
       };
       console.info("INT2_W01_005_REVISION_DB " + JSON.stringify(observations));
     } finally {
-      if (exposureBefore === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
-      else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = exposureBefore;
       await closeRegisteredClients(cluster.connectionString);
       await cluster.cleanup();
     }
@@ -2777,6 +2775,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const beforeHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
   const fakeRegistry=new Map<string,unknown>();
   const lockEvidence:Array<Awaited<ReturnType<typeof w009ObserveWait>>>=[];
+  const expectedLockRoles: Array<readonly [string,string]> = dFirst
+    ? [["w009-D","w009-gate"],["w009-writer","w009-D"]]
+    : reconcile
+      ? [["w009-writer","w009-gate"],["w009-D","w009-writer"]]
+      : [["w009-D","w009-writer"]];
   const key=806000+Math.floor(Math.random()*10000);
   const emit=(name:string,details:Record<string,unknown>={})=>events.push({name,...details});
   const failOs=(description:string):never=>{throw new Error("W009_UNEXPECTED_OS_ACTION "+description);};
@@ -2946,9 +2949,9 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       // denotes the COMMENT id; using it would never park the real writer.
       const commentIssueCondition="NEW.issue_id = '"+a.issueId+"'::uuid";
       await a.db.execute(sql.raw(
-        "CREATE FUNCTION w009_hold_comment() RETURNS trigger LANGUAGE plpgsql AS $"+
+        "CREATE FUNCTION w009_hold_comment() RETURNS trigger LANGUAGE plpgsql AS $$"+
         " BEGIN IF "+commentIssueCondition+" THEN"+
-        " PERFORM pg_advisory_xact_lock("+key+"); END IF; RETURN NEW; END $"));
+        " PERFORM pg_advisory_xact_lock("+key+"); END IF; RETURN NEW; END $$"));
       await a.db.execute(sql.raw(
         "CREATE TRIGGER w009_hold_comment_trigger BEFORE INSERT ON issue_comments"+
         " FOR EACH ROW EXECUTE FUNCTION w009_hold_comment()"));
@@ -3071,8 +3074,12 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       writeFileSync(process.env.INT2_W009_EVIDENCE_DIR+"/lock-"+mode+".json",
         JSON.stringify(finding,null,2)+"\n",{encoding:"utf8",flag:"wx"});
     }
-    expect(lockEvidence.length,JSON.stringify(finding)).toBe(dFirst?2:1);
+    expect(lockEvidence.length,JSON.stringify(finding)).toBe(expectedLockRoles.length);
     expect(lockEvidence.every(x=>x.proven),JSON.stringify(finding)).toBe(true);
+    expect(
+      lockEvidence.map(x=>[x.waiterName,x.blockerName] as const),
+      JSON.stringify(finding),
+    ).toEqual(expectedLockRoles);
     expect(runs.map(r=>r.id),JSON.stringify(finding)).toContain(a.runId);
     const issueScopedRuns=runs.filter(r=>r.contextSnapshot?.issueId===a.issueId);
     expect(issueScopedRuns.map(r=>r.id),JSON.stringify(finding)).toEqual([a.runId]);
