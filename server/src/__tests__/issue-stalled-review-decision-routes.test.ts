@@ -2454,6 +2454,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
     const foreignOwnerGate = new Promise<number>(resolve => { resolveForeignOwner = resolve; });
     const fakeRegistry = new Map<string, unknown>();
     let mocksInstalled = false;
+    let runtimeForCleanup: typeof import("../services/workspace-runtime.js") | null = null;
     const selectRows = () => observer.select().from(workspaceRuntimeServices)
       .where(eq(workspaceRuntimeServices.executionWorkspaceId, ewId));
     try {
@@ -2549,6 +2550,7 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
         readLocalServiceProcessGroupId: async () => null,
       }));
       const runtime = await import("../services/workspace-runtime.js");
+      runtimeForCleanup = runtime;
       const cwd = syntheticCwd;
       const service = {
         name: "w008-inert-safe-process",
@@ -2614,8 +2616,8 @@ describeEmbeddedPostgres("P04 INT2 W008 native collision-boundary preflight", ()
     } finally {
       resolveForeignOwner?.(99001); // unblock promise if fixture failed before gate release
       if (mocksInstalled) {
-        // The imported runtime instance is retained solely for test-side cleanup;
-        // real process termination is still intercepted by local supervisor mock.
+        // Runtime stop uses the mocked supervisor, never the host process table.
+        await runtimeForCleanup?.resetRuntimeServicesForTests({ terminateProcesses: true });
         vi.doUnmock("node:child_process");
         vi.doUnmock("../services/local-service-supervisor.js");
         vi.resetModules();
