@@ -839,7 +839,7 @@ describeEmbeddedPostgres("P04 INT2 governed direct review", () => {
  */
 describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
   for (const mode of [
-    "missing", "document", "release", "successor", "assignee_aba",
+    "missing", "document", "pre_revision_candidate", "release", "successor", "assignee_aba",
     "workspace_aba", "config_drift", "replay", "concurrent", "rollback", "generic",
     "replacement_heartbeat", "rejected_replacement_fencing",
     "project_aba", "project_workspace_aba", "execution_workspace_aba",
@@ -1102,6 +1102,21 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         expect(createdAnchor?.details.issueStatusVersion).toBe(current?.statusVersion);
         expect(createdAnchor?.details.completionContractId).toBe(run?.completionContractId);
         expect(createdAnchor?.details.completionContractSha256).toBe(run?.completionContractSha256);
+        if (mode === "document") {
+          expect(createdAnchor?.details.workspaceRevisionSchema)
+            .toBe("p04-workspace-identity-revision.v1");
+          const [settledWorkspace] = await db.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, current!.executionWorkspaceId!));
+          const atB = createdAnchor!.details.executionWorkspace as
+            { id: string; revision: string } | null;
+          // Normal B->C is instrumented, not assumed immune to all metadata churn.
+          console.info("INT2_W01_005_BC_REVISION " + JSON.stringify({
+            sourceRunId: run!.id, candidateId: createdAnchor!.id,
+            atB, atC: settledWorkspace
+              ? { id: settledWorkspace.id, revision: settledWorkspace.identityRevision } : null,
+          }));
+          expect(atB?.revision).toBe(settledWorkspace?.identityRevision);
+        }
         expect(allRuns.some(row => row.id === run?.id)).toBe(true);
         const ref = `issue_document_revision:${mode !== "missing" ? revisionId : randomUUID()}`;
         // All D cases share the same genuine running-run B and terminal C.
@@ -1780,6 +1795,18 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           await db.update(agents).set({ adapterConfig: { int2NewPreference: "after_admission" } })
             .where(eq(agents.id, agentId));
         }
+        if (mode === "pre_revision_candidate") {
+          // Exact old-schema compatibility test: the genuine B was created via
+          // the real source run, then its newly introduced revision fields are
+          // omitted as they were in pre-migration immutable activity rows.
+          const legacy = { ...createdAnchor!.details };
+          delete legacy.workspaceRevisionSchema;
+          delete legacy.directPW;
+          delete legacy.executionParentPW;
+          delete legacy.executionWorkspace;
+          await db.update(activityLog).set({ details: legacy })
+            .where(eq(activityLog.id, createdAnchor!.id));
+        }
         if (mode === "rollback") {
           // Disposable DB aborts acceptance audit after issue status UPDATE.
           await db.execute(sql.raw(`
@@ -1861,7 +1888,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           expect(reviewed.body.details?.code, JSON.stringify(result)).toBe("criterion_evidence_missing");
           expect(after?.status).toBe("in_review");
           expect(basis).toHaveLength(0);
-        } else if (mode === "successor" || mode === "assignee_aba" ||
+        } else if (mode === "pre_revision_candidate" ||
+            mode === "successor" || mode === "assignee_aba" ||
             mode === "workspace_aba" || mode === "generic" || scopeTrace) {
           if (mode === "project_workspace_company_db" ||
               mode === "execution_workspace_company_db") {
