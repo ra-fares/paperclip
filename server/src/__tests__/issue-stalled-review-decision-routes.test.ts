@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import express from "express";
+import type { NextFunction, Request, Response } from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -3017,6 +3018,106 @@ type W011CatalogRow = {
   query_start: string | Date | null;
   xact_start: string | Date | null;
 };
+
+type W013SerializedError = {
+  name: string | null;
+  message: string | null;
+  stack: string | null;
+  code: string | null;
+  severity: string | null;
+  detail: string | null;
+  constraint: string | null;
+  table: string | null;
+  routine: string | null;
+  cause: W013SerializedError | { cycle: true } | null;
+};
+
+function w013ReadErrorString(value: object, key: string): string | null {
+  try {
+    const raw = (value as Record<string, unknown>)[key];
+    return typeof raw === "string" ? raw : raw === null || raw === undefined ? null : String(raw);
+  } catch {
+    return null;
+  }
+}
+
+function w013SerializeError(
+  error: unknown,
+  seen = new Set<object>(),
+  depth = 0,
+): W013SerializedError | { cycle: true } {
+  if (!error || typeof error !== "object") {
+    return {
+      name: null,
+      message: typeof error === "string" ? error : String(error),
+      stack: null,
+      code: null,
+      severity: null,
+      detail: null,
+      constraint: null,
+      table: null,
+      routine: null,
+      cause: null,
+    };
+  }
+  if (seen.has(error)) return { cycle: true };
+  seen.add(error);
+  const object = error as object;
+  let cause: unknown = null;
+  try { cause = (object as { cause?: unknown }).cause ?? null; } catch {}
+  return {
+    name: w013ReadErrorString(object, "name"),
+    message: w013ReadErrorString(object, "message"),
+    stack: w013ReadErrorString(object, "stack"),
+    code: w013ReadErrorString(object, "code"),
+    severity: w013ReadErrorString(object, "severity"),
+    detail: w013ReadErrorString(object, "detail"),
+    constraint: w013ReadErrorString(object, "constraint"),
+    table: w013ReadErrorString(object, "table"),
+    routine: w013ReadErrorString(object, "routine"),
+    cause: cause && depth < 4 ? w013SerializeError(cause, seen, depth + 1) : null,
+  };
+}
+
+async function w013ReadFixtureLockSnapshot(
+  observer: ReturnType<typeof createDb>,
+  applicationNames: string[],
+  executionWorkspaceId: string,
+) {
+  const catalog = await w011ReadPgCatalog(observer, applicationNames);
+  const pids = [...new Set(catalog.map(row => Number(row.pid)).filter(pid => pid > 0))];
+  const ungranted = pids.length === 0
+    ? []
+    : await observer.execute(sql.raw(
+        "SELECT pid,locktype,mode,granted,relation::regclass::text AS relation_name," +
+        " transactionid::text AS transaction_id FROM pg_locks" +
+        " WHERE granted=false AND pid IN (" + pids.join(",") + ")" +
+        " ORDER BY pid,locktype,mode"
+      )) as unknown as Array<Record<string, unknown>>;
+  const services = await observer.select({
+    id: workspaceRuntimeServices.id,
+    status: workspaceRuntimeServices.status,
+    issueId: workspaceRuntimeServices.issueId,
+    projectWorkspaceId: workspaceRuntimeServices.projectWorkspaceId,
+    executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId,
+    port: workspaceRuntimeServices.port,
+  }).from(workspaceRuntimeServices)
+    .where(eq(workspaceRuntimeServices.executionWorkspaceId, executionWorkspaceId));
+  return { catalog, ungranted, services };
+}
+
+async function w013ReadRuntimeIssueForeignKey(observer: ReturnType<typeof createDb>) {
+  return await observer.execute(sql.raw(
+    "SELECT c.conname,pg_get_constraintdef(c.oid,true) AS definition," +
+    " c.condeferrable,c.condeferred,c.confdeltype,c.confupdtype,a.attname" +
+    " FROM pg_constraint c" +
+    " JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum,ord) ON true" +
+    " JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.attnum" +
+    " WHERE c.conrelid='workspace_runtime_services'::regclass" +
+    " AND c.contype='f' AND a.attname='issue_id'" +
+    " ORDER BY c.conname"
+  )) as unknown as Array<Record<string, unknown>>;
+}
 
 async function w011ReadPgCatalog(
   observer: ReturnType<typeof createDb>,
