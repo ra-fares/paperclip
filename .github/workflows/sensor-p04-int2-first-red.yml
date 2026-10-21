@@ -1,17 +1,17 @@
-# W01-017: retry eligibility + deterministic private-bind handshake, single six-selector CI.
-name: Sensor P04 W01-017 retry handshake
+# W01-018: retry lifecycle + deterministic contention, single six-selector CI.
+name: Sensor P04 W01-018 retry lifecycle
 on:
   push:
-    branches: [codex/w01-017-int2-retry-handshake]
+    branches: [codex/w01-018-int2-retry-lifecycle]
     paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-w01-017-one-run
+  group: sensor-p04-w01-018-one-run
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-017-int2-retry-handshake'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-018-int2-retry-lifecycle'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -25,25 +25,25 @@ jobs:
           persist-credentials: false
           fetch-depth: 40
 
-      - name: Exact base, three-file allowlist, immutable source manifests
+      - name: Exact base, two-file allowlist, immutable source manifests
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-017-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-017-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-018-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-018-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          base=efbed135ff2a7bc3c0126b6aba31379bbb743d26
+          base=145999e13fc5f7b1e5b3a63c20a7c81f91083222
           git merge-base --is-ancestor "$base" HEAD
           git diff --name-only "$base" HEAD > .int2-evidence/changed-files.txt
           while IFS= read -r p; do
             case "$p" in
               server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_W017_ALLOWLIST" >&2; exit 1 ;;
+              *) echo "OUTSIDE_W018_ALLOWLIST" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
           test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
           test -z "$(git diff --diff-filter=D --name-only "$base" HEAD)"
-          printf 'ASSIGNMENT=W01-017\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
+          printf 'ASSIGNMENT=W01-018\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
           git status --short --untracked-files=all > .int2-evidence/initial-git-status.txt
           sha256sum server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
 
@@ -119,19 +119,19 @@ jobs:
           # Retry pair first. Semantic FAIL of the first still runs the second.
           # Missing eligibility/handshake/visibility is invalid fixture and STOPs immediately.
           run_named retry_writer_first 'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock'
-          if ! require_retry_fixture lock_retry_writer_first; then echo 'W017_INVALID_RETRY_FIXTURE_WRITER_FIRST' >&2; exit 1; fi
+          if ! require_retry_fixture lock_retry_writer_first; then echo 'W018_INVALID_RETRY_FIXTURE_WRITER_FIRST' >&2; exit 1; fi
           run_named retry_d_first 'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock'
-          if ! require_retry_fixture lock_retry_d_first; then echo 'W017_INVALID_RETRY_FIXTURE_D_FIRST' >&2; exit 1; fi
+          if ! require_retry_fixture lock_retry_d_first; then echo 'W018_INVALID_RETRY_FIXTURE_D_FIRST' >&2; exit 1; fi
           if [ "$(cat .int2-evidence/retry_writer_first.exit_code)" -ne 0 ] || [ "$(cat .int2-evidence/retry_d_first.exit_code)" -ne 0 ]; then
             echo 'Retry controls failed; remaining four selectors NOT_RUN' >&2
             exit 1
           fi
 
           run_named runtime_writer_first 'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock'
-          if ! require_visibility lock_runtime_writer_first; then echo 'W017_INVALID_REPRO_WRITER_FIRST' >&2; exit 1; fi
+          if ! require_visibility lock_runtime_writer_first; then echo 'W018_INVALID_REPRO_WRITER_FIRST' >&2; exit 1; fi
           test "$(cat .int2-evidence/runtime_writer_first.exit_code)" -eq 0
           run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
-          if ! require_visibility lock_runtime_d_first; then echo 'W017_INVALID_REPRO_D_FIRST' >&2; exit 1; fi
+          if ! require_visibility lock_runtime_d_first; then echo 'W018_INVALID_REPRO_D_FIRST' >&2; exit 1; fi
           test "$(cat .int2-evidence/runtime_d_first.exit_code)" -eq 0
           run_named document 'P04 INT2 BCD document: actual admitted run and independent reviewer'
           test "$(cat .int2-evidence/document.exit_code)" -eq 0
@@ -282,6 +282,57 @@ jobs:
               pending:{d:typeof v.pending?.d==='string'?v.pending.d:null,writer:typeof v.pending?.writer==='string'?v.pending.writer:null,gate:typeof v.pending?.gate==='string'?v.pending.gate:null},
             }:null];
           }));
+          const safeId=v=>typeof v==='string'&&/^[0-9a-f-]{36}$/i.test(v)?v:null;
+          const safeFakePid=v=>v===89001||v===89002?v:null;
+          const safePort=v=>Number.isSafeInteger(v)&&v>0&&v<65536?v:null;
+          const safeLifecycleStatus=v=>['starting','stopped','running','failed'].includes(v)?v:null;
+          const retryLifecycle=Object.fromEntries(['retry_writer_first','retry_d_first'].map(label=>{
+            const m=mode[label],v=json('retry-lifecycle-'+m+'.json');
+            const trace=Array.isArray(v?.trace)?v.trace.slice(0,32).map(x=>({
+              sequence:Number.isSafeInteger(x.sequence)?x.sequence:null,
+              runtimeServiceId:safeId(x.runtimeServiceId),status:safeLifecycleStatus(x.status),
+              port:safePort(x.port),
+              providerRef:x.providerRef==='89001'||x.providerRef==='89002'?x.providerRef:null,
+              stoppedAtSet:x.stoppedAtSet===true,
+            })):[];
+            const mockEvents=Array.isArray(v?.mockEvents)?v.mockEvents.slice(0,32).map(x=>({
+              sequence:Number.isSafeInteger(x.sequence)?x.sequence:null,
+              kind:['spawn','terminate','registry_write','registry_remove'].includes(x.kind)?x.kind:null,
+              pid:safeFakePid(x.pid),runtimeServiceId:safeId(x.runtimeServiceId),port:safePort(x.port),
+            })):[];
+            const finalRows=Array.isArray(v?.finalRows)?v.finalRows.slice(0,4).map(x=>({
+              id:safeId(x.id),status:safeLifecycleStatus(x.status),port:safePort(x.port),
+              providerRef:x.providerRef==='89001'||x.providerRef==='89002'?x.providerRef:null,
+              stoppedAtSet:x.stoppedAtSet===true,
+            })):[];
+            const registry=Array.isArray(v?.registry)?v.registry.slice(0,4).map(x=>({
+              runtimeServiceId:safeId(x.runtimeServiceId),pid:safeFakePid(x.pid),port:safePort(x.port),
+            })):[];
+            return [label,v?{
+              schema:'p04-int2-w018-retry-lifecycle.v1',mode:m,
+              firstRuntimeRow:v.firstRuntimeRow?{id:safeId(v.firstRuntimeRow.id),port:safePort(v.firstRuntimeRow.port)}:null,
+              returnedRef:v.returnedRef?{
+                id:safeId(v.returnedRef.id),port:safePort(v.returnedRef.port),
+                status:safeLifecycleStatus(v.returnedRef.status),
+              }:null,
+              trace,mockEvents,
+              activeFakePids:Array.isArray(v.activeFakePids)?v.activeFakePids.map(safeFakePid).filter(Boolean):[],
+              registry,finalRows,
+            }:null];
+          }));
+          const retryCleanup=Object.fromEntries(['retry_writer_first','retry_d_first'].map(label=>{
+            const m=mode[label],v=json('retry-cleanup-'+m+'.json');
+            return [label,v?{
+              schema:'p04-int2-w018-retry-cleanup.v1',mode:m,
+              terminatedPids:Array.isArray(v.terminatedPids)?v.terminatedPids.map(safeFakePid).filter(Boolean):[],
+              activeFakePids:Array.isArray(v.activeFakePids)?v.activeFakePids.map(safeFakePid).filter(Boolean):[],
+              registrySize:Number.isSafeInteger(v.registrySize)?v.registrySize:null,
+              replacementPid:safeFakePid(v.replacementPid),
+              replacementTerminated:v.replacementTerminated===true,
+              samplerStopped:v.samplerStopped===true,
+              contendersSettled:v.contendersSettled===true,
+            }:null];
+          }));
           const preassert=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
             const v=json('preassert-'+m+'.json');
             if(!v)return [label,null];
@@ -348,10 +399,10 @@ jobs:
             adapterCalls:aba.adapterCalls,actualAdapterCalls:aba.actualAdapterCalls
           }:null;
           const out={
-            schema:'p04-int2-w017-classification.v1',base:'efbed135ff2a7bc3c0126b6aba31379bbb743d26',
+            schema:'p04-int2-w018-classification.v1',base:'145999e13fc5f7b1e5b3a63c20a7c81f91083222',
             sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,
             setup:{install:code('install'),sdk:code('sdk'),migrations:code('migrations'),typecheck:code('typecheck')},
-            cases,locks,preflights,invalidRepros,retryEligibility,retryHandshake,retryFailure,preassert,stages,cleanup,documentary,httpAba,lockOracle,
+            cases,locks,preflights,invalidRepros,retryEligibility,retryHandshake,retryFailure,retryLifecycle,retryCleanup,preassert,stages,cleanup,documentary,httpAba,lockOracle,
             scopeRemaining:'reconcile/indirect/rollback NOT_RUN; P04 OPEN',
           };
           const visibilityOracle=Object.entries(preflights).every(([label,v])=>v!==null&&
@@ -367,6 +418,33 @@ jobs:
               h.collisionReleased===true&&h.originalPortCollisionOwner===99001&&f===null;
           });
           out.retryFixtureOracle=retryFixtureOracle;
+          const retryLifecycleOracle=['retry_writer_first','retry_d_first'].every(label=>{
+            const l=retryLifecycle[label],c=retryCleanup[label];
+            if(!l||!c||!l.firstRuntimeRow||!l.returnedRef||l.finalRows.length!==1||
+               l.registry.length!==1||JSON.stringify(l.activeFakePids)!==JSON.stringify([89002]))return false;
+            const id=l.firstRuntimeRow.id,originalPort=l.firstRuntimeRow.port;
+            const rows=l.trace.filter(x=>x.runtimeServiceId===id);
+            const i0=rows.findIndex(x=>x.status==='starting'&&x.port===originalPort&&x.providerRef==='89001'&&!x.stoppedAtSet);
+            const i1=rows.findIndex((x,i)=>i>i0&&x.status==='stopped'&&x.port===originalPort&&x.providerRef==='89001'&&x.stoppedAtSet);
+            const i2=rows.findIndex((x,i)=>i>i1&&x.status==='starting'&&x.port!==originalPort&&x.providerRef==='89002'&&!x.stoppedAtSet);
+            const i3=rows.findIndex((x,i)=>i>i2&&x.status==='running'&&x.port!==originalPort&&x.providerRef==='89002'&&!x.stoppedAtSet);
+            if(!(i0>=0&&i1>i0&&i2>i1&&i3>i2))return false;
+            const final=l.finalRows[0],reg=l.registry[0];
+            if(final.id!==id||final.status!=='running'||final.port===originalPort||
+               final.providerRef!=='89002'||final.stoppedAtSet||
+               l.returnedRef.id!==id||l.returnedRef.port!==final.port||l.returnedRef.status!=='running'||
+               reg.runtimeServiceId!==id||reg.pid!==89002||reg.port!==final.port)return false;
+            const events=l.mockEvents;
+            const terminate=events.findIndex(x=>x.kind==='terminate'&&x.pid===89001);
+            const remove=events.findIndex(x=>x.kind==='registry_remove'&&x.runtimeServiceId===id&&x.pid===89001);
+            const spawn=events.findIndex(x=>x.kind==='spawn'&&x.pid===89002);
+            const write=events.findIndex(x=>x.kind==='registry_write'&&x.runtimeServiceId===id&&x.pid===89002);
+            if(!(terminate>=0&&remove>terminate&&spawn>remove&&write>spawn))return false;
+            return c.replacementPid===89002&&c.replacementTerminated===true&&
+              c.registrySize===0&&c.activeFakePids.length===0&&c.samplerStopped===true&&
+              c.contendersSettled===true&&c.terminatedPids.includes(89001)&&c.terminatedPids.includes(89002);
+          });
+          out.retryLifecycleOracle=retryLifecycleOracle;
           const preassertOracle=Object.entries(preassert).every(([label,v])=>v!==null&&
             v.queryVisibility?.captureComplete===true &&
             v.queryVisibility?.clientTruncated===false &&
@@ -383,7 +461,7 @@ jobs:
           const docPass=documentary?.reviewerHttp===200&&documentary?.after==='done'&&documentary?.acceptedAuditRows===1;
           const abaPass=httpAba?.reviewerHttp===409&&httpAba?.finalStatus==='in_review'&&
             httpAba?.acceptedAuditRows===0&&httpAba?.preconditionsValid===true;
-          out.overall=infra&&passes&&lockOracle&&visibilityOracle&&retryFixtureOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
+          out.overall=infra&&passes&&lockOracle&&visibilityOracle&&retryFixtureOracle&&retryLifecycleOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
           write('classification.json',out);
           for(const [label,v] of Object.entries(stages))write('stages-'+label+'.json',v);
           if(read('identity.txt'))fs.copyFileSync(dir+'/identity.txt',safe+'/identity.txt');
@@ -394,7 +472,7 @@ jobs:
           }
           console.log(JSON.stringify({overall:out.overall,sha:out.sha,run:out.run,
             cases:Object.fromEntries(Object.entries(cases).map(([k,v])=>[k,v.classification])),
-            lockOracle,visibilityOracle,retryFixtureOracle,preassertOracle,cleanupPass,docPass,abaPass}));
+            lockOracle,visibilityOracle,retryFixtureOracle,retryLifecycleOracle,preassertOracle,cleanupPass,docPass,abaPass}));
           if(out.overall!=='PASS_SCOPED')process.exitCode=1;
           NODE
 
@@ -410,7 +488,7 @@ jobs:
             if grep -Eiq 'params:|authorization:|bearer[[:space:]]|secret[[:space:]]*[:=]|password[[:space:]]*[:=]|BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY' "$path"; then
               printf 'WITHHELD_SAFETY_CHECK: %s\n' "$(basename "$path")" >> .int2-safe/withheld-evidence.txt
               # The unsafe evidence is never uploaded, regardless of test outcome.
-              mv -- "$path" "$RUNNER_TEMP/w01-017-withheld-$(basename "$path")"
+              mv -- "$path" "$RUNNER_TEMP/w01-018-withheld-$(basename "$path")"
               unsafe=1
             fi
           done < <(find .int2-safe -maxdepth 1 -type f ! -name withheld-evidence.txt -print0)
@@ -418,11 +496,11 @@ jobs:
           find .int2-safe -maxdepth 1 -type f ! -name evidence-sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > .int2-safe/evidence-sha256.txt
           test "$unsafe" -eq 0
 
-      - name: Always upload sanitized W017 evidence (no raw test logs or SQL params)
+      - name: Always upload sanitized W018 evidence (no raw test logs or SQL params)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: w01-017-six-safe-evidence
+          name: w01-018-six-safe-evidence
           path: .int2-safe/
           include-hidden-files: true
           if-no-files-found: warn

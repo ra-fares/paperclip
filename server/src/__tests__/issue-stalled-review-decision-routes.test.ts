@@ -3402,7 +3402,20 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   let writerTerminal:{kind:"settled"|"rejected";error:ReturnType<typeof w013SerializeError>|null}|null=null;
   const children:Array<EventEmitter & {pid:number;exitCode:null;signalCode:null;kill:()=>boolean}>=[];
   const beforeHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
-  const fakeRegistry=new Map<string,unknown>();
+  type W018RegistryEntry={runtimeServiceId:string|null;pid:number|null;port:number|null};
+  type W018MockEvent={sequence:number;kind:"spawn"|"terminate"|"registry_write"|"registry_remove";pid:number|null;runtimeServiceId:string|null;port:number|null};
+  const fakeRegistry=new Map<string,W018RegistryEntry>();
+  const activeFakePids=new Set<number>();
+  const fakeLifecycleEvents:W018MockEvent[]=[];
+  let fakeLifecycleSequence=0;
+  let firstRuntimeRow:{id:string;port:number|null}|null=null;
+  let retryLifecycleFinding:Record<string,unknown>|null=null;
+  const recordFakeLifecycle=(kind:W018MockEvent["kind"],entry:Partial<W018MockEvent>={})=>{
+    fakeLifecycleEvents.push({
+      sequence:++fakeLifecycleSequence,kind,
+      pid:entry.pid??null,runtimeServiceId:entry.runtimeServiceId??null,port:entry.port??null,
+    });
+  };
   const lockEvidence:Array<Awaited<ReturnType<typeof w009ObserveWait>>>=[];
   let earlyIssueWait: {
     sqlKind: string; waiterPid: number; blockerPid: number;
@@ -3567,6 +3580,30 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       schema:"p04-int2-w013-runtime-issue-fk.v1",mode,constraints:issueFkEvidence,
     });
     expect(issueFkEvidence.length).toBe(1);
+    if(retry) {
+      // Disposable append-only observer: no FK, no updates to production rows,
+      // no common sentinel/advisory lock. Trigger inserts share the real writer
+      // transaction, so rolled-back transitions roll back too.
+      await observer.execute(sql.raw(
+        "CREATE TABLE w018_runtime_trace ("+
+        "sequence bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"+
+        "runtime_service_id uuid NOT NULL,status text NOT NULL,port integer,"+
+        "provider_ref text,stopped_at timestamptz)"
+      ));
+      await observer.execute(sql.raw(
+        "CREATE FUNCTION w018_capture_runtime_trace() RETURNS trigger LANGUAGE plpgsql AS $w018$"+
+        " BEGIN IF NEW.execution_workspace_id = '"+a.ewId+"'::uuid THEN"+
+        " INSERT INTO w018_runtime_trace(runtime_service_id,status,port,provider_ref,stopped_at)"+
+        " VALUES(NEW.id,NEW.status,NEW.port,NEW.provider_ref,NEW.stopped_at);"+
+        " END IF; RETURN NEW; END $w018$"
+      ));
+      await observer.execute(sql.raw(
+        "CREATE TRIGGER w018_capture_runtime_trace_trigger"+
+        " AFTER INSERT OR UPDATE ON workspace_runtime_services"+
+        " FOR EACH ROW EXECUTE FUNCTION w018_capture_runtime_trace()"
+      ));
+      stage("w018_lifecycle_trace_ready",{appendOnly:true,noForeignKeys:true,noSentinelLock:true});
+    }
     process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
     vi.resetModules();
     mocksInstalled=true;
@@ -3594,7 +3631,10 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
           const child=Object.assign(new EventEmitter(),{
             pid:89000+spawnCount,exitCode:null as null,signalCode:null as null,kill:()=>true,
           });
-          children.push(child);emit("FAKE_SPAWN",{pid:child.pid,number:spawnCount});
+          children.push(child);
+          activeFakePids.add(child.pid);
+          recordFakeLifecycle("spawn",{pid:child.pid});
+          emit("FAKE_SPAWN",{pid:child.pid,number:spawnCount});
           return child;
         },
       };
@@ -3633,14 +3673,31 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       isLocalServiceProcessInWorkspace:async()=>false,
       readLocalServiceProcessCwd:async()=>null,
       readLocalServiceProcessGroupId:async()=>null,
-      writeLocalServiceRegistryRecord:async (x:{serviceKey:string})=>{
-        fakeRegistry.set(x.serviceKey,x);emit("FAKE_REGISTRY_WRITE");
+      writeLocalServiceRegistryRecord:async (x:{
+        serviceKey:string;runtimeServiceId?:string;pid?:number;port?:number|null;
+      })=>{
+        const entry:W018RegistryEntry={
+          runtimeServiceId:typeof x.runtimeServiceId==="string"?x.runtimeServiceId:null,
+          pid:Number.isInteger(x.pid)?Number(x.pid):null,
+          port:Number.isInteger(x.port)?Number(x.port):null,
+        };
+        fakeRegistry.set(x.serviceKey,entry);
+        recordFakeLifecycle("registry_write",entry);
+        emit("FAKE_REGISTRY_WRITE",{pid:entry.pid,port:entry.port});
       },
       removeLocalServiceRegistryRecord:async (name:string)=>{
-        fakeRegistry.delete(name);emit("FAKE_REGISTRY_REMOVE");
+        const entry=fakeRegistry.get(name)??{runtimeServiceId:null,pid:null,port:null};
+        recordFakeLifecycle("registry_remove",entry);
+        fakeRegistry.delete(name);
+        emit("FAKE_REGISTRY_REMOVE",{pid:entry.pid,port:entry.port});
       },
       touchLocalServiceRegistryRecord:async()=>undefined,
-      terminateLocalService:async()=>{emit("FAKE_TERMINATE");},
+      terminateLocalService:async (input:{pid:number;port?:number|null})=>{
+        if(!children.some(child=>child.pid===input.pid))return failOs("terminate unknown fake pid "+input.pid);
+        if(!activeFakePids.delete(input.pid))return failOs("terminate inactive fake pid "+input.pid);
+        recordFakeLifecycle("terminate",{pid:input.pid,port:Number.isInteger(input.port)?Number(input.port):null});
+        emit("FAKE_TERMINATE",{pid:input.pid,port:input.port??null});
+      },
     }));
     vi.doMock("../services/workspace-git-operation-scheduler.js",async importOriginal=>({
       ...(await importOriginal<typeof import("../services/workspace-git-operation-scheduler.js")>()),
@@ -3905,6 +3962,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
           .where(eq(workspaceRuntimeServices.executionWorkspaceId,a.ewId));
         const first=rows.find(r=>r.status==="starting");
         if(first && spawnCount===1 && first.port===port) {
+          firstRuntimeRow={id:first.id,port:first.port};
           emit("FIRST_STARTING_COMMITTED",{rowId:first.id,port:first.port});
           return first;
         }
@@ -4006,6 +4064,49 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     const runs=await a.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId,a.companyId));
     const serviceRows=await a.db.select().from(workspaceRuntimeServices)
       .where(eq(workspaceRuntimeServices.executionWorkspaceId,a.ewId));
+    const rawLifecycleTrace=retry
+      ? await observer.execute(sql.raw(
+          "SELECT sequence,runtime_service_id,status,port,provider_ref,"+
+          "(stopped_at IS NOT NULL) AS stopped_at_set"+
+          " FROM w018_runtime_trace ORDER BY sequence"
+        )) as unknown as Array<{
+          sequence:string|number|bigint;runtime_service_id:string;status:string;
+          port:number|null;provider_ref:string|null;stopped_at_set:boolean;
+        }>
+      : [];
+    const lifecycleTrace=rawLifecycleTrace.map(row=>({
+      sequence:Number(row.sequence),runtimeServiceId:row.runtime_service_id,status:row.status,
+      port:row.port,providerRef:row.provider_ref,stoppedAtSet:row.stopped_at_set===true,
+    }));
+    const returnedRef=writerResult.ok&&Array.isArray(writerResult.value)
+      ? (writerResult.value[0] as {id?:unknown;port?:unknown;status?:unknown}|undefined)
+      : undefined;
+    const safeReturnedRef=returnedRef?{
+      id:typeof returnedRef.id==="string"?returnedRef.id:null,
+      port:Number.isInteger(returnedRef.port)?Number(returnedRef.port):null,
+      status:typeof returnedRef.status==="string"?returnedRef.status:null,
+    }:null;
+    if(retry) {
+      const finalRegistry=[...fakeRegistry.values()].map(entry=>({...entry}));
+      retryLifecycleFinding={
+        schema:"p04-int2-w018-retry-lifecycle.v1",mode,
+        firstRuntimeRow,returnedRef:safeReturnedRef,
+        trace:lifecycleTrace,
+        mockEvents:fakeLifecycleEvents.map(event=>({...event})),
+        activeFakePids:[...activeFakePids].sort((x,y)=>x-y),
+        registry:finalRegistry,
+        finalRows:serviceRows.map(row=>({
+          id:row.id,status:row.status,port:row.port,providerRef:row.providerRef,
+          stoppedAtSet:row.stoppedAt!==null,
+        })),
+      };
+      persistW013Json("retry-lifecycle-"+mode+".json",retryLifecycleFinding);
+      stage("w018_retry_lifecycle_observed",{
+        traceCount:lifecycleTrace.length,mockEventCount:fakeLifecycleEvents.length,
+        finalRowCount:serviceRows.length,activeFakePids:[...activeFakePids].sort((x,y)=>x-y),
+        registrySize:fakeRegistry.size,
+      });
+    }
     const finding={mode,caseSha:process.env.GITHUB_SHA??null,
       sourceRunId:a.runId,candidateId:a.candidateId,candidateVersion:a.candidateVersion,
       dHttp:dResult.status,dBody:dResult.body,writerResult,originalAdapterCalls:a.originalAdapterCalls,
@@ -4046,9 +4147,52 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     if(retry) {
       expect(spawnCount,JSON.stringify(finding)).toBe(2);
       expect(events.some(e=>e.name==="FIRST_STARTING_COMMITTED")).toBe(true);
-      expect(serviceRows.filter(r=>r.status==="stopped").length,JSON.stringify(finding))
-        .toBeGreaterThan(0);
-      expect(serviceRows.some(r=>r.port!==port),JSON.stringify(finding)).toBe(true);
+      expect(firstRuntimeRow,JSON.stringify(retryLifecycleFinding)).not.toBeNull();
+      const firstId=firstRuntimeRow!.id;
+      const firstPid=89001,replacementPid=89002;
+      const sameIdTrace=lifecycleTrace.filter(row=>row.runtimeServiceId===firstId);
+      const firstStartingIndex=sameIdTrace.findIndex(row=>
+        row.status==="starting"&&row.port===port&&row.providerRef===String(firstPid)&&!row.stoppedAtSet);
+      const stoppedIndex=sameIdTrace.findIndex((row,index)=>
+        index>firstStartingIndex&&row.status==="stopped"&&row.port===port&&
+        row.providerRef===String(firstPid)&&row.stoppedAtSet);
+      const replacementStartingIndex=sameIdTrace.findIndex((row,index)=>
+        index>stoppedIndex&&row.status==="starting"&&row.port!==port&&
+        row.providerRef===String(replacementPid)&&!row.stoppedAtSet);
+      const runningIndex=sameIdTrace.findIndex((row,index)=>
+        index>replacementStartingIndex&&row.status==="running"&&row.port!==port&&
+        row.providerRef===String(replacementPid)&&!row.stoppedAtSet);
+      expect(firstStartingIndex,JSON.stringify(retryLifecycleFinding)).toBeGreaterThanOrEqual(0);
+      expect(stoppedIndex,JSON.stringify(retryLifecycleFinding)).toBeGreaterThan(firstStartingIndex);
+      expect(replacementStartingIndex,JSON.stringify(retryLifecycleFinding)).toBeGreaterThan(stoppedIndex);
+      expect(runningIndex,JSON.stringify(retryLifecycleFinding)).toBeGreaterThan(replacementStartingIndex);
+
+      const firstTerminate=fakeLifecycleEvents.findIndex(e=>e.kind==="terminate"&&e.pid===firstPid);
+      const firstRegistryRemove=fakeLifecycleEvents.findIndex(e=>
+        e.kind==="registry_remove"&&e.runtimeServiceId===firstId&&e.pid===firstPid);
+      const replacementSpawn=fakeLifecycleEvents.findIndex(e=>e.kind==="spawn"&&e.pid===replacementPid);
+      const replacementRegistryWrite=fakeLifecycleEvents.findIndex(e=>
+        e.kind==="registry_write"&&e.runtimeServiceId===firstId&&e.pid===replacementPid);
+      expect(firstTerminate,JSON.stringify(retryLifecycleFinding)).toBeGreaterThanOrEqual(0);
+      expect(firstRegistryRemove,JSON.stringify(retryLifecycleFinding)).toBeGreaterThan(firstTerminate);
+      expect(replacementSpawn,JSON.stringify(retryLifecycleFinding)).toBeGreaterThan(firstRegistryRemove);
+      expect(replacementRegistryWrite,JSON.stringify(retryLifecycleFinding)).toBeGreaterThan(replacementSpawn);
+
+      expect(serviceRows,JSON.stringify(retryLifecycleFinding)).toHaveLength(1);
+      const finalRow=serviceRows[0]!;
+      expect(finalRow.id,JSON.stringify(retryLifecycleFinding)).toBe(firstId);
+      expect(finalRow.status,JSON.stringify(retryLifecycleFinding)).toBe("running");
+      expect(finalRow.port,JSON.stringify(retryLifecycleFinding)).not.toBe(port);
+      expect(finalRow.providerRef,JSON.stringify(retryLifecycleFinding)).toBe(String(replacementPid));
+      expect(finalRow.stoppedAt,JSON.stringify(retryLifecycleFinding)).toBeNull();
+      expect(safeReturnedRef,JSON.stringify(retryLifecycleFinding)).toEqual({
+        id:firstId,port:finalRow.port,status:"running",
+      });
+      expect([...activeFakePids],JSON.stringify(retryLifecycleFinding)).toEqual([replacementPid]);
+      expect(fakeRegistry.size,JSON.stringify(retryLifecycleFinding)).toBe(1);
+      expect([...fakeRegistry.values()][0],JSON.stringify(retryLifecycleFinding)).toEqual({
+        runtimeServiceId:firstId,pid:replacementPid,port:finalRow.port,
+      });
     } else if(!reconcile)expect(spawnCount).toBe(1);
     if(quarantine)expect(events.some(e=>e.name==="PRE_TX_RESCUE_STUB")).toBe(true);
   } catch(error) {
@@ -4117,6 +4261,26 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     catch(error){
       cleanupErrors.push(error);
       stage("contention_cleanup_error",{phase:"runtime_reset",error:error instanceof Error?error.message:String(error)});
+    }
+    if(retry) {
+      const cleanupFinding={
+        schema:"p04-int2-w018-retry-cleanup.v1",mode,
+        terminatedPids:fakeLifecycleEvents.filter(event=>event.kind==="terminate"&&event.pid!==null)
+          .map(event=>event.pid),
+        activeFakePids:[...activeFakePids].sort((x,y)=>x-y),
+        registrySize:fakeRegistry.size,
+        replacementPid:89002,
+        replacementTerminated:fakeLifecycleEvents.some(event=>event.kind==="terminate"&&event.pid===89002),
+        samplerStopped:stopPostReleaseSampler,
+        contendersSettled:(!dTask||dSettled)&&(!writerTask||writerSettled)&&(!gateTask||gateSettled),
+      };
+      persistW013Json("retry-cleanup-"+mode+".json",cleanupFinding);
+      stage("w018_retry_cleanup_observed",cleanupFinding);
+      if(cleanupFinding.activeFakePids.length!==0||cleanupFinding.registrySize!==0||
+         !cleanupFinding.replacementTerminated||!cleanupFinding.samplerStopped||
+         !cleanupFinding.contendersSettled) {
+        cleanupErrors.push(new Error("W018_RETRY_CLEANUP_INCOMPLETE"));
+      }
     }
     if(probe&&!probeClosed) {
       await new Promise<void>(resolve=>{
