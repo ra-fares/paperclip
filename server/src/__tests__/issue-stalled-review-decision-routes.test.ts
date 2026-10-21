@@ -865,7 +865,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
         ? `P04 INT2 W009 ${mode}: genuine BCD and PG lock`
         : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
       const w016Selected = ["lock_runtime_writer_first","lock_runtime_d_first",
-        "lock_retry_writer_first","lock_retry_d_first"].includes(mode);
+        "lock_retry_writer_first","lock_retry_d_first",
+        "lock_forward_writer_first","lock_forward_d_first",
+        "lock_quarantine_writer_first","lock_quarantine_d_first"].includes(mode);
       let w016CaptureLimitBytes:number|undefined;
       const w012Selected =
         mode.startsWith("lock_") ||

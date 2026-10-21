@@ -1,19 +1,19 @@
-# W01-018: retry lifecycle + deterministic contention, single six-selector CI.
-name: Sensor P04 W01-018 retry lifecycle
+# W01-020: bounded residual INT2 checks, one eight-selector CI.
+name: Sensor P04 W01-020 residual checks
 on:
   push:
-    branches: [codex/w01-018-int2-retry-lifecycle]
+    branches: [codex/w01-020-int2-residual-checks]
     paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-w01-018-one-run
+  group: sensor-p04-w01-020-one-run
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-018-int2-retry-lifecycle'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-020-int2-residual-checks'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       CI: 'true'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
@@ -29,21 +29,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-018-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-018-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-020-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-020-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          base=145999e13fc5f7b1e5b3a63c20a7c81f91083222
+          base=1e84af70a0fa73e3f33325be3be2dfb59e379270
           git merge-base --is-ancestor "$base" HEAD
           git diff --name-only "$base" HEAD > .int2-evidence/changed-files.txt
           while IFS= read -r p; do
             case "$p" in
               server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_W018_ALLOWLIST" >&2; exit 1 ;;
+              *) echo "OUTSIDE_W020_ALLOWLIST" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
           test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
           test -z "$(git diff --diff-filter=D --name-only "$base" HEAD)"
-          printf 'ASSIGNMENT=W01-018\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
+          printf 'ASSIGNMENT=W01-020\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
           git status --short --untracked-files=all > .int2-evidence/initial-git-status.txt
           sha256sum server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
 
@@ -59,7 +59,7 @@ jobs:
           version: 9.15.4
           run_install: false
 
-      - name: Frozen install, build prerequisites, migration integrity, typecheck
+      - name: Frozen install, migration integrity and server typecheck
         shell: bash
         run: |
           set -euo pipefail
@@ -79,7 +79,7 @@ jobs:
           printf '%s\n' "$type_code" > .int2-evidence/typecheck.exit_code
           test "$type_code" -eq 0
 
-      - name: Six exact selectors, real isolated PostgreSQL and safe fake spawn
+      - name: Eight exact selectors, fail-fast, disposable PostgreSQL
         shell: bash
         run: |
           set -euo pipefail
@@ -87,8 +87,8 @@ jobs:
           export INT2_W012_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_W011_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_W009_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
+          export INT2_SCOPE_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_POSITIVE_BCD_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/document-observation.json"
-          export INT2_HTTP_ABA_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/http-aba-observation.json"
 
           run_named() {
             local label="$1" pattern="$2" code
@@ -99,7 +99,12 @@ jobs:
             fi
             printf '%s\n' "$code" > ".int2-evidence/$label.exit_code"
             echo "SELECTOR=$label EXIT=$code"
-            # No unredacted Vitest tails to Actions logs.
+          }
+
+          require_pass() {
+            local label="$1"
+            test -f ".int2-evidence/$label.exit_code"
+            test "$(cat ".int2-evidence/$label.exit_code")" -eq 0
           }
 
           require_visibility() {
@@ -108,35 +113,34 @@ jobs:
             test ! -f ".int2-evidence/invalid-repro-$mode.json"
             node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(p.valid===true&&p.configuredLimitBytes===16384?0:1)' ".int2-evidence/preflight-$mode.json"
           }
-          require_retry_fixture() {
-            local mode="$1"
-            require_visibility "$mode"
-            test -f ".int2-evidence/retry-eligibility-$mode.json"
-            test -f ".int2-evidence/retry-handshake-$mode.json"
-            node -e 'const fs=require("fs"),e=JSON.parse(fs.readFileSync(process.argv[1],"utf8")),h=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));process.exit(e.actualMode==="isolated_workspace"&&e.eligible===true&&e.fixedPortFallbackExpected===true&&h.actualMode==="isolated_workspace"&&h.eligible===true&&h.bindCheckEntered===true&&h.collisionReleased===true?0:1)' ".int2-evidence/retry-eligibility-$mode.json" ".int2-evidence/retry-handshake-$mode.json"
-          }
 
-          # Retry pair first. Semantic FAIL of the first still runs the second.
-          # Missing eligibility/handshake/visibility is invalid fixture and STOPs immediately.
-          run_named retry_writer_first 'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock'
-          if ! require_retry_fixture lock_retry_writer_first; then echo 'W018_INVALID_RETRY_FIXTURE_WRITER_FIRST' >&2; exit 1; fi
-          run_named retry_d_first 'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock'
-          if ! require_retry_fixture lock_retry_d_first; then echo 'W018_INVALID_RETRY_FIXTURE_D_FIRST' >&2; exit 1; fi
-          if [ "$(cat .int2-evidence/retry_writer_first.exit_code)" -ne 0 ] || [ "$(cat .int2-evidence/retry_d_first.exit_code)" -ne 0 ]; then
-            echo 'Retry controls failed; remaining four selectors NOT_RUN' >&2
-            exit 1
-          fi
-
-          run_named runtime_writer_first 'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock'
-          if ! require_visibility lock_runtime_writer_first; then echo 'W018_INVALID_REPRO_WRITER_FIRST' >&2; exit 1; fi
-          test "$(cat .int2-evidence/runtime_writer_first.exit_code)" -eq 0
-          run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
-          if ! require_visibility lock_runtime_d_first; then echo 'W018_INVALID_REPRO_D_FIRST' >&2; exit 1; fi
-          test "$(cat .int2-evidence/runtime_d_first.exit_code)" -eq 0
           run_named document 'P04 INT2 BCD document: actual admitted run and independent reviewer'
-          test "$(cat .int2-evidence/document.exit_code)" -eq 0
-          run_named http_aba 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate'
-          test "$(cat .int2-evidence/http_aba.exit_code)" -eq 0
+          require_pass document
+
+          run_named rollback 'P04 INT2 BCD rollback: actual admitted run and independent reviewer'
+          require_pass rollback
+
+          run_named indirect_parent_pw_change_db 'P04 INT2 BCD indirect_parent_pw_change_db: actual admitted run and independent reviewer'
+          require_pass indirect_parent_pw_change_db
+
+          run_named indirect_parent_pw_aba_db 'P04 INT2 BCD indirect_parent_pw_aba_db: actual admitted run and independent reviewer'
+          require_pass indirect_parent_pw_aba_db
+
+          run_named forward_d_first 'P04 INT2 W009 lock_forward_d_first: genuine BCD and PG lock'
+          require_visibility lock_forward_d_first
+          require_pass forward_d_first
+
+          run_named forward_writer_first 'P04 INT2 W009 lock_forward_writer_first: genuine BCD and PG lock'
+          require_visibility lock_forward_writer_first
+          require_pass forward_writer_first
+
+          run_named quarantine_d_first 'P04 INT2 W009 lock_quarantine_d_first: genuine BCD and PG lock'
+          require_visibility lock_quarantine_d_first
+          require_pass quarantine_d_first
+
+          run_named quarantine_writer_first 'P04 INT2 W009 lock_quarantine_writer_first: genuine BCD and PG lock'
+          require_visibility lock_quarantine_writer_first
+          require_pass quarantine_writer_first
 
       - name: Always classify and materialize SAFE evidence only
         if: always()
@@ -146,324 +150,220 @@ jobs:
           node <<'NODE'
           const fs=require('node:fs'),dir='.int2-evidence',safe='.int2-safe';
           const names={
-            runtime_writer_first:'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock',
-            runtime_d_first:'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock',
-            retry_writer_first:'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock',
-            retry_d_first:'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock',
             document:'P04 INT2 BCD document: actual admitted run and independent reviewer',
-            http_aba:'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate',
+            rollback:'P04 INT2 BCD rollback: actual admitted run and independent reviewer',
+            indirect_parent_pw_change_db:'P04 INT2 BCD indirect_parent_pw_change_db: actual admitted run and independent reviewer',
+            indirect_parent_pw_aba_db:'P04 INT2 BCD indirect_parent_pw_aba_db: actual admitted run and independent reviewer',
+            forward_d_first:'P04 INT2 W009 lock_forward_d_first: genuine BCD and PG lock',
+            forward_writer_first:'P04 INT2 W009 lock_forward_writer_first: genuine BCD and PG lock',
+            quarantine_d_first:'P04 INT2 W009 lock_quarantine_d_first: genuine BCD and PG lock',
+            quarantine_writer_first:'P04 INT2 W009 lock_quarantine_writer_first: genuine BCD and PG lock',
           };
-          const mode={runtime_writer_first:'lock_runtime_writer_first',runtime_d_first:'lock_runtime_d_first',
-            retry_writer_first:'lock_retry_writer_first',retry_d_first:'lock_retry_d_first'};
+          const lockMode={
+            forward_d_first:'lock_forward_d_first',
+            forward_writer_first:'lock_forward_writer_first',
+            quarantine_d_first:'lock_quarantine_d_first',
+            quarantine_writer_first:'lock_quarantine_writer_first',
+          };
           const read=n=>{try{return fs.readFileSync(dir+'/'+n,'utf8')}catch{return null}};
-          const json=n=>{try{return JSON.parse(read(n))}catch{return null}};
+          const json=n=>{try{const s=read(n);return s===null?null:JSON.parse(s)}catch{return null}};
           const code=n=>{const s=read(n+'.exit_code');return s===null?null:Number(s.trim())};
           const write=(n,v)=>fs.writeFileSync(safe+'/'+n,JSON.stringify(v,null,2)+'\n');
           const summary=(label,name)=>{
             const report=json('vitest-'+label+'.json');
             const all=(report?.testResults??[]).flatMap(x=>x.assertionResults??[]);
             const selected=all.filter(t=>t.fullName===name||t.fullName?.endsWith(name));
-            const executed=all.filter(t=>t.status==='passed'||t.status==='failed');
+            const executed=selected.filter(t=>t.status==='passed'||t.status==='failed');
             const pass=selected.length===1&&executed.length===1&&selected[0].status==='passed'&&
               code(label)===0&&report?.numPassedTests===1&&report?.numFailedTests===0;
-            return {name,selected:selected.length,executed:executed.length,
-              status:selected[0]?.status??null,exitCode:code(label),
-              classification:pass?'PASS':selected.length===0||executed.length===0?'NOT_RUN':'FAIL',
+            return {name,selected:selected.length,executed:executed.length,status:selected[0]?.status??null,
+              exitCode:code(label),classification:pass?'PASS':selected.length===0||executed.length===0?'NOT_RUN':'FAIL',
               failureCount:selected[0]?.failureMessages?.length??0};
           };
-          const safeLocks=(label)=>{
-            const d=json('lock-'+mode[label]+'.json');
-            if(!d)return null;
-            return {
-              sourceRunId:d.sourceRunId,candidateId:d.candidateId,
-              dHttp:d.dHttp,finalStatus:d.finalStatus,acceptedAuditRows:d.acceptedAuditRows,
-              writerOk:d.writerResult?.ok,spawnCount:d.spawnCount,
-              runIds:d.runIds??[],originalAdapterCalls:d.originalAdapterCalls??[],
-              serviceRows:(d.serviceRows??[]).map(x=>({id:x.id,status:x.status,port:x.port})),
-              earlyIssueWait:d.earlyIssueWait??null,
-              lockEvidence:(d.lockEvidence??[]).map(x=>({
-                waiterName:x.waiterName,blockerName:x.blockerName,waiterPid:x.waiterPid,blockerPid:x.blockerPid,
-                waitEvent:x.waitEvent,waitSqlKind:x.waitSqlKind,blockerSqlKind:x.blockerSqlKind,
-                blockingLockTypes:x.blockingLockTypes,blockingLockModes:x.blockingLockModes,proven:x.proven,
-              })),
-            };
-          };
+          const safeId=v=>typeof v==='string'&&/^[0-9a-f-]{36}$/i.test(v)?v:null;
+          const safeInt=v=>Number.isSafeInteger(v)?v:null;
+          const safeStatus=v=>['backlog','todo','in_progress','blocked','in_review','done','cancelled','running','succeeded','failed'].includes(v)?v:null;
+          const safeRev=v=>typeof v==='string'&&/^(0|[1-9][0-9]*)$/.test(v)?v:null;
           const queryKinds=['issues.select_for_key_share','issues.select_for_update','issues.update','project_workspaces.select_for_update','execution_workspaces.select_for_update','advisory_lock','other'];
           const kind=v=>queryKinds.includes(v)?v:'other';
-          const pid=v=>Number.isSafeInteger(v)&&v>0?v:null;
-          const stageRows=(name)=>{
-            const v=read('stages-'+name+'.jsonl');
-            if(!v)return [];
-            return v.split('\n').filter(Boolean).flatMap(line=>{
-              try{
-                const x=JSON.parse(line);
-                const detail=x.stage==='pre_assert_wait_recorded'?{
-                  assertionId:['w015_d_first_early_issue_wait','w015_writer_first_receipt_lock'].includes(x.assertionId)?x.assertionId:null,
-                  expectedQueryKind:kind(x.expectedQueryKind),actualQueryKind:kind(x.actualQueryKind),
-                  waiterPid:pid(x.waiterPid),blockerPid:pid(x.blockerPid),
-                  observedBlockingEdge:x.observedBlockingEdge===true,
-                }:null;
-                return [{sequence:x.sequence,stage:x.stage,mode:x.mode,...(detail?{detail}:{})}];
-              }catch{return []}
-            });
-          };
-          const stages={};
-          const cleanup={};
-          for(const [label,m] of Object.entries(mode)){
-            stages[label]=stageRows(m);
-            const last=stages[label].at(-1);
-            cleanup[label]={last:last?.stage??null,outerComplete:stages[label].some(x=>x.stage==='outer_cleanup_complete'),
-              contentionComplete:stages[label].some(x=>x.stage==='contention_cleanup_complete')};
-          }
-          stages.document=stageRows('document');
-          stages.http_aba=stageRows('execution_workspace_branch_aba_http');
-          cleanup.document={outerComplete:stages.document.some(x=>x.stage==='outer_cleanup_complete')};
-          cleanup.http_aba={outerComplete:stages.http_aba.some(x=>x.stage==='outer_cleanup_complete')};
-          const cases=Object.fromEntries(Object.entries(names).map(([k,v])=>[k,summary(k,v)]));
-          for(const [k,v] of Object.entries(cases))write('vitest-'+k+'-summary.json',v);
-          const visibility=v=>v?{
-            configuredLimitBytes:Number.isSafeInteger(v.configuredLimitBytes)?v.configuredLimitBytes:null,
-            queryByteLength:Number.isSafeInteger(v.queryByteLength)?v.queryByteLength:null,
+          const safeVisibility=v=>v?{
+            configuredLimitBytes:safeInt(v.configuredLimitBytes),
+            queryByteLength:safeInt(v.queryByteLength),
             clientTruncated:v.clientTruncated===false?false:null,
             captureComplete:v.captureComplete===true,
-            hasFromIssues:v.hasFromIssues===true,hasForUpdate:v.hasForUpdate===true,
+            hasFromIssues:v.hasFromIssues===true,
+            hasForUpdate:v.hasForUpdate===true,
             hasForKeyShare:v.hasForKeyShare===true,
           }:null;
-          const preflights=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
-            const v=json('preflight-'+m+'.json');return [label,v?{
-              schema:'p04-int2-w017-preflight.v1',case:m,
-              configuredLimitBytes:Number.isSafeInteger(v.configuredLimitBytes)?v.configuredLimitBytes:null,
-              generatedQueryBytes:Number.isSafeInteger(v.generatedQueryBytes)?v.generatedQueryBytes:null,
-              safetyMarginBytes:1024,fullQueryKind:kind(v.fullQueryKind),
-              prefix500QueryKind:kind(v.prefix500QueryKind),
-              fullHasFromIssues:v.fullHasFromIssues===true,fullHasForUpdate:v.fullHasForUpdate===true,
-              valid:v.valid===true,
-            }:null];
-          }));
-          const invalidRepros=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
-            const v=json('invalid-repro-'+m+'.json');return [label,v?{
-              assertionId:['w015_d_first_early_issue_wait','w015_writer_first_receipt_lock'].includes(v.assertionId)?v.assertionId:null,
-              expectedQueryKind:kind(v.expectedQueryKind),actualQueryKind:kind(v.actualQueryKind),
-              queryVisibility:visibility(v.queryVisibility),
-              waiterPid:pid(v.waiterPid),blockerPid:pid(v.blockerPid),
-            }:null];
-          }));
-          const retryEligibility=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
-            const v=json('retry-eligibility-'+m+'.json');return [label,v?{
-              schema:'p04-int2-w017-retry-eligibility.v1',mode:m,
-              actualMode:typeof v.actualMode==='string'?v.actualMode:null,
-              eligible:v.eligible===true,fixedPortFallbackExpected:v.fixedPortFallbackExpected===true,
-            }:null];
-          }));
-          const retryHandshake=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
-            const v=json('retry-handshake-'+m+'.json');return [label,v?{
-              schema:'p04-int2-w017-retry-handshake.v1',mode:m,
-              actualMode:typeof v.actualMode==='string'?v.actualMode:null,
-              eligible:v.eligible===true,bindCheckEntered:v.bindCheckEntered===true,
-              collisionReleased:v.collisionReleased===true,
-              originalPortCollisionOwner:v.originalPortCollisionOwner===99001?99001:null,
-              spawnCount:Number.isSafeInteger(v.spawnCount)?v.spawnCount:null,
-              logCount:Number.isSafeInteger(v.logCount)?v.logCount:null,
-            }:null];
-          }));
-          const retryFailure=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
-            const v=json('retry-failure-'+m+'.json');return [label,v?{
-              schema:'p04-int2-w017-retry-failure.v1',mode:m,
-              phase:typeof v.phase==='string'?v.phase:null,
-              failureLabel:['first_starting_committed','private_bind_check_entered','retry_parent_locked_log_hook'].includes(v.failureLabel)?v.failureLabel:'other',
-              actualMode:typeof v.actualMode==='string'?v.actualMode:null,
-              eligible:v.eligible===true,bindCheckEntered:v.bindCheckEntered===true,
-              collisionReleased:v.collisionReleased===true,
-              writerTerminal:['settled','rejected'].includes(v.writerTerminal)?v.writerTerminal:null,
-              errorName:typeof v.errorName==='string'&&/^[A-Za-z0-9_.-]{1,128}$/.test(v.errorName)?v.errorName:null,
-              errorCode:typeof v.errorCode==='string'&&/^[A-Z0-9]{5}$/.test(v.errorCode)?v.errorCode:null,
-              spawnCount:Number.isSafeInteger(v.spawnCount)?v.spawnCount:null,
-              logCount:Number.isSafeInteger(v.logCount)?v.logCount:null,
-              pending:{d:typeof v.pending?.d==='string'?v.pending.d:null,writer:typeof v.pending?.writer==='string'?v.pending.writer:null,gate:typeof v.pending?.gate==='string'?v.pending.gate:null},
-            }:null];
-          }));
-          const safeId=v=>typeof v==='string'&&/^[0-9a-f-]{36}$/i.test(v)?v:null;
-          const safeFakePid=v=>v===89001||v===89002?v:null;
-          const safePort=v=>Number.isSafeInteger(v)&&v>0&&v<65536?v:null;
-          const safeLifecycleStatus=v=>['starting','stopped','running','failed'].includes(v)?v:null;
-          const retryLifecycle=Object.fromEntries(['retry_writer_first','retry_d_first'].map(label=>{
-            const m=mode[label],v=json('retry-lifecycle-'+m+'.json');
-            const trace=Array.isArray(v?.trace)?v.trace.slice(0,32).map(x=>({
-              sequence:Number.isSafeInteger(x.sequence)?x.sequence:null,
-              runtimeServiceId:safeId(x.runtimeServiceId),status:safeLifecycleStatus(x.status),
-              port:safePort(x.port),
-              providerRef:x.providerRef==='89001'||x.providerRef==='89002'?x.providerRef:null,
-              stoppedAtSet:x.stoppedAtSet===true,
+          const safeLocks=label=>{
+            const mode=lockMode[label],d=json('lock-'+mode+'.json');
+            if(!d)return null;
+            const lockEvidence=Array.isArray(d.lockEvidence)?d.lockEvidence.slice(0,4).map(x=>({
+              waiterName:['w009-D','w009-writer','w009-gate'].includes(x.waiterName)?x.waiterName:null,
+              blockerName:['w009-D','w009-writer','w009-gate'].includes(x.blockerName)?x.blockerName:null,
+              waiterPid:Number.isSafeInteger(x.waiterPid)&&x.waiterPid>0?x.waiterPid:null,
+              blockerPid:Number.isSafeInteger(x.blockerPid)&&x.blockerPid>0?x.blockerPid:null,
+              waitEvent:['transactionid','tuple','relation','advisory'].includes(x.waitEvent)?x.waitEvent:null,
+              waitSqlKind:kind(x.waitSqlKind),blockerSqlKind:kind(x.blockerSqlKind),
+              blockingLockTypes:Array.isArray(x.blockingLockTypes)?x.blockingLockTypes.slice(0,8).map(v=>['transactionid','tuple','relation','advisory','virtualxid'].includes(v)?v:'other'):[],
+              blockingLockModes:Array.isArray(x.blockingLockModes)?x.blockingLockModes.slice(0,8).map(v=>['ShareLock','ExclusiveLock','RowShareLock','RowExclusiveLock','AccessShareLock','AccessExclusiveLock','ShareUpdateExclusiveLock','ShareRowExclusiveLock'].includes(v)?v:'other'):[],
+              queryVisibility:safeVisibility(x.queryVisibility),proven:x.proven===true,
             })):[];
-            const mockEvents=Array.isArray(v?.mockEvents)?v.mockEvents.slice(0,32).map(x=>({
-              sequence:Number.isSafeInteger(x.sequence)?x.sequence:null,
-              kind:['spawn','terminate','registry_write','registry_remove'].includes(x.kind)?x.kind:null,
-              pid:safeFakePid(x.pid),runtimeServiceId:safeId(x.runtimeServiceId),port:safePort(x.port),
-            })):[];
-            const finalRows=Array.isArray(v?.finalRows)?v.finalRows.slice(0,4).map(x=>({
-              id:safeId(x.id),status:safeLifecycleStatus(x.status),port:safePort(x.port),
-              providerRef:x.providerRef==='89001'||x.providerRef==='89002'?x.providerRef:null,
-              stoppedAtSet:x.stoppedAtSet===true,
-            })):[];
-            const registry=Array.isArray(v?.registry)?v.registry.slice(0,4).map(x=>({
-              runtimeServiceId:safeId(x.runtimeServiceId),pid:safeFakePid(x.pid),port:safePort(x.port),
-            })):[];
-            return [label,v?{
-              schema:'p04-int2-w018-retry-lifecycle.v1',mode:m,
-              firstRuntimeRow:v.firstRuntimeRow?{id:safeId(v.firstRuntimeRow.id),port:safePort(v.firstRuntimeRow.port)}:null,
-              returnedRef:v.returnedRef?{
-                id:safeId(v.returnedRef.id),port:safePort(v.returnedRef.port),
-                status:safeLifecycleStatus(v.returnedRef.status),
+            return {
+              mode,sourceRunId:safeId(d.sourceRunId),candidateId:safeId(d.candidateId),
+              dHttp:safeInt(d.dHttp),finalStatus:safeStatus(d.finalStatus),acceptedAuditRows:safeInt(d.acceptedAuditRows),
+              writerOk:typeof d.writerResult?.ok==='boolean'?d.writerResult.ok:null,spawnCount:safeInt(d.spawnCount),
+              runIds:Array.isArray(d.runIds)?d.runIds.slice(0,8).map(safeId).filter(Boolean):[],
+              originalAdapterCalls:Array.isArray(d.originalAdapterCalls)?d.originalAdapterCalls.slice(0,8).map(safeId).filter(Boolean):[],
+              serviceRowCount:Array.isArray(d.serviceRows)?d.serviceRows.length:null,
+              earlyIssueWait:d.earlyIssueWait?{
+                sqlKind:kind(d.earlyIssueWait.sqlKind),
+                waiterPid:Number.isSafeInteger(d.earlyIssueWait.waiterPid)?d.earlyIssueWait.waiterPid:null,
+                blockerPid:Number.isSafeInteger(d.earlyIssueWait.blockerPid)?d.earlyIssueWait.blockerPid:null,
+                serviceRowsBeforeRelease:safeInt(d.earlyIssueWait.serviceRowsBeforeRelease),
+                spawnCountBeforeRelease:safeInt(d.earlyIssueWait.spawnCountBeforeRelease),
               }:null,
-              trace,mockEvents,
-              activeFakePids:Array.isArray(v.activeFakePids)?v.activeFakePids.map(safeFakePid).filter(Boolean):[],
-              registry,finalRows,
-            }:null];
-          }));
-          const retryCleanup=Object.fromEntries(['retry_writer_first','retry_d_first'].map(label=>{
-            const m=mode[label],v=json('retry-cleanup-'+m+'.json');
+              quarantineRescueStub:Array.isArray(d.events)&&d.events.some(e=>e?.name==='PRE_TX_RESCUE_STUB'),
+              lockEvidence,
+            };
+          };
+          const safeScope=mode=>{
+            const d=json('scope-'+mode+'-observation.json');
+            if(!d)return null;
+            const t=d.scopeTrace&&typeof d.scopeTrace==='object'?d.scopeTrace:null;
+            return {
+              mode:typeof d.mode==='string'?d.mode:null,
+              runId:safeId(d.runId),candidateId:safeId(d.candidateId),
+              candidateStatusVersion:safeInt(d.candidateStatusVersion),
+              sourceTerminal:safeStatus(d.sourceTerminal),reviewerHttp:safeInt(d.reviewerHttp),
+              after:safeStatus(d.after),afterVersion:safeInt(d.afterVersion),acceptedAuditRows:safeInt(d.acceptedAuditRows),
+              observedRuns:Array.isArray(d.observedRuns)?d.observedRuns.slice(0,8).map(x=>({id:safeId(x.id),status:safeStatus(x.status)})):[],
+              adapterCalls:Array.isArray(d.adapterCalls)?d.adapterCalls.slice(0,8).map(safeId).filter(Boolean):[],
+              admissionChecks:Array.isArray(d.admissionChecks)?d.admissionChecks.slice(0,8).map(safeId).filter(Boolean):[],
+              scopeTrace:t?{
+                channel:typeof t.channel==='string'&&['FIXTURE_SQL_INDIRECT_PARENT_ONLY','DB_ONLY_DEFENSE_NOT_LIFECYCLE','AUTHORIZED_HTTP_PATCH'].includes(t.channel)?t.channel:null,
+                directPW:t.directPW===null?null:safeId(t.directPW),
+                ewId:safeId(t.ewId),parentId:safeId(t.parentId),
+                revisionB:safeRev(t.revisionB),revisionD:safeRev(t.revisionD),
+                expectedCode:typeof t.expectedCode==='string'&&/^[a-z0-9_]{1,80}$/.test(t.expectedCode)?t.expectedCode:null,
+              }:null,
+            };
+          };
+          const safeDocument=()=>{
+            const d=json('document-observation.json');if(!d)return null;
+            return {
+              mode:d.mode==='document'?'document':null,runId:safeId(d.runId),candidateId:safeId(d.candidateId),
+              sourceTerminal:safeStatus(d.sourceTerminal),reviewerHttp:safeInt(d.reviewerHttp),
+              after:safeStatus(d.after),acceptedAuditRows:safeInt(d.acceptedAuditRows),
+              observedRuns:Array.isArray(d.observedRuns)?d.observedRuns.slice(0,8).map(x=>({id:safeId(x.id),status:safeStatus(x.status)})):[],
+              adapterCalls:Array.isArray(d.adapterCalls)?d.adapterCalls.slice(0,8).map(safeId).filter(Boolean):[],
+              admissionChecks:Array.isArray(d.admissionChecks)?d.admissionChecks.slice(0,8).map(safeId).filter(Boolean):[],
+            };
+          };
+          const stageNames={document:'document',rollback:'rollback',
+            indirect_parent_pw_change_db:'indirect_parent_pw_change_db',
+            indirect_parent_pw_aba_db:'indirect_parent_pw_aba_db',...lockMode};
+          const safeStages={};
+          const cleanup={};
+          for(const [label,m] of Object.entries(stageNames)){
+            const raw=read('stages-'+m+'.jsonl');
+            const rows=raw?raw.split('\n').filter(Boolean).flatMap(line=>{
+              try{const x=JSON.parse(line);return [{sequence:safeInt(x.sequence),stage:typeof x.stage==='string'&&/^[a-z0-9_]{1,80}$/.test(x.stage)?x.stage:null}]}catch{return []}
+            }):[];
+            safeStages[label]=rows;
+            cleanup[label]={
+              outerComplete:rows.some(x=>x.stage==='outer_cleanup_complete'),
+              contentionComplete:label in lockMode?rows.some(x=>x.stage==='contention_cleanup_complete'):null,
+            };
+          }
+          const cases=Object.fromEntries(Object.entries(names).map(([k,v])=>[k,summary(k,v)]));
+          for(const [k,v] of Object.entries(cases))write('vitest-'+k+'-summary.json',v);
+          const locks=Object.fromEntries(Object.keys(lockMode).map(k=>[k,safeLocks(k)]));
+          const preflights=Object.fromEntries(Object.entries(lockMode).map(([label,m])=>{
+            const v=json('preflight-'+m+'.json');
             return [label,v?{
-              schema:'p04-int2-w018-retry-cleanup.v1',mode:m,
-              terminatedPids:Array.isArray(v.terminatedPids)?v.terminatedPids.map(safeFakePid).filter(Boolean):[],
-              activeFakePids:Array.isArray(v.activeFakePids)?v.activeFakePids.map(safeFakePid).filter(Boolean):[],
-              registrySize:Number.isSafeInteger(v.registrySize)?v.registrySize:null,
-              replacementPid:safeFakePid(v.replacementPid),
-              replacementTerminated:v.replacementTerminated===true,
-              samplerStopped:v.samplerStopped===true,
-              contendersSettled:v.contendersSettled===true,
+              case:m,configuredLimitBytes:safeInt(v.configuredLimitBytes),generatedQueryBytes:safeInt(v.generatedQueryBytes),
+              safetyMarginBytes:1024,fullQueryKind:kind(v.fullQueryKind),prefix500QueryKind:kind(v.prefix500QueryKind),
+              fullHasFromIssues:v.fullHasFromIssues===true,fullHasForUpdate:v.fullHasForUpdate===true,valid:v.valid===true,
+              invalidReproPresent:json('invalid-repro-'+m+'.json')!==null,
             }:null];
           }));
-          const preassert=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
-            const v=json('preassert-'+m+'.json');
-            if(!v)return [label,null];
-            const safeArray=(xs,allow)=>Array.isArray(xs)?xs.slice(0,8).map(x=>allow.includes(x)?x:'other'):[];
-            const safeBool=x=>typeof x==='boolean'?x:null;
-            return [label,{
-              schema:'p04-int2-w015-preassert.v1',case:m,mode:m,
-              assertionId:['w015_d_first_early_issue_wait','w015_writer_first_receipt_lock'].includes(v.assertionId)?v.assertionId:null,
-              expectedQueryKind:kind(v.expectedQueryKind),actualQueryKind:kind(v.actualQueryKind),
-              waiterRole:['w009-D','w009-writer','w009-gate'].includes(v.waiterRole)?v.waiterRole:null,
-              blockerRole:['w009-D','w009-writer','w009-gate'].includes(v.blockerRole)?v.blockerRole:null,
-              waiterPid:pid(v.waiterPid),blockerPid:pid(v.blockerPid),
-              waitEvent:['transactionid','tuple','relation','advisory','other'].includes(v.waitEvent)?v.waitEvent:'other',
-              lockTypes:safeArray(v.lockTypes,['transactionid','tuple','relation','advisory','virtualxid','other']),
-              lockModes:safeArray(v.lockModes,['ShareLock','ExclusiveLock','RowShareLock','RowExclusiveLock','AccessShareLock','AccessExclusiveLock','ShareUpdateExclusiveLock','ShareRowExclusiveLock','other']),
-              observedBlockingEdge:v.observedBlockingEdge===true,
-              queryVisibility:visibility(v.queryVisibility),
-              pending:{d:safeBool(v.pending?.d),writer:safeBool(v.pending?.writer),gate:safeBool(v.pending?.gate)},
-              cleanup:{contentionComplete:safeBool(v.cleanup?.contentionComplete),outerComplete:safeBool(v.cleanup?.outerComplete)},
-              httpCode:Number.isInteger(v.httpCode)?v.httpCode:null,
-              finalStatus:['done','in_review','running','starting'].includes(v.finalStatus)?v.finalStatus:null,
-              auditCount:Number.isSafeInteger(v.auditCount)?v.auditCount:null,
-              runs:Number.isSafeInteger(v.runs)?v.runs:null,
-              calls:Number.isSafeInteger(v.calls)?v.calls:null,
-              spawns:Number.isSafeInteger(v.spawns)?v.spawns:null,
-            }];
-          }));
-          const locks=Object.fromEntries(Object.keys(mode).map(k=>[k,safeLocks(k)]));
+          const document=safeDocument();
+          const rollback=safeScope('rollback');
+          const indirectChange=safeScope('indirect_parent_pw_change_db');
+          const indirectAba=safeScope('indirect_parent_pw_aba_db');
+
+          const passes=Object.values(cases).every(c=>c.classification==='PASS');
+          const infra=['install','sdk','migrations','typecheck'].every(n=>code(n)===0);
+          const cleanupPass=Object.entries(cleanup).every(([label,c])=>
+            c.outerComplete===true && (!(label in lockMode)||c.contentionComplete===true));
+          const visibilityOracle=Object.entries(preflights).every(([,v])=>v!==null&&v.valid===true&&
+            v.configuredLimitBytes===16384&&v.generatedQueryBytes!==null&&
+            v.generatedQueryBytes+1024<v.configuredLimitBytes&&
+            v.fullQueryKind==='issues.select_for_update'&&v.prefix500QueryKind!=='issues.select_for_update'&&
+            v.invalidReproPresent===false);
           const lockOracle=Object.entries(locks).every(([label,d])=>{
-            if(!d||d.dHttp!==200||d.finalStatus!=='done'||d.acceptedAuditRows!==1||d.writerOk!==true||
-              d.lockEvidence.length!==(label.endsWith('d_first')?2:1))return false;
-            const pair=d.lockEvidence.map(x=>[x.waiterName,x.blockerName]);
-            const wanted=label.endsWith('d_first')
+            if(!d||d.lockEvidence.length!==2||d.spawnCount!==0||d.runIds.length!==1||
+               d.runIds[0]!==d.sourceRunId||d.originalAdapterCalls.length!==1||
+               d.originalAdapterCalls[0]!==d.sourceRunId)return false;
+            const dFirst=label.endsWith('d_first');
+            const expected=dFirst
               ? [['w009-D','w009-gate'],['w009-writer','w009-D']]
-              : [['w009-D','w009-writer']];
-            if(JSON.stringify(pair)!==JSON.stringify(wanted))return false;
-            if(!d.lockEvidence.every(x=>x.proven===true&&Number(x.waiterPid)>0&&
-              Number(x.blockerPid)>0&&x.blockingLockTypes?.length>0))return false;
-            const early=label.endsWith('d_first');
-            const issueWait=d.lockEvidence.at(-1);
-            if(issueWait.waitSqlKind!==(early?'issues.select_for_key_share':'issues.select_for_update')||
-              !issueWait.blockingLockTypes.includes('transactionid')||
-              !issueWait.blockingLockModes.includes('ShareLock'))return false;
-            if(early&&(!d.earlyIssueWait||d.earlyIssueWait.sqlKind!=='issues.select_for_key_share'||
-              d.earlyIssueWait.serviceRowsBeforeRelease!==(label.startsWith('retry_')?1:0)||
-              d.earlyIssueWait.spawnCountBeforeRelease!==(label.startsWith('retry_')?1:0)))return false;
-            if(d.spawnCount!==(label.startsWith('retry_')?2:1))return false;
-            if(!d.runIds.includes(d.sourceRunId)||
-              d.originalAdapterCalls.filter(id=>id===d.sourceRunId).length!==1)return false;
+              : [['w009-writer','w009-gate'],['w009-D','w009-writer']];
+            const actual=d.lockEvidence.map(x=>[x.waiterName,x.blockerName]);
+            if(JSON.stringify(actual)!==JSON.stringify(expected)||
+               !d.lockEvidence.every(x=>x.proven===true&&x.waiterPid>0&&x.blockerPid>0&&x.blockingLockTypes.length>0))return false;
+            const issueWait=d.lockEvidence[1];
+            const expectedKind=dFirst?'issues.select_for_key_share':'issues.select_for_update';
+            if(issueWait.waitSqlKind!==expectedKind||
+               issueWait.queryVisibility?.captureComplete!==true||
+               issueWait.queryVisibility?.clientTruncated!==false||
+               issueWait.queryVisibility?.hasFromIssues!==true||
+               (dFirst?issueWait.queryVisibility?.hasForKeyShare!==true:issueWait.queryVisibility?.hasForUpdate!==true)||
+               !issueWait.blockingLockTypes.includes('transactionid')||
+               !issueWait.blockingLockModes.includes('ShareLock'))return false;
+            if(dFirst){
+              if(d.dHttp!==200||d.finalStatus!=='done'||d.acceptedAuditRows!==1||
+                 d.earlyIssueWait?.sqlKind!=='issues.select_for_key_share'||
+                 d.earlyIssueWait?.serviceRowsBeforeRelease!==0||d.earlyIssueWait?.spawnCountBeforeRelease!==0)return false;
+            }else{
+              if(d.dHttp!==409||d.finalStatus!=='in_review'||d.acceptedAuditRows!==0)return false;
+            }
+            if(label.startsWith('quarantine_')&&d.quarantineRescueStub!==true)return false;
             return true;
           });
-          const doc=json('document-observation.json');
-          const aba=json('http-aba-observation.json');
-          const documentary=doc?{
-            sourceRunId:doc.sourceRunId,sourceTerminal:doc.sourceTerminal,
-            reviewerHttp:doc.reviewerHttp,after:doc.after,acceptedAuditRows:doc.acceptedAuditRows,
-            observedRuns:doc.observedRuns,adapterCalls:doc.adapterCalls,admissionChecks:doc.admissionChecks
-          }:null;
-          const httpAba=aba?{
-            sourceRunId:aba.sourceRunId,stage:aba.stage,preconditionsValid:aba.preconditionsValid,
-            reviewerHttp:aba.reviewerHttp,reviewerCode:aba.reviewerCode,
-            finalStatus:aba.finalStatus,acceptedAuditRows:aba.acceptedAuditRows,
-            allRuns:aba.allRuns,admissionChecks:aba.admissionChecks,
-            adapterCalls:aba.adapterCalls,actualAdapterCalls:aba.actualAdapterCalls
-          }:null;
+          const documentOracle=document?.sourceTerminal==='succeeded'&&document.reviewerHttp===200&&
+            document.after==='done'&&document.acceptedAuditRows===1&&document.runId!==null&&
+            document.observedRuns.length===1&&document.observedRuns[0]?.id===document.runId&&
+            document.adapterCalls.length===1&&document.adapterCalls[0]===document.runId&&
+            document.admissionChecks.length===1&&document.admissionChecks[0]===document.runId;
+          const rollbackOracle=rollback?.sourceTerminal==='succeeded'&&rollback.reviewerHttp!==null&&
+            rollback.reviewerHttp>=500&&rollback.after==='in_review'&&rollback.acceptedAuditRows===0&&
+            rollback.afterVersion===rollback.candidateStatusVersion&&rollback.runId!==null&&
+            rollback.observedRuns.length===1&&rollback.observedRuns[0]?.id===rollback.runId&&
+            rollback.adapterCalls.length===1&&rollback.adapterCalls[0]===rollback.runId&&
+            rollback.admissionChecks.length===1&&rollback.admissionChecks[0]===rollback.runId;
+          const indirectOracle=(v,delta)=>v?.sourceTerminal==='succeeded'&&v.reviewerHttp===409&&
+            v.after==='in_review'&&v.acceptedAuditRows===0&&v.afterVersion===v.candidateStatusVersion&&
+            v.scopeTrace?.channel==='FIXTURE_SQL_INDIRECT_PARENT_ONLY'&&v.scopeTrace.directPW===null&&
+            v.scopeTrace.parentId!==null&&v.scopeTrace.ewId!==null&&v.scopeTrace.expectedCode==='governed_candidate_stale'&&
+            v.scopeTrace.revisionB!==null&&v.scopeTrace.revisionD!==null&&
+            BigInt(v.scopeTrace.revisionD)===BigInt(v.scopeTrace.revisionB)+BigInt(delta);
+          const indirectOraclePass=indirectOracle(indirectChange,1)&&indirectOracle(indirectAba,2);
+
           const out={
-            schema:'p04-int2-w018-classification.v1',base:'145999e13fc5f7b1e5b3a63c20a7c81f91083222',
+            schema:'p04-int2-w020-classification.v1',
+            base:'1e84af70a0fa73e3f33325be3be2dfb59e379270',
             sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,
             setup:{install:code('install'),sdk:code('sdk'),migrations:code('migrations'),typecheck:code('typecheck')},
-            cases,locks,preflights,invalidRepros,retryEligibility,retryHandshake,retryFailure,retryLifecycle,retryCleanup,preassert,stages,cleanup,documentary,httpAba,lockOracle,
-            scopeRemaining:'reconcile/indirect/rollback NOT_RUN; P04 OPEN',
+            cases,document,rollback,indirectChange,indirectAba,locks,preflights,cleanup,safeStages,
+            oracles:{passes,infra,cleanupPass,visibilityOracle,lockOracle,documentOracle,rollbackOracle,indirectOracle:indirectOraclePass},
+            scope:'eight existing residual selectors only; P04 status remains coordinator-owned',
           };
-          const visibilityOracle=Object.entries(preflights).every(([label,v])=>v!==null&&
-            v.valid===true && v.configuredLimitBytes===16384 &&
-            v.generatedQueryBytes+1024<v.configuredLimitBytes &&
-            v.fullQueryKind==='issues.select_for_update' &&
-            v.prefix500QueryKind!=='issues.select_for_update' && invalidRepros[label]===null);
-          out.visibilityOracle=visibilityOracle;
-          const retryFixtureOracle=['retry_writer_first','retry_d_first'].every(label=>{
-            const e=retryEligibility[label],h=retryHandshake[label],f=retryFailure[label];
-            return e?.actualMode==='isolated_workspace'&&e.eligible===true&&e.fixedPortFallbackExpected===true&&
-              h?.actualMode==='isolated_workspace'&&h.eligible===true&&h.bindCheckEntered===true&&
-              h.collisionReleased===true&&h.originalPortCollisionOwner===99001&&f===null;
-          });
-          out.retryFixtureOracle=retryFixtureOracle;
-          const retryLifecycleOracle=['retry_writer_first','retry_d_first'].every(label=>{
-            const l=retryLifecycle[label],c=retryCleanup[label];
-            if(!l||!c||!l.firstRuntimeRow||!l.returnedRef||l.finalRows.length!==1||
-               l.registry.length!==1||JSON.stringify(l.activeFakePids)!==JSON.stringify([89002]))return false;
-            const id=l.firstRuntimeRow.id,originalPort=l.firstRuntimeRow.port;
-            const rows=l.trace.filter(x=>x.runtimeServiceId===id);
-            const i0=rows.findIndex(x=>x.status==='starting'&&x.port===originalPort&&x.providerRef==='89001'&&!x.stoppedAtSet);
-            const i1=rows.findIndex((x,i)=>i>i0&&x.status==='stopped'&&x.port===originalPort&&x.providerRef==='89001'&&x.stoppedAtSet);
-            const i2=rows.findIndex((x,i)=>i>i1&&x.status==='starting'&&x.port!==originalPort&&x.providerRef==='89002'&&!x.stoppedAtSet);
-            const i3=rows.findIndex((x,i)=>i>i2&&x.status==='running'&&x.port!==originalPort&&x.providerRef==='89002'&&!x.stoppedAtSet);
-            if(!(i0>=0&&i1>i0&&i2>i1&&i3>i2))return false;
-            const final=l.finalRows[0],reg=l.registry[0];
-            if(final.id!==id||final.status!=='running'||final.port===originalPort||
-               final.providerRef!=='89002'||final.stoppedAtSet||
-               l.returnedRef.id!==id||l.returnedRef.port!==final.port||l.returnedRef.status!=='running'||
-               reg.runtimeServiceId!==id||reg.pid!==89002||reg.port!==final.port)return false;
-            const events=l.mockEvents;
-            const terminate=events.findIndex(x=>x.kind==='terminate'&&x.pid===89001);
-            const remove=events.findIndex(x=>x.kind==='registry_remove'&&x.runtimeServiceId===id&&x.pid===89001);
-            const spawn=events.findIndex(x=>x.kind==='spawn'&&x.pid===89002);
-            const write=events.findIndex(x=>x.kind==='registry_write'&&x.runtimeServiceId===id&&x.pid===89002);
-            if(!(terminate>=0&&remove>terminate&&spawn>remove&&write>spawn))return false;
-            return c.replacementPid===89002&&c.replacementTerminated===true&&
-              c.registrySize===0&&c.activeFakePids.length===0&&c.samplerStopped===true&&
-              c.contendersSettled===true&&c.terminatedPids.includes(89001)&&c.terminatedPids.includes(89002);
-          });
-          out.retryLifecycleOracle=retryLifecycleOracle;
-          const preassertOracle=Object.entries(preassert).every(([label,v])=>v!==null&&
-            v.queryVisibility?.captureComplete===true &&
-            v.queryVisibility?.clientTruncated===false &&
-            v.queryVisibility?.hasFromIssues===true &&
-            (label.endsWith('d_first')?v.queryVisibility.hasForKeyShare:v.queryVisibility.hasForUpdate) &&
-
-            v.observedBlockingEdge&&v.waiterPid>0&&v.blockerPid>0&&
-            v.expectedQueryKind===v.actualQueryKind&&
-            v.expectedQueryKind===(label.endsWith('d_first')?'issues.select_for_key_share':'issues.select_for_update'));
-          out.preassertOracle=preassertOracle;
-          const passes=Object.values(cases).every(c=>c.classification==='PASS');
-          const cleanupPass=Object.values(cleanup).every(x=>x.outerComplete===true);
-          const infra=Object.values(out.setup).every(x=>x===0);
-          const docPass=documentary?.reviewerHttp===200&&documentary?.after==='done'&&documentary?.acceptedAuditRows===1;
-          const abaPass=httpAba?.reviewerHttp===409&&httpAba?.finalStatus==='in_review'&&
-            httpAba?.acceptedAuditRows===0&&httpAba?.preconditionsValid===true;
-          out.overall=infra&&passes&&lockOracle&&visibilityOracle&&retryFixtureOracle&&retryLifecycleOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
+          out.overall=passes&&infra&&cleanupPass&&visibilityOracle&&lockOracle&&documentOracle&&rollbackOracle&&indirectOraclePass
+            ?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
           write('classification.json',out);
-          for(const [label,v] of Object.entries(stages))write('stages-'+label+'.json',v);
+          for(const [label,v] of Object.entries(safeStages))write('stages-'+label+'.json',v);
           if(read('identity.txt'))fs.copyFileSync(dir+'/identity.txt',safe+'/identity.txt');
           if(read('changed-files.txt'))fs.copyFileSync(dir+'/changed-files.txt',safe+'/changed-files.txt');
           if(read('source-sha256.txt'))fs.copyFileSync(dir+'/source-sha256.txt',safe+'/source-sha256.txt');
@@ -471,8 +371,7 @@ jobs:
             if(read(n+'.exit_code')!==null)fs.copyFileSync(dir+'/'+n+'.exit_code',safe+'/'+n+'.exit_code');
           }
           console.log(JSON.stringify({overall:out.overall,sha:out.sha,run:out.run,
-            cases:Object.fromEntries(Object.entries(cases).map(([k,v])=>[k,v.classification])),
-            lockOracle,visibilityOracle,retryFixtureOracle,retryLifecycleOracle,preassertOracle,cleanupPass,docPass,abaPass}));
+            cases:Object.fromEntries(Object.entries(cases).map(([k,v])=>[k,v.classification])),oracles:out.oracles}));
           if(out.overall!=='PASS_SCOPED')process.exitCode=1;
           NODE
 
@@ -487,8 +386,7 @@ jobs:
           while IFS= read -r -d '' path; do
             if grep -Eiq 'params:|authorization:|bearer[[:space:]]|secret[[:space:]]*[:=]|password[[:space:]]*[:=]|BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY' "$path"; then
               printf 'WITHHELD_SAFETY_CHECK: %s\n' "$(basename "$path")" >> .int2-safe/withheld-evidence.txt
-              # The unsafe evidence is never uploaded, regardless of test outcome.
-              mv -- "$path" "$RUNNER_TEMP/w01-018-withheld-$(basename "$path")"
+              mv -- "$path" "$RUNNER_TEMP/w01-020-withheld-$(basename "$path")"
               unsafe=1
             fi
           done < <(find .int2-safe -maxdepth 1 -type f ! -name withheld-evidence.txt -print0)
@@ -496,11 +394,11 @@ jobs:
           find .int2-safe -maxdepth 1 -type f ! -name evidence-sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > .int2-safe/evidence-sha256.txt
           test "$unsafe" -eq 0
 
-      - name: Always upload sanitized W018 evidence (no raw test logs or SQL params)
+      - name: Always upload sanitized W020 evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: w01-018-six-safe-evidence
+          name: w01-020-eight-safe-evidence
           path: .int2-safe/
           include-hidden-files: true
           if-no-files-found: warn
