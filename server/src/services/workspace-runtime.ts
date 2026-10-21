@@ -7668,6 +7668,19 @@ async function lockWorkspaceRuntimeStartParents(
       code: "workspace_runtime_parent_stale",
     });
   }
+  // The decision route holds issues FOR UPDATE before taking PW/EW locks.
+  // Reserve the same lock order in both normal and deferred-retry runtime TXs:
+  // this weak issue lock also protects the immediate service.issueId FK.
+  if (input.issue?.id) {
+    const [lockedIssue] = await db.select({ id: issues.id })
+      .from(issues).where(and(
+        eq(issues.id, input.issue.id),
+        eq(issues.companyId, input.actor.companyId),
+      )).for("key share").limit(1);
+    if (!lockedIssue) throw conflict("Runtime start issue vanished", {
+      code: "workspace_runtime_parent_stale",
+    });
+  }
   const parentIds = [...new Set([
     input.workspace.workspaceId ?? null,
     probe?.projectWorkspaceId ?? null,

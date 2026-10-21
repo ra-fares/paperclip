@@ -3019,64 +3019,58 @@ type W011CatalogRow = {
   xact_start: string | Date | null;
 };
 
+// W014: bounded structured diagnostics. No raw Drizzle message, stack, SQL or params.
 type W013SerializedError = {
   name: string | null;
-  message: string | null;
-  stack: string | null;
   code: string | null;
-  severity: string | null;
-  detail: string | null;
+  routine: string | null;
   constraint: string | null;
   table: string | null;
-  routine: string | null;
   cause: W013SerializedError | { cycle: true } | null;
 };
-
-function w013ReadErrorString(value: object, key: string): string | null {
-  try {
-    const raw = (value as Record<string, unknown>)[key];
-    return typeof raw === "string" ? raw : raw === null || raw === undefined ? null : String(raw);
-  } catch {
-    return null;
-  }
+function w014SafeErrorField(value: object, key: "name" | "code" | "routine" | "constraint" | "table") {
+  let raw: unknown;
+  try { raw = (value as Record<string, unknown>)[key]; } catch { return null; }
+  if (typeof raw !== "string" || raw.length > 128) return null;
+  if (key === "code") return /^[A-Z0-9]{5}$/.test(raw) ? raw : null;
+  return /^[a-zA-Z0-9_.-]{1,128}$/.test(raw) ? raw : null;
 }
-
-function w013SerializeError(
-  error: unknown,
-  seen = new Set<object>(),
-  depth = 0,
-): W013SerializedError | { cycle: true } {
+function w013SerializeError(error: unknown, seen = new Set<object>(), depth = 0):
+  W013SerializedError | { cycle: true } {
   if (!error || typeof error !== "object") {
-    return {
-      name: null,
-      message: typeof error === "string" ? error : String(error),
-      stack: null,
-      code: null,
-      severity: null,
-      detail: null,
-      constraint: null,
-      table: null,
-      routine: null,
-      cause: null,
-    };
+    return { name: null, code: null, routine: null, constraint: null, table: null, cause: null };
   }
   if (seen.has(error)) return { cycle: true };
   seen.add(error);
-  const object = error as object;
   let cause: unknown = null;
-  try { cause = (object as { cause?: unknown }).cause ?? null; } catch {}
+  try { cause = (error as { cause?: unknown }).cause ?? null; } catch {}
   return {
-    name: w013ReadErrorString(object, "name"),
-    message: w013ReadErrorString(object, "message"),
-    stack: w013ReadErrorString(object, "stack"),
-    code: w013ReadErrorString(object, "code"),
-    severity: w013ReadErrorString(object, "severity"),
-    detail: w013ReadErrorString(object, "detail"),
-    constraint: w013ReadErrorString(object, "constraint"),
-    table: w013ReadErrorString(object, "table"),
-    routine: w013ReadErrorString(object, "routine"),
+    name: w014SafeErrorField(error, "name"),
+    code: w014SafeErrorField(error, "code"),
+    routine: w014SafeErrorField(error, "routine"),
+    constraint: w014SafeErrorField(error, "constraint"),
+    table: w014SafeErrorField(error, "table"),
     cause: cause && depth < 4 ? w013SerializeError(cause, seen, depth + 1) : null,
   };
+}
+function w014PgQueryKind(query: string): string {
+  if (/\bissues\b/i.test(query) && /\bFOR\s+KEY\s+SHARE\b/i.test(query))
+    return "issues.select_for_key_share";
+  if (/\bUPDATE\s+"?issues"?(?:\s|$)/i.test(query)) return "issues.update";
+  if (/\bproject_workspaces\b/i.test(query) && /\bFOR\s+UPDATE\b/i.test(query))
+    return "project_workspaces.select_for_update";
+  if (/\bexecution_workspaces\b/i.test(query) && /\bFOR\s+UPDATE\b/i.test(query))
+    return "execution_workspaces.select_for_update";
+  if (/\bpg_advisory_(?:xact_)?lock\b/i.test(query)) return "advisory_lock";
+  return "other";
+}
+function w014CatalogSummary(rows: W011CatalogRow[]) {
+  return rows.map(row => ({
+    pid: row.pid, application_name: row.application_name,
+    blocking_pids: row.blocking_pids,
+    wait_event_type: row.wait_event_type, wait_event: row.wait_event,
+    state: row.state, queryKind: w014PgQueryKind(row.query),
+  }));
 }
 
 async function w013ReadFixtureLockSnapshot(
@@ -3103,7 +3097,7 @@ async function w013ReadFixtureLockSnapshot(
     port: workspaceRuntimeServices.port,
   }).from(workspaceRuntimeServices)
     .where(eq(workspaceRuntimeServices.executionWorkspaceId, executionWorkspaceId));
-  return { catalog, ungranted, services };
+  return { catalog: w014CatalogSummary(catalog), ungranted, services };
 }
 
 async function w013ReadRuntimeIssueForeignKey(observer: ReturnType<typeof createDb>) {
@@ -3245,11 +3239,11 @@ async function w009ObserveWait(
       }
     }
     if (candidates.length > 1) {
-      stage?.("wait_oracle_ambiguous", { waiterName, blockerName, catalog: rows });
+      stage?.("wait_oracle_ambiguous", { waiterName, blockerName, catalog: w014CatalogSummary(rows) });
       throw new Error("W011_AMBIGUOUS_WAIT_ORACLE " + JSON.stringify({
         waiterName, blockerName,
         candidates: candidates.map(({ waiter, blocker }) => ({ waiterPid: waiter.pid, blockerPid: blocker.pid })),
-        catalog: rows,
+        catalog: w014CatalogSummary(rows),
       }));
     }
     if (candidates.length === 1) {
@@ -3266,11 +3260,11 @@ async function w009ObserveWait(
           waitEvent: waiter.wait_event,
           blockingLockTypes: locks.map((row) => row.locktype),
           blockingLockModes: locks.map((row) => row.mode),
-          waitSql: waiter.query,
+          waitSqlKind: w014PgQueryKind(waiter.query),
           waiterState: waiter.state,
           blockerState: blocker.state,
-          blockerSql: blocker.query,
-          catalog: rows,
+          blockerSqlKind: w014PgQueryKind(blocker.query),
+          catalog: w014CatalogSummary(rows),
           proven: true as const,
         };
         stage?.("wait_observed", evidence);
@@ -3279,8 +3273,8 @@ async function w009ObserveWait(
     }
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
   }
-  stage?.("wait_oracle_timeout", { waiterName, blockerName, catalog: latest });
-  throw new Error("W011_INVALID_WAIT_ORACLE " + JSON.stringify({ waiterName, blockerName, catalog: latest }));
+  stage?.("wait_oracle_timeout", { waiterName, blockerName, catalog: w014CatalogSummary(latest) });
+  throw new Error("W011_INVALID_WAIT_ORACLE " + JSON.stringify({ waiterName, blockerName, catalog: w014CatalogSummary(latest) }));
 }
 
 type W009ContentionArgs = {
@@ -3346,6 +3340,10 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const beforeHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
   const fakeRegistry=new Map<string,unknown>();
   const lockEvidence:Array<Awaited<ReturnType<typeof w009ObserveWait>>>=[];
+  let earlyIssueWait: {
+    sqlKind: string; waiterPid: number; blockerPid: number;
+    serviceRowsBeforeRelease: number; spawnCountBeforeRelease: number;
+  } | null = null;
   const expectedLockRoles: Array<readonly [string,string]> = dFirst
     ? [["w009-D","w009-gate"],["w009-writer","w009-D"]]
     : reconcile
@@ -3361,8 +3359,8 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   const watchdogDetails=async(label:string)=>{
     const catalog=await contentionCatalog();
     const pending=pendingState();
-    stage("watchdog_timeout",{label,pending,catalog});
-    return {label,pending,catalog};
+    stage("watchdog_timeout",{label,pending,catalog:w014CatalogSummary(catalog)});
+    return {label,pending,catalog:w014CatalogSummary(catalog)};
   };
   const persistW013Json=(name:string,value:unknown)=>{
     const dir=process.env.INT2_W013_EVIDENCE_DIR;
@@ -3597,7 +3595,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       dTask=task;
       void task.then(
         (result)=>{dSettled=true;stage("D_settled",{httpStatus:result.status});},
-        (error)=>{dSettled=true;stage("D_rejected",{error:error instanceof Error?error.message:String(error)});},
+        (error)=>{dSettled=true;stage("D_rejected",{error:w013SerializeError(error)});},
       );
     };
     const launchGate=async()=>{
@@ -3678,7 +3676,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       writerTask=runner;
       void runner.then(
         ()=>{writerSettled=true;stage("writer_settled",{kind:"runtime"});},
-        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"runtime",error:error instanceof Error?error.message:String(error)});},
+        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"runtime",error:w013SerializeError(error)});},
       );
     };
     const startReconcile=()=>{
@@ -3690,7 +3688,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       writerTask=runner;
       void runner.then(
         ()=>{writerSettled=true;stage("writer_settled",{kind:"reconcile"});},
-        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"reconcile",error:error instanceof Error?error.message:String(error)});},
+        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"reconcile",error:w013SerializeError(error)});},
       );
     };
     const startWriter=async()=>{
@@ -3722,7 +3720,25 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       stage("writer_launch",{kind:retry?"retry":"runtime"});
       if(!retry)await startWriter();
       else {foreignReleased=true;foreignOwner.resolve(99001);}
-      lockEvidence.push(await w009ObserveWait(observer,"w009-writer","w009-D",stage));
+      const early = await w009ObserveWait(observer,"w009-writer","w009-D",stage);
+      lockEvidence.push(early);
+      expect(early.waitSqlKind).toBe("issues.select_for_key_share");
+      expect(early.blockingLockTypes).toContain("transactionid");
+      expect(early.blockingLockModes).toContain("ShareLock");
+      // Observe this before releasing D's gate. The second runtime TX
+      // cannot have acquired PW/EW or reserved/spawned the next service.
+      const beforeRelease = await observer.select({ id: workspaceRuntimeServices.id })
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.executionWorkspaceId,a.ewId));
+      earlyIssueWait = {
+        sqlKind: early.waitSqlKind, waiterPid: Number(early.waiterPid),
+        blockerPid: Number(early.blockerPid),
+        serviceRowsBeforeRelease: beforeRelease.length,
+        spawnCountBeforeRelease: spawnCount,
+      };
+      expect(beforeRelease).toHaveLength(retry?1:0);
+      expect(spawnCount).toBe(retry?1:0);
+      stage("early_issue_wait_before_reservation",earlyIssueWait);
       stage("gate_release",{reason:"required_waits_observed"});
       releaseGate.resolve();
     } else {
@@ -3743,7 +3759,13 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         ); // TX locks already acquired
       }
       launchD();
-      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-writer",stage));
+      const issueWait = await w009ObserveWait(observer,"w009-D","w009-writer",stage);
+      lockEvidence.push(issueWait);
+      if (!reconcile) {
+        expect(issueWait.waitSqlKind).toBe("issues.update");
+        expect(issueWait.blockingLockTypes).toContain("transactionid");
+        expect(issueWait.blockingLockModes).toContain("ShareLock");
+      }
       diagnosticPhase="writer_barrier_release";
       stage("writer_barrier_release",{reconcile});
       if(reconcile)releaseGate.resolve();else releaseLog.resolve();
@@ -3754,7 +3776,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     stage("settlement_enter",{pending:pendingState()});
     const [dResult,writerResult]=await Promise.all([
       dTask,writerTask.then(v=>({ok:true,value:v}),e=>({
-        ok:false,error:e instanceof Error?e.message:String(e),
+        ok:false,error:w013SerializeError(e),
         code:(e as {details?:{code?:unknown}})?.details?.code??null,
       })),
     ]);
@@ -3775,7 +3797,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       runIds:runs.map(r=>r.id),finalStatus:afterIssue?.status,finalVersion:afterIssue?.statusVersion,
       acceptedAuditRows:accepted.length,spawnCount,
       serviceRows:serviceRows.map(r=>({id:r.id,status:r.status,port:r.port})),
-      lockEvidence,events,
+      lockEvidence,events,earlyIssueWait,
       issueFkEvidence,
       errorCaptureCount:capturedErrors.length,
       errorCodes:capturedErrors.map(entry=>
@@ -3819,9 +3841,9 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     let catalog:W011CatalogRow[]=[];
     try{catalog=await contentionCatalog();}catch{}
     stage("contention_error",{
-      error:error instanceof Error?error.message:String(error),
+      error:w013SerializeError(error),
       pending:pendingState(),
-      catalog,
+      catalog:w014CatalogSummary(catalog),
       lockEvidence,
       events,
     });
@@ -3912,8 +3934,8 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     }
     stage("contention_cleanup_complete",{
       pending:pendingState(),
-      cleanupErrors:cleanupErrors.map((error)=>error instanceof Error?error.message:String(error)),
-      primaryError:primaryError instanceof Error?primaryError.message:primaryError?String(primaryError):null,
+      cleanupErrors:cleanupErrors.map(error=>w013SerializeError(error)),
+      primaryError:primaryError?w013SerializeError(primaryError):null,
     });
   }
   if(primaryError)throw primaryError;
