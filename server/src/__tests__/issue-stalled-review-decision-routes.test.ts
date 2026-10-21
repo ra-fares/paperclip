@@ -3053,9 +3053,17 @@ function w013SerializeError(error: unknown, seen = new Set<object>(), depth = 0)
     cause: cause && depth < 4 ? w013SerializeError(cause, seen, depth + 1) : null,
   };
 }
-function w014PgQueryKind(query: string): string {
-  if (/\bissues\b/i.test(query) && /\bFOR\s+KEY\s+SHARE\b/i.test(query))
+type W014PgQueryKind =
+  | "issues.select_for_key_share" | "issues.select_for_update" | "issues.update"
+  | "project_workspaces.select_for_update" | "execution_workspaces.select_for_update"
+  | "advisory_lock" | "other";
+function w014PgQueryKind(query: string): W014PgQueryKind {
+  // A lock is credited only to an actual SELECT FROM issues, with optional schema/quotes.
+  const selectIssues = /^\s*SELECT\b[\s\S]*?\bFROM\s+(?:(?:"[a-z_]\w*"|[a-z_]\w*)\s*\.\s*)?(?:"issues"|issues)(?=\s|[,;]|$)/i.test(query);
+  if (selectIssues && /\bFOR\s+KEY\s+SHARE\b/i.test(query))
     return "issues.select_for_key_share";
+  if (selectIssues && /\bFOR\s+UPDATE\b/i.test(query))
+    return "issues.select_for_update";
   if (/\bUPDATE\s+"?issues"?(?:\s|$)/i.test(query)) return "issues.update";
   if (/\bproject_workspaces\b/i.test(query) && /\bFOR\s+UPDATE\b/i.test(query))
     return "project_workspaces.select_for_update";
@@ -3373,6 +3381,38 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         error:error instanceof Error?error.message:String(error),
       });
     }
+  };
+  // Diagnostic-only real PG wait record, written before any SQL-kind assertion.
+  const recordW015Preassert=(
+    assertionId:"w015_d_first_early_issue_wait"|"w015_writer_first_receipt_lock",
+    expectedQueryKind:W014PgQueryKind,
+    observed:Awaited<ReturnType<typeof w009ObserveWait>>,
+  )=>{
+    const safeEnum=(value:string,allowed:readonly string[])=>allowed.includes(value)?value:"other";
+    const finding={
+      schema:"p04-int2-w015-preassert.v1",case:mode,mode,
+      assertionId,expectedQueryKind,actualQueryKind:observed.waitSqlKind,
+      waiterRole:observed.waiterName,blockerRole:observed.blockerName,
+      waiterPid:Number(observed.waiterPid),blockerPid:Number(observed.blockerPid),
+      waitEvent:safeEnum(observed.waitEvent??"",["transactionid","tuple","relation","advisory"]),
+      lockTypes:observed.blockingLockTypes.map(v=>safeEnum(v,["transactionid","tuple","relation","advisory","virtualxid"])),
+      lockModes:observed.blockingLockModes.map(v=>safeEnum(v,["ShareLock","ExclusiveLock","RowShareLock","RowExclusiveLock","AccessShareLock","AccessExclusiveLock","ShareUpdateExclusiveLock","ShareRowExclusiveLock"])),
+      observedBlockingEdge:observed.proven===true,
+      pending:{d:!dSettled,writer:!writerSettled,gate:!gateSettled},
+      cleanup:{contentionComplete:null,outerComplete:null},
+      httpCode:null,finalStatus:null,auditCount:null,runs:null,
+      calls:a.originalAdapterCalls.length,spawns:spawnCount,
+    };
+    persistW013Json("preassert-"+mode+".json",finding);
+    stage("pre_assert_wait_recorded",{
+      assertionId,expectedQueryKind,actualQueryKind:finding.actualQueryKind,
+      waiterRole:finding.waiterRole,blockerRole:finding.blockerRole,
+      waiterPid:finding.waiterPid,blockerPid:finding.blockerPid,
+      waitEvent:finding.waitEvent,lockTypes:finding.lockTypes,lockModes:finding.lockModes,
+      observedBlockingEdge:finding.observedBlockingEdge,pending:finding.pending,
+      cleanup:finding.cleanup,httpCode:null,finalStatus:null,auditCount:null,
+      runs:null,calls:finding.calls,spawns:finding.spawns,
+    });
   };
   const startPostReleaseSampler=()=>{
     if(postReleaseSampler)return;
@@ -3722,6 +3762,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       else {foreignReleased=true;foreignOwner.resolve(99001);}
       const early = await w009ObserveWait(observer,"w009-writer","w009-D",stage);
       lockEvidence.push(early);
+      if(!reconcile)recordW015Preassert("w015_d_first_early_issue_wait","issues.select_for_key_share",early);
       expect(early.waitSqlKind).toBe("issues.select_for_key_share");
       expect(early.blockingLockTypes).toContain("transactionid");
       expect(early.blockingLockModes).toContain("ShareLock");
@@ -3762,7 +3803,8 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       const issueWait = await w009ObserveWait(observer,"w009-D","w009-writer",stage);
       lockEvidence.push(issueWait);
       if (!reconcile) {
-        expect(issueWait.waitSqlKind).toBe("issues.update");
+        recordW015Preassert("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
+        expect(issueWait.waitSqlKind).toBe("issues.select_for_update");
         expect(issueWait.blockingLockTypes).toContain("transactionid");
         expect(issueWait.blockingLockModes).toContain("ShareLock");
       }
