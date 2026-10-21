@@ -1,19 +1,19 @@
-# W01-012 fresh single CI run: remaining INT2 matrix on the W011-corrected fixture.
-name: Sensor P04 W01-012 remaining matrix
+# W01-013 single diagnostic CI: capture internal runtime writer-first error without changing production behavior.
+name: Sensor P04 W01-013 error diagnostics
 on:
   push:
-    branches: [codex/w01-012-int2-remaining-matrix]
+    branches: [codex/w01-013-int2-error-diagnostics]
     paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-w01-012-final
+  group: sensor-p04-w01-013-final
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-012-int2-remaining-matrix'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-013-int2-error-diagnostics'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       CI: 'true'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
@@ -24,36 +24,40 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 40
-      - name: Exact committed SHA, two-path fence and source manifest
+
+      - name: Exact W013 SHA, two-path fence and source manifest
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence "$RUNNER_TEMP/w01-012-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-012-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence "$RUNNER_TEMP/w01-013-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-013-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git merge-base --is-ancestor 6d34de8dda2c312a2fa223fb5c903bc6770a8cd1 HEAD
-          git diff --name-only 6d34de8dda2c312a2fa223fb5c903bc6770a8cd1 HEAD | tee .int2-evidence/changed-files.txt
+          git merge-base --is-ancestor 5793b52752bd5fbdc066761561db6426747f7f06 HEAD
+          git diff --name-only 5793b52752bd5fbdc066761561db6426747f7f06 HEAD | tee .int2-evidence/changed-files.txt
           while IFS= read -r p; do
             case "$p" in
               server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_W012_ALLOWLIST: $p" >&2; exit 1 ;;
+              *) echo "OUTSIDE_W013_ALLOWLIST: $p" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
           test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
-          test -z "$(git diff --diff-filter=D --name-only 6d34de8dda2c312a2fa223fb5c903bc6770a8cd1 HEAD)"
-          printf 'BASE=6d34de8dda2c312a2fa223fb5c903bc6770a8cd1\nSHA=%s\nRUN=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > .int2-evidence/identity.txt
+          test -z "$(git diff --diff-filter=D --name-only 5793b52752bd5fbdc066761561db6426747f7f06 HEAD)"
+          printf 'BASE=5793b52752bd5fbdc066761561db6426747f7f06\nSHA=%s\nRUN=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > .int2-evidence/identity.txt
           git status --short --untracked-files=all > .int2-evidence/initial-git-status.txt
           sha256sum server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
+
       - name: Set up Node 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           package-manager-cache: false
+
       - name: Set up pnpm 9.15.4
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9.15.4
           run_install: false
+
       - name: Frozen dependencies and build prerequisites
         shell: bash
         run: |
@@ -71,7 +75,8 @@ jobs:
           test "$install_code" -eq 0
           test "$sdk_code" -eq 0
           test -f server/node_modules/vitest/vitest.mjs
-      - name: Migration integrity, server typecheck and sixteen exact real-PG selectors
+
+      - name: Migration integrity, typecheck, diagnostic RED then positive control
         shell: bash
         run: |
           set -euo pipefail
@@ -81,48 +86,45 @@ jobs:
           pnpm --filter @paperclipai/server typecheck > .int2-evidence/typecheck.stdout 2> .int2-evidence/typecheck.stderr
           typecheck_code=$?
           set -e
-          echo "$migrations_code" > .int2-evidence/migrations.exit_code
-          echo "$typecheck_code" > .int2-evidence/typecheck.exit_code
+          printf '%s\n' "$migrations_code" > .int2-evidence/migrations.exit_code
+          printf '%s\n' "$typecheck_code" > .int2-evidence/typecheck.exit_code
           if [ "$migrations_code" -ne 0 ] || [ "$typecheck_code" -ne 0 ]; then
-            echo 'Migration/typecheck failed, do not run expensive tests' >&2
+            echo 'Migration/typecheck failed; required selectors are NOT_RUN' >&2
             exit 1
           fi
+
+          export INT2_W013_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_W012_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_W011_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
           export INT2_W009_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
-          export INT2_SCOPE_EVIDENCE_DIR="$GITHUB_WORKSPACE/.int2-evidence"
-          export INT2_HTTP_ABA_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/http-aba-observation.json"
-          export INT2_POSITIVE_BCD_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/positive-document-observation.json"
-          export INT2_W008_COLLISION_OBSERVATION_PATH="$GITHUB_WORKSPACE/.int2-evidence/native-retry.json"
+
           run_named() {
             local label="$1" pattern="$2" code
             set +e
             node server/node_modules/vitest/vitest.mjs run --root server src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=json --outputFile="$GITHUB_WORKSPACE/.int2-evidence/vitest-$label.json" -t "$pattern" > ".int2-evidence/$label.stdout" 2> ".int2-evidence/$label.stderr"
             code=$?
             set -e
-            echo "$code" > ".int2-evidence/$label.exit_code"
+            printf '%s\n' "$code" > ".int2-evidence/$label.exit_code"
             echo "SELECTOR=$label EXIT=$code"
-            tail -n 80 ".int2-evidence/$label.stderr" || true
-            tail -n 60 ".int2-evidence/$label.stdout" || true
+            tail -n 100 ".int2-evidence/$label.stderr" || true
+            tail -n 80 ".int2-evidence/$label.stdout" || true
             return "$code"
           }
-          run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
+
+          # W013 explicitly runs the diagnostic RED first, then the positive control
+          # even when the first returns the known semantic nonzero exit.
+          set +e
           run_named runtime_writer_first 'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock'
-          run_named retry_d_first 'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock'
-          run_named retry_writer_first 'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock'
-          run_named forward_d_first 'P04 INT2 W009 lock_forward_d_first: genuine BCD and PG lock'
-          run_named forward_writer_first 'P04 INT2 W009 lock_forward_writer_first: genuine BCD and PG lock'
-          run_named quarantine_d_first 'P04 INT2 W009 lock_quarantine_d_first: genuine BCD and PG lock'
-          run_named quarantine_writer_first 'P04 INT2 W009 lock_quarantine_writer_first: genuine BCD and PG lock'
-          run_named parent_drift 'P04 INT2 W009 DB-only EW parent drift rejects before fake spawn'
-          run_named source_drift 'P04 INT2 W009 DB-only EW source drift rejects before fake spawn'
-          run_named indirect_material 'P04 INT2 BCD indirect_parent_pw_change_db: actual admitted run and independent reviewer'
-          run_named indirect_aba 'P04 INT2 BCD indirect_parent_pw_aba_db: actual admitted run and independent reviewer'
-          run_named rollback 'P04 INT2 BCD rollback: actual admitted run and independent reviewer'
-          run_named http_aba 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate'
-          run_named document 'P04 INT2 BCD document: actual admitted run and independent reviewer'
-          run_named native_retry 'P04 INT2 W008 genuine postcommit fixed-port collision and retry'
-      - name: Strict W012 sixteen-case provenance, semantic, lock and cleanup oracle
+          writer_code=$?
+          run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
+          control_code=$?
+          set -e
+          printf 'writer=%s\ncontrol=%s\n' "$writer_code" "$control_code" > .int2-evidence/selector-summary.txt
+          if [ "$writer_code" -ne 0 ] || [ "$control_code" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Strict W013 diagnostic classifier
         if: always()
         shell: bash
         run: |
@@ -130,268 +132,135 @@ jobs:
           set +e
           node <<'NODE'
           const fs=require('node:fs'),dir='.int2-evidence';
-          const tests={
-            runtime_d_first:"P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock",
+          const names={
             runtime_writer_first:"P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock",
-            retry_d_first:"P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock",
-            retry_writer_first:"P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock",
-            forward_d_first:"P04 INT2 W009 lock_forward_d_first: genuine BCD and PG lock",
-            forward_writer_first:"P04 INT2 W009 lock_forward_writer_first: genuine BCD and PG lock",
-            quarantine_d_first:"P04 INT2 W009 lock_quarantine_d_first: genuine BCD and PG lock",
-            quarantine_writer_first:"P04 INT2 W009 lock_quarantine_writer_first: genuine BCD and PG lock",
-            parent_drift:"P04 INT2 W009 DB-only EW parent drift rejects before fake spawn",
-            source_drift:"P04 INT2 W009 DB-only EW source drift rejects before fake spawn",
-            indirect_material:"P04 INT2 BCD indirect_parent_pw_change_db: actual admitted run and independent reviewer",
-            indirect_aba:"P04 INT2 BCD indirect_parent_pw_aba_db: actual admitted run and independent reviewer",
-            rollback:"P04 INT2 BCD rollback: actual admitted run and independent reviewer",
-            http_aba:"P04 INT2 HTTP execution workspace branch ABA must reject stale candidate",
-            document:"P04 INT2 BCD document: actual admitted run and independent reviewer",
-            native_retry:"P04 INT2 W008 genuine postcommit fixed-port collision and retry",
-          };
-          const lockModes={
-            runtime_d_first:"lock_runtime_d_first",
-            runtime_writer_first:"lock_runtime_writer_first",
-            retry_d_first:"lock_retry_d_first",
-            retry_writer_first:"lock_retry_writer_first",
-            forward_d_first:"lock_forward_d_first",
-            forward_writer_first:"lock_forward_writer_first",
-            quarantine_d_first:"lock_quarantine_d_first",
-            quarantine_writer_first:"lock_quarantine_writer_first",
-          };
-          const expectedRoles={
-            lock_runtime_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
-            lock_retry_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
-            lock_forward_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
-            lock_quarantine_d_first:[['w009-D','w009-gate'],['w009-writer','w009-D']],
-            lock_runtime_writer_first:[['w009-D','w009-writer']],
-            lock_retry_writer_first:[['w009-D','w009-writer']],
-            lock_forward_writer_first:[['w009-writer','w009-gate'],['w009-D','w009-writer']],
-            lock_quarantine_writer_first:[['w009-writer','w009-gate'],['w009-D','w009-writer']],
+            runtime_d_first:"P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock",
           };
           const read=n=>{try{return fs.readFileSync(dir+'/'+n,'utf8')}catch{return null}};
           const json=n=>{try{return JSON.parse(read(n))}catch{return null}};
           const code=n=>{const v=read(n+'.exit_code');return v===null?null:Number(v.trim())};
           const stages=n=>(read('stages-'+n+'.jsonl')??'').split('\n').filter(Boolean).map(line=>JSON.parse(line));
-          const has=(arr,name)=>arr.includes(name);
-          const stageSummary=(name,required,finalName,waitCount=null)=>{
-            const rows=stages(name),names=rows.map(x=>x.stage);
-            const cleanup=rows.findLast?.(x=>x.stage===finalName)??[...rows].reverse().find(x=>x.stage===finalName);
-            const waits=rows.filter(x=>x.stage==='wait_observed');
-            const okay=rows[0]?.stage==='before_pg_start'&&required.every(n=>names.includes(n))&&
-              Boolean(cleanup)&&
-              (!Array.isArray(cleanup?.cleanupErrors)||cleanup.cleanupErrors.length===0)&&
-              (cleanup?.cleanupError===undefined||cleanup.cleanupError===null)&&
-              (cleanup?.primaryError===undefined||cleanup.primaryError===null)&&
-              (waitCount===null||waits.length===waitCount);
-            return {okay,eventCount:rows.length,last:names.at(-1)??null,
-              missing:required.filter(n=>!names.includes(n)),waitCount:waits.length,
-              cleanupErrors:cleanup?.cleanupErrors??cleanup?.cleanupError??null,
-              primaryError:cleanup?.primaryError??null};
-          };
-          const runOnce=(obj,idKey='runId')=>{
-            const id=obj?.[idKey];
-            return Boolean(id&&Array.isArray(obj?.adapterCalls)&&
-              obj.adapterCalls.filter(x=>x===id).length===1);
-          };
-          const out={
-            schema:'p04-int2-w012-classification.v1',
-            sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,
-            typecheck:code('typecheck'),migrations:code('migrations'),
-            cases:{},lockOracles:{},semanticOracles:{},stageOracles:{},
-            sourceFiles:(read('changed-files.txt')??'').trim().split('\n').filter(Boolean),
-          };
-          let invalid=out.typecheck!==0||out.migrations!==0;
-          for(const [label,name] of Object.entries(tests)){
+          const classify=(label,name)=>{
             const report=json('vitest-'+label+'.json');
             const assertions=(report?.testResults??[]).flatMap(x=>x.assertionResults??[]);
             const matches=assertions.filter(t=>t.fullName===name||t.fullName?.endsWith(name));
             const executed=assertions.filter(t=>t.status==='passed'||t.status==='failed');
             const pass=matches.length===1&&executed.length===1&&matches[0].status==='passed'&&
               code(label)===0&&report?.numPassedTests===1&&report?.numFailedTests===0;
-            out.cases[label]={name,selected:matches.length,executed:executed.length,
-              status:matches[0]?.status??null,exitCode:code(label),
-              classification:pass?'PASS':matches.length===0||executed.length===0?'NOT_RUN':'FAIL',
+            return {name,selected:matches.length,executed:executed.length,status:matches[0]?.status??null,
+              exitCode:code(label),classification:pass?'PASS':matches.length===0||executed.length===0?'NOT_RUN':'FAIL',
               failures:matches.flatMap(t=>t.failureMessages??[])};
-            if(!pass)invalid=true;
-          }
-
-          const bcdRequired=[
-            'before_pg_start','pg_started','source_pool_ready','seed_begin','seed_complete',
-            'heartbeat_invoke_enter','admission_enter','adapter_enter','B_request_enter','B_request_result',
-            'B_candidate_persisted','adapter_return','C_drain_enter','C_settled'
-          ];
-          for(const [label,mode] of Object.entries(lockModes)){
-            const d=json('lock-'+mode+'.json'),roles=expectedRoles[mode],locks=d?.lockEvidence??[];
+          };
+          const lockRole=(file,roles)=>{
+            const d=json(file),locks=d?.lockEvidence??[];
             const observed=Array.isArray(locks)?locks.map(x=>[x.waiterName,x.blockerName]):[];
-            const reconcile=mode.includes('forward')||mode.includes('quarantine');
-            const dFirst=mode.endsWith('d_first');
-            const expectedSemantic=reconcile&&!dFirst
-              ? d?.dHttp===409&&d?.finalStatus==='in_review'&&d?.acceptedAuditRows===0
-              : d?.dHttp===200&&d?.finalStatus==='done'&&d?.acceptedAuditRows===1;
-            const runProven=Boolean(d?.sourceRunId&&Array.isArray(d?.runIds)&&d.runIds.includes(d.sourceRunId)&&
-              Array.isArray(d?.originalAdapterCalls)&&d.originalAdapterCalls.filter(x=>x===d.sourceRunId).length===1);
-            const lockOkay=Boolean(
-              d?.mode===mode&&d?.candidateId&&runProven&&expectedSemantic&&
+            const okay=Boolean(d?.sourceRunId&&d?.candidateId&&
               JSON.stringify(observed)===JSON.stringify(roles)&&locks.length===roles.length&&
               locks.every(x=>x.proven===true&&Number(x.waiterPid)>0&&Number(x.blockerPid)>0&&
-                Array.isArray(x.blockingLockTypes)&&x.blockingLockTypes.length>0&&
-                typeof x.waitSql==='string'&&typeof x.blockerSql==='string')
-            );
-            let retryOkay=true;
-            if(mode.includes('retry')){
-              const first=(d?.events??[]).find(x=>x?.name==='FIRST_STARTING_COMMITTED');
-              retryOkay=Boolean(d?.spawnCount===2&&first?.port&&
-                Array.isArray(d?.serviceRows)&&d.serviceRows.some(x=>x.status==='stopped'&&x.port===first.port)&&
-                d.serviceRows.some(x=>x.port!==first.port));
-            }
-            const quarantineOkay=!mode.includes('quarantine')||
-              Boolean((d?.events??[]).some(x=>x?.name==='PRE_TX_RESCUE_STUB'));
-            out.lockOracles[mode]={okay:lockOkay&&retryOkay&&quarantineOkay,
-              expectedRoles:roles,observedRoles:observed,retryOkay,quarantineOkay,
-              waiterPids:locks.map(x=>x.waiterPid),blockerPids:locks.map(x=>x.blockerPid)};
-            if(!out.lockOracles[mode].okay)invalid=true;
+                Array.isArray(x.blockingLockTypes)&&x.blockingLockTypes.length>0));
+            return {okay,observed,waiterPids:locks.map(x=>x.waiterPid),blockerPids:locks.map(x=>x.blockerPid),
+              dHttp:d?.dHttp??null,finalStatus:d?.finalStatus??null,acceptedAuditRows:d?.acceptedAuditRows??null,
+              writerOk:d?.writerResult?.ok??null,errorCaptureCount:d?.errorCaptureCount??null,
+              errorCodes:d?.errorCodes??[],postReleaseSampleCount:d?.postReleaseSampleCount??null,
+              serviceRows:d?.serviceRows??[]};
+          };
+          const cleanup=(mode)=>{
+            const rows=stages(mode),last=rows.at(-1),names=rows.map(x=>x.stage);
+            const contention=[...rows].reverse().find(x=>x.stage==='contention_cleanup_complete');
+            const outer=[...rows].reverse().find(x=>x.stage==='outer_cleanup_complete');
+            return {
+              okay:Boolean(contention&&outer&&last?.stage==='outer_cleanup_complete'&&
+                Array.isArray(contention.cleanupErrors)&&contention.cleanupErrors.length===0&&
+                outer.cleanupError===null),
+              last:last?.stage??null,eventCount:rows.length,
+              hasErrorTap:names.includes('error_tap_captured'),
+              hasFk:names.includes('runtime_issue_fk_observed'),
+              hasPostReleaseSample:names.includes('post_release_pg_sample'),
+              contentionPrimaryError:contention?.primaryError??null,
+              outerCleanupError:outer?.cleanupError??null,
+            };
+          };
 
-            const required=[...bcdRequired,'contention_pools_ready','contention_helper_enter',
-              'module_setup_complete','gate_trigger_installed','D_launch','settlement_complete',
-              'contention_cleanup_complete','outer_cleanup_complete'];
-            if(dFirst)required.push('gate_acquired','writer_launch','gate_release');
-            else required.push('writer_barrier_release');
-            const stage=stageSummary(mode,required,'outer_cleanup_complete',roles.length);
-            const rows=stages(mode);
-            const sourcePool=rows.find(x=>x.stage==='source_pool_ready');
-            const contentionPool=rows.find(x=>x.stage==='contention_pools_ready');
-            const expectedWriter=mode.includes('quarantine')?2:1;
-            stage.poolOkay=sourcePool?.maxConnections===2&&
-              contentionPool?.sourcePoolMaxConnections===2&&
-              contentionPool?.reviewerPoolMaxConnections===2&&
-              contentionPool?.writerPoolMaxConnections===expectedWriter&&
-              contentionPool?.observerPoolMaxConnections===1&&
-              contentionPool?.gatePoolMaxConnections===1;
-            stage.okay=stage.okay&&stage.poolOkay;
-            out.stageOracles[mode]=stage;
-            if(!stage.okay)invalid=true;
-          }
+          const out={
+            schema:'p04-int2-w013-classification.v1',
+            sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,
+            migrations:code('migrations'),typecheck:code('typecheck'),
+            cases:{
+              runtime_writer_first:classify('runtime_writer_first',names.runtime_writer_first),
+              runtime_d_first:classify('runtime_d_first',names.runtime_d_first),
+            },
+            locks:{
+              writer_first:lockRole('lock-lock_runtime_writer_first.json',[['w009-D','w009-writer']]),
+              d_first:lockRole('lock-lock_runtime_d_first.json',[['w009-D','w009-gate'],['w009-writer','w009-D']]),
+            },
+            cleanup:{
+              writer_first:cleanup('lock_runtime_writer_first'),
+              d_first:cleanup('lock_runtime_d_first'),
+            },
+            errorCapture:json('error-lock_runtime_writer_first.json'),
+            writerFk:json('fk-lock_runtime_writer_first.json'),
+            controlFk:json('fk-lock_runtime_d_first.json'),
+            postRelease:json('post-release-lock_runtime_writer_first.json'),
+            sourceFiles:(read('changed-files.txt')??'').trim().split('\n').filter(Boolean),
+            other14:'NOT_RUN_BY_W013_SCOPE',
+          };
 
-          for(const drift of ['parent','source']){
-            const d=json(drift+'-drift.json');
-            const semantic=Boolean(d?.lock?.proven===true&&d?.spawnCalls===0&&d?.persistedRows===0&&
-              d?.writerKind==='FIXTURE_DB_ONLY_'+drift.toUpperCase()+'_CHANGE');
-            out.semanticOracles[drift+'_drift']=semantic;
-            if(!semantic)invalid=true;
-            const stage=stageSummary(drift+'_drift',[
-              'before_pg_start','pg_started','drift_pools_ready','seed_begin','seed_complete',
-              'drift_writer_lock_held','module_setup_complete','drift_runtime_launch',
-              'wait_observed','drift_writer_release','drift_assertions_complete','drift_cleanup_complete'
-            ],'drift_cleanup_complete',1);
-            out.stageOracles[drift+'_drift']=stage;
-            if(!stage.okay)invalid=true;
-          }
+          const writerFkRows=out.writerFk?.constraints??[];
+          const controlFkRows=out.controlFk?.constraints??[];
+          out.fkOracle=Boolean(
+            writerFkRows.length===1&&controlFkRows.length===1&&
+            writerFkRows[0]?.attname==='issue_id'&&controlFkRows[0]?.attname==='issue_id'&&
+            typeof writerFkRows[0]?.definition==='string'&&writerFkRows[0].definition.includes('FOREIGN KEY (issue_id)')&&
+            writerFkRows[0]?.condeferrable===false&&writerFkRows[0]?.condeferred===false
+          );
 
-          const indirectChecks=[
-            ['indirect_material','indirect_parent_pw_change_db',1n],
-            ['indirect_aba','indirect_parent_pw_aba_db',2n],
-          ];
-          for(const [label,mode,delta] of indirectChecks){
-            const d=json('scope-'+mode+'-observation.json');
-            let revisionOkay=false;
-            try{revisionOkay=BigInt(String(d?.scopeTrace?.revisionD))===BigInt(String(d?.scopeTrace?.revisionB))+delta;}catch{}
-            const semantic=Boolean(d?.mode===mode&&d?.reviewerHttp===409&&d?.after==='in_review'&&
-              d?.acceptedAuditRows===0&&d?.sourceTerminal==='succeeded'&&runOnce(d)&&
-              d?.scopeTrace?.directPW===null&&d?.scopeTrace?.expectedCode==='governed_candidate_stale'&&revisionOkay);
-            out.semanticOracles[label]=semantic;
-            if(!semantic)invalid=true;
-            const stage=stageSummary(mode,[...bcdRequired,'D_request_enter','D_request_result','outer_cleanup_complete'],
-              'outer_cleanup_complete',0);
-            const sourcePool=stages(mode).find(x=>x.stage==='source_pool_ready');
-            stage.poolOkay=sourcePool?.maxConnections===2;
-            stage.okay=stage.okay&&stage.poolOkay;
-            out.stageOracles[label]=stage;
-            if(!stage.okay)invalid=true;
-          }
+          const captures=out.errorCapture?.captures??[];
+          out.errorOracle=Boolean(
+            out.cases.runtime_writer_first.classification==='FAIL'
+              ? captures.length>=1&&captures.every(x=>
+                  x?.request?.method==='PATCH'&&
+                  typeof x?.request?.path==='string'&&
+                  x.request.path.includes('/api/issues/')&&
+                  x?.fixture?.issueId&&x?.error&&typeof x.error==='object')
+              : captures.length===0
+          );
 
-          const rollback=json('scope-rollback-observation.json');
-          const rollbackOkay=Boolean(rollback?.mode==='rollback'&&rollback?.reviewerHttp>=500&&
-            rollback?.after==='in_review'&&rollback?.acceptedAuditRows===0&&
-            rollback?.sourceTerminal==='succeeded'&&runOnce(rollback));
-          out.semanticOracles.rollback=rollbackOkay;
-          if(!rollbackOkay)invalid=true;
-          const rollbackStage=stageSummary('rollback',[...bcdRequired,'D_request_enter','D_request_result','outer_cleanup_complete'],
-            'outer_cleanup_complete',0);
-          rollbackStage.poolOkay=stages('rollback').find(x=>x.stage==='source_pool_ready')?.maxConnections===2;
-          rollbackStage.okay=rollbackStage.okay&&rollbackStage.poolOkay;
-          out.stageOracles.rollback=rollbackStage;
-          if(!rollbackStage.okay)invalid=true;
+          const samples=out.postRelease?.samples??[];
+          out.postReleaseOracle=Boolean(
+            samples.length>=1&&samples.every(x=>
+              Array.isArray(x.catalog)&&Array.isArray(x.ungranted)&&Array.isArray(x.services))
+          );
 
-          const aba=json('http-aba-observation.json');
-          let abaRevision=false;
-          try{
-            const steps=aba?.steps??[];
-            const first=steps.find(x=>x.phase==='before_http_A');
-            const middle=steps.find(x=>x.phase==='after_http_B');
-            const last=steps.find(x=>x.phase==='after_http_restored_A');
-            abaRevision=Boolean(first&&middle&&last&&
-              BigInt(String(middle.identityRevision))===BigInt(String(first.identityRevision))+1n&&
-              BigInt(String(last.identityRevision))===BigInt(String(first.identityRevision))+2n);
-          }catch{}
-          const abaOkay=Boolean(abaRevision&&aba?.preconditionsValid===true&&
-            aba?.receiptSchema==='sensor-direct-dispatch-claim.v2'&&aba?.sourceRunStatus==='succeeded'&&
-            aba?.reviewerHttp===409&&aba?.reviewerCode==='governed_candidate_stale'&&
-            aba?.finalStatus==='in_review'&&aba?.acceptedAuditRows===0&&
-            Array.isArray(aba?.adapterCalls)&&aba.adapterCalls.filter(x=>x===aba.sourceRunId).length===1);
-          out.semanticOracles.http_aba=abaOkay;
-          if(!abaOkay)invalid=true;
-          const abaStage=stageSummary('execution_workspace_branch_aba_http',[
-            ...bcdRequired,'http_aba_first_patch_enter','http_aba_first_patch_result',
-            'http_aba_restore_patch_enter','http_aba_restore_patch_result',
-            'D_request_enter','D_request_result','outer_cleanup_complete'
-          ],'outer_cleanup_complete',0);
-          abaStage.poolOkay=stages('execution_workspace_branch_aba_http')
-            .find(x=>x.stage==='source_pool_ready')?.maxConnections===2;
-          abaStage.okay=abaStage.okay&&abaStage.poolOkay;
-          out.stageOracles.http_aba=abaStage;
-          if(!abaStage.okay)invalid=true;
+          const controlSemantic=out.cases.runtime_d_first.classification==='PASS'&&
+            out.locks.d_first.okay&&out.locks.d_first.dHttp===200&&
+            out.locks.d_first.finalStatus==='done'&&out.locks.d_first.acceptedAuditRows===1;
 
-          const doc=json('positive-document-observation.json');
-          const docOkay=Boolean(doc?.mode==='document'&&doc?.reviewerHttp===200&&doc?.after==='done'&&
-            doc?.acceptedAuditRows===1&&doc?.sourceTerminal==='succeeded'&&runOnce(doc));
-          out.semanticOracles.document=docOkay;
-          if(!docOkay)invalid=true;
-          const docStage=stageSummary('document',[...bcdRequired,'D_request_enter','D_request_result','outer_cleanup_complete'],
-            'outer_cleanup_complete',0);
-          docStage.poolOkay=stages('document').find(x=>x.stage==='source_pool_ready')?.maxConnections===2;
-          docStage.okay=docStage.okay&&docStage.poolOkay;
-          out.stageOracles.document=docStage;
-          if(!docStage.okay)invalid=true;
+          const diagnosticsComplete=out.fkOracle&&out.errorOracle&&out.postReleaseOracle&&
+            out.locks.writer_first.okay&&out.cleanup.writer_first.okay&&
+            out.cleanup.d_first.okay&&controlSemantic;
 
-          const native=json('native-retry.json');
-          const nativeOkay=Boolean(native?.spawnCount===2&&native?.firstStatusAfter==='stopped'&&
-            native?.secondRowId&&native?.secondPort!==native?.initialPort);
-          out.semanticOracles.native_retry=nativeOkay;
-          if(!nativeOkay)invalid=true;
-          const nativeStage=stageSummary('native_retry',[
-            'before_pg_start','pg_started','native_retry_pools_ready','seed_begin','seed_complete',
-            'loopback_probe_complete','module_setup_complete','runtime_start_enter',
-            'first_starting_committed','native_collision_release','runtime_start_settled',
-            'native_retry_assertions_complete','native_retry_cleanup_complete'
-          ],'native_retry_cleanup_complete',0);
-          out.stageOracles.native_retry=nativeStage;
-          if(!nativeStage.okay)invalid=true;
+          // The diagnostic selector retains its original semantic oracle. A FAIL is
+          // therefore still an overall FAIL even when diagnostics are complete.
+          const allTestsPass=Object.values(out.cases).every(x=>x.classification==='PASS');
+          const infraOkay=out.migrations===0&&out.typecheck===0;
+          out.diagnosticsComplete=diagnosticsComplete;
+          out.overall=infraOkay&&diagnosticsComplete&&allTestsPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
 
-          out.overall=invalid?'FAIL_OR_NOT_RUN':'PASS_SCOPED';
           fs.writeFileSync(dir+'/classification.json',JSON.stringify(out,null,2)+'\n');
           console.log(JSON.stringify({
-            sha:out.sha,overall:out.overall,typecheck:out.typecheck,migrations:out.migrations,
-            cases:Object.fromEntries(Object.entries(out.cases).map(([k,v])=>[k,v.classification])),
-            lockOracles:out.lockOracles,semanticOracles:out.semanticOracles,
-            stageOracles:Object.fromEntries(Object.entries(out.stageOracles).map(([k,v])=>[k,v.okay])),
+            sha:out.sha,overall:out.overall,migrations:out.migrations,typecheck:out.typecheck,
+            cases:out.cases,locks:out.locks,cleanup:out.cleanup,
+            fkOracle:out.fkOracle,errorOracle:out.errorOracle,
+            postReleaseOracle:out.postReleaseOracle,diagnosticsComplete:out.diagnosticsComplete,
+            errorCodes:captures.map(x=>x?.error?.code??null),
           },null,2));
-          if(invalid)process.exitCode=1;
+          if(out.overall!=='PASS_SCOPED')process.exitCode=1;
           NODE
           classifier_code=$?
           printf '%s\n' "$classifier_code" > .int2-evidence/classifier.exit_code
           exit "$classifier_code"
 
-      - name: Always write W012 diagnostic manifest
+      - name: Always write W013 diagnostic and SHA manifests
         if: always()
         shell: bash
         run: |
@@ -402,9 +271,9 @@ jobs:
           const fs=require('node:fs'),dir='.int2-evidence';
           const files=fs.readdirSync(dir).sort();
           const read=n=>{try{return fs.readFileSync(dir+'/'+n,'utf8')}catch{return null}};
-          const tail=n=>{const s=read(n);if(!s)return null;const lines=s.trim().split('\n');return lines.slice(-8)};
+          const tail=n=>{const s=read(n);if(!s)return null;return s.trim().split('\n').slice(-10)};
           const manifest={
-            schema:'p04-int2-w012-diagnostic-manifest.v1',
+            schema:'p04-int2-w013-diagnostic-manifest.v1',
             sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,
             files,classification:read('classification.json')?JSON.parse(read('classification.json')):null,
             exits:{
@@ -412,54 +281,34 @@ jobs:
               sdk:read('sdk.exit_code')?.trim()??null,
               migrations:read('migrations.exit_code')?.trim()??null,
               typecheck:read('typecheck.exit_code')?.trim()??null,
-              runtime_d_first:read('runtime_d_first.exit_code')?.trim()??null,
               runtime_writer_first:read('runtime_writer_first.exit_code')?.trim()??null,
-              retry_d_first:read('retry_d_first.exit_code')?.trim()??null,
-              retry_writer_first:read('retry_writer_first.exit_code')?.trim()??null,
-              forward_d_first:read('forward_d_first.exit_code')?.trim()??null,
-              forward_writer_first:read('forward_writer_first.exit_code')?.trim()??null,
-              quarantine_d_first:read('quarantine_d_first.exit_code')?.trim()??null,
-              quarantine_writer_first:read('quarantine_writer_first.exit_code')?.trim()??null,
-              parent_drift:read('parent_drift.exit_code')?.trim()??null,
-              source_drift:read('source_drift.exit_code')?.trim()??null,
-              indirect_material:read('indirect_material.exit_code')?.trim()??null,
-              indirect_aba:read('indirect_aba.exit_code')?.trim()??null,
-              rollback:read('rollback.exit_code')?.trim()??null,
-              http_aba:read('http_aba.exit_code')?.trim()??null,
-              document:read('document.exit_code')?.trim()??null,
-              native_retry:read('native_retry.exit_code')?.trim()??null,
+              runtime_d_first:read('runtime_d_first.exit_code')?.trim()??null,
               classifier:read('classifier.exit_code')?.trim()??null,
             },
             stageTails:{
-              runtime_d_first:tail('stages-lock_runtime_d_first.jsonl'),
               runtime_writer_first:tail('stages-lock_runtime_writer_first.jsonl'),
-              retry_d_first:tail('stages-lock_retry_d_first.jsonl'),
-              retry_writer_first:tail('stages-lock_retry_writer_first.jsonl'),
-              forward_d_first:tail('stages-lock_forward_d_first.jsonl'),
-              forward_writer_first:tail('stages-lock_forward_writer_first.jsonl'),
-              quarantine_d_first:tail('stages-lock_quarantine_d_first.jsonl'),
-              quarantine_writer_first:tail('stages-lock_quarantine_writer_first.jsonl'),
-              parent_drift:tail('stages-parent_drift.jsonl'),
-              source_drift:tail('stages-source_drift.jsonl'),
-              indirect_material:tail('stages-indirect_parent_pw_change_db.jsonl'),
-              indirect_aba:tail('stages-indirect_parent_pw_aba_db.jsonl'),
-              rollback:tail('stages-rollback.jsonl'),
-              http_aba:tail('stages-execution_workspace_branch_aba_http.jsonl'),
-              document:tail('stages-document.jsonl'),
-              native_retry:tail('stages-native_retry.jsonl'),
+              runtime_d_first:tail('stages-lock_runtime_d_first.jsonl'),
+            },
+            rawDiagnostics:{
+              writerError:read('error-lock_runtime_writer_first.json')?JSON.parse(read('error-lock_runtime_writer_first.json')):null,
+              writerFk:read('fk-lock_runtime_writer_first.json')?JSON.parse(read('fk-lock_runtime_writer_first.json')):null,
+              controlFk:read('fk-lock_runtime_d_first.json')?JSON.parse(read('fk-lock_runtime_d_first.json')):null,
+              postRelease:read('post-release-lock_runtime_writer_first.json')?JSON.parse(read('post-release-lock_runtime_writer_first.json')):null,
             },
           };
           fs.writeFileSync(dir+'/diagnostic-manifest.json',JSON.stringify(manifest,null,2)+'\n');
           NODE
-      - name: Always upload W012 original evidence, including failure and NOT_RUN
+
+      - name: Always upload W013 original diagnostic evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: w01-012-final-evidence
+          name: w01-013-error-diagnostics
           path: .int2-evidence/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
+
       - name: Ensure checkout tracked files unchanged
         if: always()
         run: git diff --exit-code
