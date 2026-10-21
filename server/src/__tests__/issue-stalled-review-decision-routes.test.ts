@@ -864,6 +864,9 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       : mode.startsWith("lock_")
         ? `P04 INT2 W009 ${mode}: genuine BCD and PG lock`
         : `P04 INT2 BCD ${mode}: actual admitted run and independent reviewer`, async () => {
+      const w016Selected = ["lock_runtime_writer_first","lock_runtime_d_first",
+        "lock_retry_writer_first","lock_retry_d_first"].includes(mode);
+      let w016CaptureLimitBytes:number|undefined;
       const w012Selected =
         mode.startsWith("lock_") ||
         mode === "document" ||
@@ -880,7 +883,8 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
           ? "one request transaction plus one existing out-of-transaction instance-settings read"
           : "historical topology outside W012 selected scope",
       });
-      const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`);
+      const cluster = await startEmbeddedPostgresTestDatabase(`paperclip-int2-bcd-${mode}-`,
+        w016Selected?{trackActivityQuerySizeBytes:16384}:undefined);
       stage("pg_started");
       const db = createDb(cluster.connectionString, w012Selected
         ? { maxConnections: 2, applicationName: sourceApplicationName }
@@ -938,6 +942,30 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
       });
 
       try {
+      if(w016Selected) {
+        // Generates the same full-row receipt SELECT shape as runUpdate, without executing SQL.
+        const generated=db.select().from(issues).where(eq(issues.id,randomUUID())).for("update").toSQL().sql;
+        const settingRows=await db.execute(sql.raw(
+          "SELECT pg_size_bytes(current_setting('track_activity_query_size'))::bigint AS configured_bytes"
+        )) as unknown as Array<{configured_bytes:string|number|bigint}>;
+        const configuredLimitBytes=Number(settingRows[0]?.configured_bytes);
+        const generatedQueryBytes=Buffer.byteLength(generated,"utf8");
+        const fullQueryKind=w014PgQueryKind(generated);
+        const prefix500QueryKind=w014PgQueryKind(generated.slice(0,500));
+        const valid=configuredLimitBytes===16384 && generatedQueryBytes+1024<configuredLimitBytes &&
+          fullQueryKind==="issues.select_for_update" && prefix500QueryKind!=="issues.select_for_update";
+        w016CaptureLimitBytes=valid?configuredLimitBytes:undefined;
+        const preflight={schema:"p04-int2-w016-preflight.v1",case:mode,
+          configuredLimitBytes:Number.isSafeInteger(configuredLimitBytes)?configuredLimitBytes:null,
+          generatedQueryBytes,safetyMarginBytes:1024,fullQueryKind,prefix500QueryKind,
+          fullHasFromIssues:/\bFROM\s+(?:(?:"[a-z_]\w*"|[a-z_]\w*)\s*\.\s*)?(?:"issues"|issues)(?=\s|[,;]|$)/i.test(generated),
+          fullHasForUpdate:/\bFOR\s+UPDATE\b/i.test(generated),valid};
+        if(process.env.INT2_W013_EVIDENCE_DIR) writeFileSync(
+          process.env.INT2_W013_EVIDENCE_DIR+"/preflight-"+mode+".json",
+          JSON.stringify(preflight,null,2)+"\n",{encoding:"utf8",flag:"wx"});
+        stage("w016_visibility_preflight",preflight);
+        if(!valid)throw new Error("W016_INVALID_REPRO_PREFLIGHT");
+      }
         stage("seed_begin");
         const now = new Date();
         await db.insert(authUsers).values([requesterId, reviewerId].map(id => ({
@@ -2124,6 +2152,7 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
             candidateVersion: current!.statusVersion, decisionPayload,
             originalAdapterCalls: [...seenAdapterIds],
             sourcePoolMaxConnections: w012Selected ? 2 : 1,
+            captureLimitBytes:w016CaptureLimitBytes,
             observerDb: w011Observer ?? undefined,
             stage,
           });
@@ -3128,7 +3157,7 @@ async function w011ReadPgCatalog(
   const quoted = applicationNames.map((name) => "'" + name.replaceAll("'", "''") + "'").join(",");
   return await observer.execute(sql.raw(
     "SELECT a.pid,a.application_name,pg_blocking_pids(a.pid) AS blocking_pids," +
-    " a.wait_event_type,a.wait_event,a.state,LEFT(a.query,500) AS query," +
+    " a.wait_event_type,a.wait_event,a.state,a.query AS query," +
     " a.query_start,a.xact_start FROM pg_stat_activity AS a" +
     " WHERE a.datname=current_database() AND a.application_name IN (" + quoted + ")" +
     " ORDER BY a.application_name,a.pid"
@@ -3220,11 +3249,21 @@ async function w011Watchdog<T>(
 }
 
 /** Poll PG catalog to PROVE the actual blocked PID, never infer it from delay or role label. */
+function w016QueryVisibility(query:string,configuredLimitBytes:number) {
+  const queryByteLength=Buffer.byteLength(query,"utf8");
+  const hasFromIssues=/\bFROM\s+(?:(?:"[a-z_]\w*"|[a-z_]\w*)\s*\.\s*)?(?:"issues"|issues)(?=\s|[,;]|$)/i.test(query);
+  const hasForUpdate=/\bFOR\s+UPDATE\b/i.test(query);
+  const hasForKeyShare=/\bFOR\s+KEY\s+SHARE\b/i.test(query);
+  return {configuredLimitBytes,queryByteLength,clientTruncated:false,
+    captureComplete:configuredLimitBytes===16384 && queryByteLength>0 && queryByteLength<configuredLimitBytes,
+    hasFromIssues,hasForUpdate,hasForKeyShare};
+}
 async function w009ObserveWait(
   observer: ReturnType<typeof createDb>,
   waiterName: string,
   blockerName: string,
   stage?: W011StageWriter,
+  captureLimitBytes?:number,
 ) {
   const deadline = Date.now() + 12_000;
   let latest: W011CatalogRow[] = [];
@@ -3269,6 +3308,7 @@ async function w009ObserveWait(
           blockingLockTypes: locks.map((row) => row.locktype),
           blockingLockModes: locks.map((row) => row.mode),
           waitSqlKind: w014PgQueryKind(waiter.query),
+          queryVisibility:captureLimitBytes===16384?w016QueryVisibility(waiter.query,captureLimitBytes):null,
           waiterState: waiter.state,
           blockerState: blocker.state,
           blockerSqlKind: w014PgQueryKind(blocker.query),
@@ -3292,6 +3332,7 @@ type W009ContentionArgs = {
   candidateId:string; candidateVersion:number;
   decisionPayload:Record<string,unknown>; originalAdapterCalls:string[];
   sourcePoolMaxConnections:number;
+  captureLimitBytes?:number;
   observerDb?:ReturnType<typeof createDb>;
   stage: W011StageWriter;
 };
@@ -3398,6 +3439,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       lockTypes:observed.blockingLockTypes.map(v=>safeEnum(v,["transactionid","tuple","relation","advisory","virtualxid"])),
       lockModes:observed.blockingLockModes.map(v=>safeEnum(v,["ShareLock","ExclusiveLock","RowShareLock","RowExclusiveLock","AccessShareLock","AccessExclusiveLock","ShareUpdateExclusiveLock","ShareRowExclusiveLock"])),
       observedBlockingEdge:observed.proven===true,
+      queryVisibility:observed.queryVisibility,
       pending:{d:!dSettled,writer:!writerSettled,gate:!gateSettled},
       cleanup:{contentionComplete:null,outerComplete:null},
       httpCode:null,finalStatus:null,auditCount:null,runs:null,
@@ -3409,10 +3451,28 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       waiterRole:finding.waiterRole,blockerRole:finding.blockerRole,
       waiterPid:finding.waiterPid,blockerPid:finding.blockerPid,
       waitEvent:finding.waitEvent,lockTypes:finding.lockTypes,lockModes:finding.lockModes,
-      observedBlockingEdge:finding.observedBlockingEdge,pending:finding.pending,
+      observedBlockingEdge:finding.observedBlockingEdge,queryVisibility:finding.queryVisibility,pending:finding.pending,
       cleanup:finding.cleanup,httpCode:null,finalStatus:null,auditCount:null,
       runs:null,calls:finding.calls,spawns:finding.spawns,
     });
+  };
+  const requireW016Visibility=(
+    assertionId:"w015_d_first_early_issue_wait"|"w015_writer_first_receipt_lock",
+    expected:W014PgQueryKind,
+    observed:Awaited<ReturnType<typeof w009ObserveWait>>,
+  )=>{
+    const v=observed.queryVisibility;
+    const valid=Boolean(v?.captureComplete && v.hasFromIssues &&
+      (expected==="issues.select_for_update"?v.hasForUpdate:v.hasForKeyShare));
+    if(!valid) {
+      const finding={schema:"p04-int2-w016-invalid-repro.v1",case:mode,assertionId,
+        expectedQueryKind:expected,actualQueryKind:observed.waitSqlKind,
+        queryVisibility:v??null,waiterPid:observed.waiterPid,blockerPid:observed.blockerPid,
+        blockingLockTypes:observed.blockingLockTypes,blockingLockModes:observed.blockingLockModes};
+      persistW013Json("invalid-repro-"+mode+".json",finding);
+      stage("w016_invalid_repro_visibility",finding);
+      throw new Error("W016_INVALID_REPRO_VISIBILITY");
+    }
   };
   const startPostReleaseSampler=()=>{
     if(postReleaseSampler)return;
@@ -3756,13 +3816,16 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       }
       await launchGate();
       launchD();
-      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-gate",stage));
+      lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-gate",stage,a.captureLimitBytes));
       stage("writer_launch",{kind:retry?"retry":"runtime"});
       if(!retry)await startWriter();
       else {foreignReleased=true;foreignOwner.resolve(99001);}
-      const early = await w009ObserveWait(observer,"w009-writer","w009-D",stage);
+      const early = await w009ObserveWait(observer,"w009-writer","w009-D",stage,a.captureLimitBytes);
       lockEvidence.push(early);
-      if(!reconcile)recordW015Preassert("w015_d_first_early_issue_wait","issues.select_for_key_share",early);
+      if(!reconcile) {
+        recordW015Preassert("w015_d_first_early_issue_wait","issues.select_for_key_share",early);
+        requireW016Visibility("w015_d_first_early_issue_wait","issues.select_for_key_share",early);
+      }
       expect(early.waitSqlKind).toBe("issues.select_for_key_share");
       expect(early.blockingLockTypes).toContain("transactionid");
       expect(early.blockingLockModes).toContain("ShareLock");
@@ -3800,10 +3863,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         ); // TX locks already acquired
       }
       launchD();
-      const issueWait = await w009ObserveWait(observer,"w009-D","w009-writer",stage);
+      const issueWait = await w009ObserveWait(observer,"w009-D","w009-writer",stage,a.captureLimitBytes);
       lockEvidence.push(issueWait);
       if (!reconcile) {
         recordW015Preassert("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
+        requireW016Visibility("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
         expect(issueWait.waitSqlKind).toBe("issues.select_for_update");
         expect(issueWait.blockingLockTypes).toContain("transactionid");
         expect(issueWait.blockingLockModes).toContain("ShareLock");

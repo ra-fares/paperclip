@@ -202,21 +202,33 @@ async function stopEmbeddedPostgresBounded(
 // a fresh port and a fresh data directory, so a transient collision clears.
 const EMBEDDED_POSTGRES_START_MAX_ATTEMPTS = 5;
 
+type EmbeddedPostgresTestStartOptions = { trackActivityQuerySizeBytes?: 16384 };
+function checkW016Options(options?: EmbeddedPostgresTestStartOptions) {
+  if (options?.trackActivityQuerySizeBytes !== undefined && options.trackActivityQuerySizeBytes !== 16384) {
+    throw new Error('INVALID_EMBEDDED_POSTGRES_TEST_QUERY_SIZE_OPTION');
+  }
+}
+
 // Start one embedded Postgres cluster with a bounded retry. Each attempt gets a
 // fresh port and a fresh data directory. On a failed attempt we stop the cluster
 // and remove its data directory before the next attempt. After the last attempt
 // we throw with the real Postgres output so the failure is loud and diagnosable.
-async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
+async function startEmbeddedPostgresWithRetry(tempDirPrefix: string, options?: EmbeddedPostgresTestStartOptions): Promise<{
   port: number;
   dataDir: string;
   instance: EmbeddedPostgresInstance;
 }> {
+  checkW016Options(options);
   let lastError = new Error("embedded Postgres startup failed");
 
   for (let attempt = 1; attempt <= EMBEDDED_POSTGRES_START_MAX_ATTEMPTS; attempt += 1) {
     const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
     try {
       await created.instance.initialise();
+      // Explicit one-use CI option, written only to this attempt's fresh fixture dataDir.
+      if (options?.trackActivityQuerySizeBytes === 16384) {
+        fs.appendFileSync(path.join(created.dataDir, 'postgresql.conf'), '\ntrack_activity_query_size = 16384\n', 'utf8');
+      }
       await created.instance.start();
       return { port: created.port, dataDir: created.dataDir, instance: created.instance };
     } catch (error) {
@@ -273,10 +285,12 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
 
 export async function startEmbeddedPostgresTestDatabase(
   tempDirPrefix: string,
+  options?: EmbeddedPostgresTestStartOptions,
 ): Promise<EmbeddedPostgresTestDatabase> {
   // The bounded retry hardens the cluster start against the port race. It throws
   // with the real Postgres output if every attempt fails.
-  const { port, dataDir, instance } = await startEmbeddedPostgresWithRetry(tempDirPrefix);
+  checkW016Options(options);
+  const { port, dataDir, instance } = await startEmbeddedPostgresWithRetry(tempDirPrefix, options);
 
   try {
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;

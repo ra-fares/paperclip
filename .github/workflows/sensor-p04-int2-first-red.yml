@@ -1,17 +1,17 @@
-# W01-015: test-only two-file oracle correction, single six-selector CI.
-name: Sensor P04 W01-015 lock query oracle
+# W01-016: three-file test-only full SQL observer, single six-selector CI.
+name: Sensor P04 W01-016 full query visibility
 on:
   push:
-    branches: [codex/w01-015-int2-lock-oracle]
+    branches: [codex/w01-016-int2-query-visibility]
     paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-w01-015-one-run
+  group: sensor-p04-w01-016-one-run
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-015-int2-lock-oracle'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-016-int2-query-visibility'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -29,23 +29,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-015-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-015-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-016-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-016-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          base=0a5b430b53f0f1cde41a0c680e665ddb8c49b331
+          base=f9bf438c178be2439d3cc7a4285a91144dfbf65c
           git merge-base --is-ancestor "$base" HEAD
           git diff --name-only "$base" HEAD > .int2-evidence/changed-files.txt
           while IFS= read -r p; do
             case "$p" in
-              server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_W015_ALLOWLIST" >&2; exit 1 ;;
+              packages/db/src/test-embedded-postgres.ts|server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
+              *) echo "OUTSIDE_W016_ALLOWLIST" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
-          test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
+          test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 3
           test -z "$(git diff --diff-filter=D --name-only "$base" HEAD)"
-          printf 'ASSIGNMENT=W01-015\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
+          printf 'ASSIGNMENT=W01-016\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
           git status --short --untracked-files=all > .int2-evidence/initial-git-status.txt
-          sha256sum server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
+          sha256sum packages/db/src/test-embedded-postgres.ts server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
 
       - name: Node 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -103,16 +103,27 @@ jobs:
           }
 
           # These two controls always execute, even if the first is semantically RED.
+          # Incomplete SQL capture/setup is INVALID_REPRO: do not launch the second control.
+          require_visibility() {
+            local mode="$1"
+            test -f ".int2-evidence/preflight-$mode.json"
+            test ! -f ".int2-evidence/invalid-repro-$mode.json"
+            node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(p.valid===true&&p.configuredLimitBytes===16384?0:1)' ".int2-evidence/preflight-$mode.json"
+          }
           run_named runtime_writer_first 'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock'
+          if ! require_visibility lock_runtime_writer_first; then echo "W016_INVALID_REPRO_WRITER_FIRST" >&2; exit 1; fi
           run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
+          if ! require_visibility lock_runtime_d_first; then echo 'W016_INVALID_REPRO_D_FIRST' >&2; exit 1; fi
           if [ "$(cat .int2-evidence/runtime_writer_first.exit_code)" -ne 0 ] || [ "$(cat .int2-evidence/runtime_d_first.exit_code)" -ne 0 ]; then
             echo 'Normal controls failed; remaining four selectors NOT_RUN' >&2
             exit 1
           fi
 
           run_named retry_writer_first 'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock'
+          if ! require_visibility lock_retry_writer_first; then echo 'W016_INVALID_REPRO_RETRY_WRITER' >&2; exit 1; fi
           test "$(cat .int2-evidence/retry_writer_first.exit_code)" -eq 0
           run_named retry_d_first 'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock'
+          if ! require_visibility lock_retry_d_first; then echo 'W016_INVALID_REPRO_RETRY_D' >&2; exit 1; fi
           test "$(cat .int2-evidence/retry_d_first.exit_code)" -eq 0
           run_named document 'P04 INT2 BCD document: actual admitted run and independent reviewer'
           test "$(cat .int2-evidence/document.exit_code)" -eq 0
@@ -202,6 +213,33 @@ jobs:
           cleanup.http_aba={outerComplete:stages.http_aba.some(x=>x.stage==='outer_cleanup_complete')};
           const cases=Object.fromEntries(Object.entries(names).map(([k,v])=>[k,summary(k,v)]));
           for(const [k,v] of Object.entries(cases))write('vitest-'+k+'-summary.json',v);
+          const visibility=v=>v?{
+            configuredLimitBytes:Number.isSafeInteger(v.configuredLimitBytes)?v.configuredLimitBytes:null,
+            queryByteLength:Number.isSafeInteger(v.queryByteLength)?v.queryByteLength:null,
+            clientTruncated:v.clientTruncated===false?false:null,
+            captureComplete:v.captureComplete===true,
+            hasFromIssues:v.hasFromIssues===true,hasForUpdate:v.hasForUpdate===true,
+            hasForKeyShare:v.hasForKeyShare===true,
+          }:null;
+          const preflights=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
+            const v=json('preflight-'+m+'.json');return [label,v?{
+              schema:'p04-int2-w016-preflight.v1',case:m,
+              configuredLimitBytes:Number.isSafeInteger(v.configuredLimitBytes)?v.configuredLimitBytes:null,
+              generatedQueryBytes:Number.isSafeInteger(v.generatedQueryBytes)?v.generatedQueryBytes:null,
+              safetyMarginBytes:1024,fullQueryKind:kind(v.fullQueryKind),
+              prefix500QueryKind:kind(v.prefix500QueryKind),
+              fullHasFromIssues:v.fullHasFromIssues===true,fullHasForUpdate:v.fullHasForUpdate===true,
+              valid:v.valid===true,
+            }:null];
+          }));
+          const invalidRepros=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
+            const v=json('invalid-repro-'+m+'.json');return [label,v?{
+              assertionId:['w015_d_first_early_issue_wait','w015_writer_first_receipt_lock'].includes(v.assertionId)?v.assertionId:null,
+              expectedQueryKind:kind(v.expectedQueryKind),actualQueryKind:kind(v.actualQueryKind),
+              queryVisibility:visibility(v.queryVisibility),
+              waiterPid:pid(v.waiterPid),blockerPid:pid(v.blockerPid),
+            }:null];
+          }));
           const preassert=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
             const v=json('preassert-'+m+'.json');
             if(!v)return [label,null];
@@ -218,6 +256,7 @@ jobs:
               lockTypes:safeArray(v.lockTypes,['transactionid','tuple','relation','advisory','virtualxid','other']),
               lockModes:safeArray(v.lockModes,['ShareLock','ExclusiveLock','RowShareLock','RowExclusiveLock','AccessShareLock','AccessExclusiveLock','ShareUpdateExclusiveLock','ShareRowExclusiveLock','other']),
               observedBlockingEdge:v.observedBlockingEdge===true,
+              queryVisibility:visibility(v.queryVisibility),
               pending:{d:safeBool(v.pending?.d),writer:safeBool(v.pending?.writer),gate:safeBool(v.pending?.gate)},
               cleanup:{contentionComplete:safeBool(v.cleanup?.contentionComplete),outerComplete:safeBool(v.cleanup?.outerComplete)},
               httpCode:Number.isInteger(v.httpCode)?v.httpCode:null,
@@ -267,13 +306,24 @@ jobs:
             adapterCalls:aba.adapterCalls,actualAdapterCalls:aba.actualAdapterCalls
           }:null;
           const out={
-            schema:'p04-int2-w015-classification.v1',base:'0a5b430b53f0f1cde41a0c680e665ddb8c49b331',
+            schema:'p04-int2-w016-classification.v1',base:'f9bf438c178be2439d3cc7a4285a91144dfbf65c',
             sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,
             setup:{install:code('install'),sdk:code('sdk'),migrations:code('migrations'),typecheck:code('typecheck')},
-            cases,locks,preassert,stages,cleanup,documentary,httpAba,lockOracle,
+            cases,locks,preflights,invalidRepros,preassert,stages,cleanup,documentary,httpAba,lockOracle,
             scopeRemaining:'reconcile/indirect/rollback NOT_RUN; P04 OPEN',
           };
+          const visibilityOracle=Object.entries(preflights).every(([label,v])=>v!==null&&
+            v.valid===true && v.configuredLimitBytes===16384 &&
+            v.generatedQueryBytes+1024<v.configuredLimitBytes &&
+            v.fullQueryKind==='issues.select_for_update' &&
+            v.prefix500QueryKind!=='issues.select_for_update' && invalidRepros[label]===null);
+          out.visibilityOracle=visibilityOracle;
           const preassertOracle=Object.entries(preassert).every(([label,v])=>v!==null&&
+            v.queryVisibility?.captureComplete===true &&
+            v.queryVisibility?.clientTruncated===false &&
+            v.queryVisibility?.hasFromIssues===true &&
+            (label.endsWith('d_first')?v.queryVisibility.hasForKeyShare:v.queryVisibility.hasForUpdate) &&
+
             v.observedBlockingEdge&&v.waiterPid>0&&v.blockerPid>0&&
             v.expectedQueryKind===v.actualQueryKind&&
             v.expectedQueryKind===(label.endsWith('d_first')?'issues.select_for_key_share':'issues.select_for_update'));
@@ -284,7 +334,7 @@ jobs:
           const docPass=documentary?.reviewerHttp===200&&documentary?.after==='done'&&documentary?.acceptedAuditRows===1;
           const abaPass=httpAba?.reviewerHttp===409&&httpAba?.finalStatus==='in_review'&&
             httpAba?.acceptedAuditRows===0&&httpAba?.preconditionsValid===true;
-          out.overall=infra&&passes&&lockOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
+          out.overall=infra&&passes&&lockOracle&&visibilityOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
           write('classification.json',out);
           for(const [label,v] of Object.entries(stages))write('stages-'+label+'.json',v);
           if(read('identity.txt'))fs.copyFileSync(dir+'/identity.txt',safe+'/identity.txt');
@@ -295,7 +345,7 @@ jobs:
           }
           console.log(JSON.stringify({overall:out.overall,sha:out.sha,run:out.run,
             cases:Object.fromEntries(Object.entries(cases).map(([k,v])=>[k,v.classification])),
-            lockOracle,preassertOracle,cleanupPass,docPass,abaPass}));
+            lockOracle,visibilityOracle,preassertOracle,cleanupPass,docPass,abaPass}));
           if(out.overall!=='PASS_SCOPED')process.exitCode=1;
           NODE
 
@@ -311,7 +361,7 @@ jobs:
             if grep -Eiq 'params:|authorization:|bearer[[:space:]]|secret[[:space:]]*[:=]|password[[:space:]]*[:=]|BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY' "$path"; then
               printf 'WITHHELD_SAFETY_CHECK: %s\n' "$(basename "$path")" >> .int2-safe/withheld-evidence.txt
               # The unsafe evidence is never uploaded, regardless of test outcome.
-              mv -- "$path" "$RUNNER_TEMP/w01-015-withheld-$(basename "$path")"
+              mv -- "$path" "$RUNNER_TEMP/w01-016-withheld-$(basename "$path")"
               unsafe=1
             fi
           done < <(find .int2-safe -maxdepth 1 -type f ! -name withheld-evidence.txt -print0)
@@ -319,11 +369,11 @@ jobs:
           find .int2-safe -maxdepth 1 -type f ! -name evidence-sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > .int2-safe/evidence-sha256.txt
           test "$unsafe" -eq 0
 
-      - name: Always upload sanitized W015 evidence (no raw test logs or SQL params)
+      - name: Always upload sanitized W016 evidence (no raw test logs or SQL params)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: w01-015-six-safe-evidence
+          name: w01-016-six-safe-evidence
           path: .int2-safe/
           include-hidden-files: true
           if-no-files-found: warn
