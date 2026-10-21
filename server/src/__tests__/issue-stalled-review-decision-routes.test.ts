@@ -1181,6 +1181,17 @@ describeEmbeddedPostgres("P04 INT2 bound candidate and evidence gates", () => {
               workspaceId: issue!.executionWorkspaceId,
               runWorkspaceId: run?.contextSnapshot?.executionWorkspaceId ?? null,
             });
+            if (mode === "lock_retry_writer_first" || mode === "lock_retry_d_first") {
+              const [eligibleWorkspace] = await db.update(executionWorkspaces)
+                .set({ mode: "isolated_workspace" })
+                .where(eq(executionWorkspaces.id, workspaceId!))
+                .returning({ mode: executionWorkspaces.mode });
+              expect(eligibleWorkspace?.mode).toBe("isolated_workspace");
+              stage("w017_retry_workspace_configured_before_admission", {
+                actualMode: eligibleWorkspace?.mode ?? null,
+                eligible: eligibleWorkspace?.mode === "isolated_workspace",
+              });
+            }
             const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId!));
             const baselineSha = "d".repeat(40);
             await db.update(executionWorkspaces).set({
@@ -3368,6 +3379,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   });
   const gateEntered=w009Deferred(),releaseGate=w009Deferred();
   const logEntered=w009Deferred(),releaseLog=w009Deferred();
+  const privateBindCheckEntered=w009Deferred<number>();
   const foreignOwner=w009Deferred<number>();
   const events:Array<Record<string,unknown>>=[];
   let gateTask:Promise<unknown>|null=null, writerTask:Promise<unknown>|null=null;
@@ -3384,7 +3396,10 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   let issueFkEvidence:Array<Record<string,unknown>>=[];
   let runtimeForStop:typeof import("../services/workspace-runtime.js")|null=null;
   let probe:import("node:net").Server|null=null,probeClosed=true;
-  let spawnCount=0,logCount=0,port=0,foreignReleased=false,mocksInstalled=false;
+  let spawnCount=0,logCount=0,port=0,mocksInstalled=false;
+  let privateBindCheckSeen=false,foreignCollisionReleased=false;
+  let retryEligibility:{actualMode:string|null,eligible:boolean}|null=null;
+  let writerTerminal:{kind:"settled"|"rejected";error:ReturnType<typeof w013SerializeError>|null}|null=null;
   const children:Array<EventEmitter & {pid:number;exitCode:null;signalCode:null;kill:()=>boolean}>=[];
   const beforeHttps=process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
   const fakeRegistry=new Map<string,unknown>();
@@ -3528,6 +3543,24 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   };
   try {
     stage("contention_helper_enter",{mode});
+    if(retry) {
+      const [eligibilityRow]=await observer.select({
+        mode:executionWorkspaces.mode,status:executionWorkspaces.status,
+      }).from(executionWorkspaces).where(eq(executionWorkspaces.id,a.ewId));
+      retryEligibility={
+        actualMode:eligibilityRow?.mode??null,
+        eligible:eligibilityRow?.mode==="isolated_workspace",
+      };
+      persistW013Json("retry-eligibility-"+mode+".json",{
+        schema:"p04-int2-w017-retry-eligibility.v1",mode,
+        actualMode:retryEligibility.actualMode,eligible:retryEligibility.eligible,
+        fixedPortFallbackExpected:retryEligibility.eligible,
+      });
+      stage("w017_retry_eligibility_observed",{
+        actualMode:retryEligibility.actualMode,eligible:retryEligibility.eligible,
+      });
+      expect(retryEligibility.eligible).toBe(true);
+    }
     issueFkEvidence=await w013ReadRuntimeIssueForeignKey(observer);
     stage("runtime_issue_fk_observed",{constraints:issueFkEvidence});
     persistW013Json("fk-"+mode+".json",{
@@ -3581,8 +3614,15 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       readLocalServicePortOwner:async (lookedUpPort:number)=>{
         if(reconcile)return failOs("port lookup in reconcile");
         if(spawnCount===0)return null;
-        if(retry&&spawnCount===1&&lookedUpPort===port&&!foreignReleased){
-          emit("PRIVATE_BIND_CHECK_ENTERED",{port:lookedUpPort});
+        if(retry&&spawnCount===1&&lookedUpPort===port){
+          if(!privateBindCheckSeen) {
+            privateBindCheckSeen=true;
+            emit("PRIVATE_BIND_CHECK_ENTERED",{port:lookedUpPort});
+            stage("w017_private_bind_check_entered",{spawnCount,logCount});
+            privateBindCheckEntered.resolve(lookedUpPort);
+          }
+          // Once the real checker has entered for the original port, preserve
+          // the foreign owner deterministically even after the release signal.
           return await foreignOwner.promise;
         }
         if(retry&&spawnCount===1)return null;
@@ -3775,8 +3815,9 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       });
       writerTask=runner;
       void runner.then(
-        ()=>{writerSettled=true;stage("writer_settled",{kind:"runtime"});},
-        (error)=>{writerSettled=true;stage("writer_rejected",{kind:"runtime",error:w013SerializeError(error)});},
+        ()=>{writerSettled=true;writerTerminal={kind:"settled",error:null};stage("writer_settled",{kind:"runtime"});},
+        (error)=>{writerSettled=true;writerTerminal={kind:"rejected",error:w013SerializeError(error)};
+          stage("writer_rejected",{kind:"runtime",error:writerTerminal.error});},
       );
     };
     const startReconcile=()=>{
@@ -3794,9 +3835,72 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     const startWriter=async()=>{
       if(reconcile)startReconcile();else await startRuntime();
     };
+    const persistRetryFailure=(failureLabel:string)=>{
+      if(!retry)return;
+      const safeError=writerTerminal?.error;
+      const finding={
+        schema:"p04-int2-w017-retry-failure.v1",mode,
+        phase:diagnosticPhase,failureLabel,
+        actualMode:retryEligibility?.actualMode??null,
+        eligible:retryEligibility?.eligible===true,
+        bindCheckEntered:privateBindCheckSeen,
+        collisionReleased:foreignCollisionReleased,
+        writerTerminal:writerTerminal?.kind??null,
+        errorName:safeError&&"cycle" in safeError?null:safeError?.name??null,
+        errorCode:safeError&&"cycle" in safeError?null:safeError?.code??null,
+        spawnCount,logCount,pending:pendingState(),
+      };
+      persistW013Json("retry-failure-"+mode+".json",finding);
+      stage("w017_retry_failure",finding);
+    };
+    const awaitRetryMilestone=async<T>(promise:Promise<T>,failureLabel:string):Promise<T>=>{
+      if(!retry)return await w011Watchdog(promise,failureLabel,()=>watchdogDetails(failureLabel));
+      if(!writerTask)throw new Error("W017_INVALID_RETRY_WRITER_NOT_STARTED");
+      try {
+        const outcome=await w011Watchdog(Promise.race([
+          promise.then(value=>({kind:"milestone" as const,value})),
+          writerTask.then(
+            ()=>({kind:"writer" as const}),
+            ()=>({kind:"writer" as const}),
+          ),
+        ]),failureLabel,()=>watchdogDetails(failureLabel));
+        if(outcome.kind==="writer") {
+          persistRetryFailure(failureLabel);
+          throw new Error("W017_RETRY_WRITER_SETTLED_BEFORE_"+failureLabel);
+        }
+        return outcome.value;
+      } catch(error) {
+        persistRetryFailure(failureLabel);
+        throw error;
+      }
+    };
+    const awaitPrivateBindCheck=async()=>{
+      const enteredPort=await awaitRetryMilestone(privateBindCheckEntered.promise,"private_bind_check_entered");
+      expect(enteredPort).toBe(port);
+      stage("w017_private_bind_check_confirmed",{spawnCount,logCount});
+    };
+    const releaseForeignCollision=()=>{
+      expect(privateBindCheckSeen).toBe(true);
+      if(!foreignCollisionReleased) {
+        foreignCollisionReleased=true;
+        foreignOwner.resolve(99001);
+        persistW013Json("retry-handshake-"+mode+".json",{
+          schema:"p04-int2-w017-retry-handshake.v1",mode,
+          actualMode:retryEligibility?.actualMode??null,
+          eligible:retryEligibility?.eligible===true,
+          bindCheckEntered:privateBindCheckSeen,collisionReleased:true,
+          originalPortCollisionOwner:99001,spawnCount,logCount,
+        });
+        stage("w017_foreign_collision_released",{spawnCount,logCount});
+      }
+    };
     const firstCommitted=async()=>{
       const limit=Date.now()+12_000;
       while(Date.now()<limit) {
+        if(retry&&writerSettled) {
+          persistRetryFailure("first_starting_committed");
+          throw new Error("W017_RETRY_WRITER_SETTLED_BEFORE_FIRST_COMMIT");
+        }
         const rows=await observer.select().from(workspaceRuntimeServices)
           .where(eq(workspaceRuntimeServices.executionWorkspaceId,a.ewId));
         const first=rows.find(r=>r.status==="starting");
@@ -3813,13 +3917,14 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       if(retry) {
         await startWriter();
         await firstCommitted();
+        await awaitPrivateBindCheck();
       }
       await launchGate();
       launchD();
       lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-gate",stage,a.captureLimitBytes));
       stage("writer_launch",{kind:retry?"retry":"runtime"});
       if(!retry)await startWriter();
-      else {foreignReleased=true;foreignOwner.resolve(99001);}
+      else releaseForeignCollision();
       const early = await w009ObserveWait(observer,"w009-writer","w009-D",stage,a.captureLimitBytes);
       lockEvidence.push(early);
       if(!reconcile) {
@@ -3854,13 +3959,17 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         await startWriter();
         if(retry) {
           await firstCommitted();
-          foreignReleased=true;foreignOwner.resolve(99001);
-        }
-        await w011Watchdog(
-          logEntered.promise,
-          "real_parent_locked_log_hook",
-          ()=>watchdogDetails("real_parent_locked_log_hook"),
-        ); // TX locks already acquired
+          await awaitPrivateBindCheck();
+          releaseForeignCollision();
+          await awaitRetryMilestone(logEntered.promise,"retry_parent_locked_log_hook");
+          stage("w017_retry_parent_lock_hook_confirmed",{spawnCount,logCount});
+        } else {
+          await w011Watchdog(
+            logEntered.promise,
+            "real_parent_locked_log_hook",
+            ()=>watchdogDetails("real_parent_locked_log_hook"),
+          );
+        } // TX locks already acquired
       }
       launchD();
       const issueWait = await w009ObserveWait(observer,"w009-D","w009-writer",stage,a.captureLimitBytes);
@@ -3960,7 +4069,7 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     stage("contention_cleanup_begin",{pending:pendingState(),hadPrimaryError:Boolean(primaryError)});
     releaseLog.resolve();
     releaseGate.resolve();
-    foreignReleased=true;foreignOwner.resolve(99001);
+    if(!foreignCollisionReleased)foreignOwner.resolve(99001);
     stage("contention_gates_released",{pending:pendingState()});
 
     if(!dSettled && dRequest?.abort) {

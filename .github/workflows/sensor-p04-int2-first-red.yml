@@ -1,17 +1,17 @@
-# W01-016: three-file test-only full SQL observer, single six-selector CI.
-name: Sensor P04 W01-016 full query visibility
+# W01-017: retry eligibility + deterministic private-bind handshake, single six-selector CI.
+name: Sensor P04 W01-017 retry handshake
 on:
   push:
-    branches: [codex/w01-016-int2-query-visibility]
+    branches: [codex/w01-017-int2-retry-handshake]
     paths: [.github/workflows/sensor-p04-int2-first-red.yml]
 permissions:
   contents: read
 concurrency:
-  group: sensor-p04-w01-016-one-run
+  group: sensor-p04-w01-017-one-run
   cancel-in-progress: false
 jobs:
   isolated-postgres:
-    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-016-int2-query-visibility'
+    if: github.repository == 'ra-fares/paperclip' && github.ref == 'refs/heads/codex/w01-017-int2-retry-handshake'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -29,23 +29,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-016-home"
-          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-016-home" >> "$GITHUB_ENV"
+          mkdir -p .int2-evidence .int2-safe "$RUNNER_TEMP/w01-017-home"
+          echo "PAPERCLIP_HOME=$RUNNER_TEMP/w01-017-home" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          base=f9bf438c178be2439d3cc7a4285a91144dfbf65c
+          base=efbed135ff2a7bc3c0126b6aba31379bbb743d26
           git merge-base --is-ancestor "$base" HEAD
           git diff --name-only "$base" HEAD > .int2-evidence/changed-files.txt
           while IFS= read -r p; do
             case "$p" in
-              packages/db/src/test-embedded-postgres.ts|server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
-              *) echo "OUTSIDE_W016_ALLOWLIST" >&2; exit 1 ;;
+              server/src/__tests__/issue-stalled-review-decision-routes.test.ts|.github/workflows/sensor-p04-int2-first-red.yml) ;;
+              *) echo "OUTSIDE_W017_ALLOWLIST" >&2; exit 1 ;;
             esac
           done < .int2-evidence/changed-files.txt
-          test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 3
+          test "$(wc -l < .int2-evidence/changed-files.txt)" -eq 2
           test -z "$(git diff --diff-filter=D --name-only "$base" HEAD)"
-          printf 'ASSIGNMENT=W01-016\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
+          printf 'ASSIGNMENT=W01-017\nBASE=%s\nSHA=%s\nRUN=%s\nATTEMPT=%s\n' "$base" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > .int2-evidence/identity.txt
           git status --short --untracked-files=all > .int2-evidence/initial-git-status.txt
-          sha256sum packages/db/src/test-embedded-postgres.ts server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
+          sha256sum server/src/__tests__/issue-stalled-review-decision-routes.test.ts .github/workflows/sensor-p04-int2-first-red.yml > .int2-evidence/source-sha256.txt
 
       - name: Node 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -102,29 +102,37 @@ jobs:
             # No unredacted Vitest tails to Actions logs.
           }
 
-          # These two controls always execute, even if the first is semantically RED.
-          # Incomplete SQL capture/setup is INVALID_REPRO: do not launch the second control.
           require_visibility() {
             local mode="$1"
             test -f ".int2-evidence/preflight-$mode.json"
             test ! -f ".int2-evidence/invalid-repro-$mode.json"
             node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.exit(p.valid===true&&p.configuredLimitBytes===16384?0:1)' ".int2-evidence/preflight-$mode.json"
           }
-          run_named runtime_writer_first 'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock'
-          if ! require_visibility lock_runtime_writer_first; then echo "W016_INVALID_REPRO_WRITER_FIRST" >&2; exit 1; fi
-          run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
-          if ! require_visibility lock_runtime_d_first; then echo 'W016_INVALID_REPRO_D_FIRST' >&2; exit 1; fi
-          if [ "$(cat .int2-evidence/runtime_writer_first.exit_code)" -ne 0 ] || [ "$(cat .int2-evidence/runtime_d_first.exit_code)" -ne 0 ]; then
-            echo 'Normal controls failed; remaining four selectors NOT_RUN' >&2
+          require_retry_fixture() {
+            local mode="$1"
+            require_visibility "$mode"
+            test -f ".int2-evidence/retry-eligibility-$mode.json"
+            test -f ".int2-evidence/retry-handshake-$mode.json"
+            node -e 'const fs=require("fs"),e=JSON.parse(fs.readFileSync(process.argv[1],"utf8")),h=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));process.exit(e.actualMode==="isolated_workspace"&&e.eligible===true&&e.fixedPortFallbackExpected===true&&h.actualMode==="isolated_workspace"&&h.eligible===true&&h.bindCheckEntered===true&&h.collisionReleased===true?0:1)' ".int2-evidence/retry-eligibility-$mode.json" ".int2-evidence/retry-handshake-$mode.json"
+          }
+
+          # Retry pair first. Semantic FAIL of the first still runs the second.
+          # Missing eligibility/handshake/visibility is invalid fixture and STOPs immediately.
+          run_named retry_writer_first 'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock'
+          if ! require_retry_fixture lock_retry_writer_first; then echo 'W017_INVALID_RETRY_FIXTURE_WRITER_FIRST' >&2; exit 1; fi
+          run_named retry_d_first 'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock'
+          if ! require_retry_fixture lock_retry_d_first; then echo 'W017_INVALID_RETRY_FIXTURE_D_FIRST' >&2; exit 1; fi
+          if [ "$(cat .int2-evidence/retry_writer_first.exit_code)" -ne 0 ] || [ "$(cat .int2-evidence/retry_d_first.exit_code)" -ne 0 ]; then
+            echo 'Retry controls failed; remaining four selectors NOT_RUN' >&2
             exit 1
           fi
 
-          run_named retry_writer_first 'P04 INT2 W009 lock_retry_writer_first: genuine BCD and PG lock'
-          if ! require_visibility lock_retry_writer_first; then echo 'W016_INVALID_REPRO_RETRY_WRITER' >&2; exit 1; fi
-          test "$(cat .int2-evidence/retry_writer_first.exit_code)" -eq 0
-          run_named retry_d_first 'P04 INT2 W009 lock_retry_d_first: genuine BCD and PG lock'
-          if ! require_visibility lock_retry_d_first; then echo 'W016_INVALID_REPRO_RETRY_D' >&2; exit 1; fi
-          test "$(cat .int2-evidence/retry_d_first.exit_code)" -eq 0
+          run_named runtime_writer_first 'P04 INT2 W009 lock_runtime_writer_first: genuine BCD and PG lock'
+          if ! require_visibility lock_runtime_writer_first; then echo 'W017_INVALID_REPRO_WRITER_FIRST' >&2; exit 1; fi
+          test "$(cat .int2-evidence/runtime_writer_first.exit_code)" -eq 0
+          run_named runtime_d_first 'P04 INT2 W009 lock_runtime_d_first: genuine BCD and PG lock'
+          if ! require_visibility lock_runtime_d_first; then echo 'W017_INVALID_REPRO_D_FIRST' >&2; exit 1; fi
+          test "$(cat .int2-evidence/runtime_d_first.exit_code)" -eq 0
           run_named document 'P04 INT2 BCD document: actual admitted run and independent reviewer'
           test "$(cat .int2-evidence/document.exit_code)" -eq 0
           run_named http_aba 'P04 INT2 HTTP execution workspace branch ABA must reject stale candidate'
@@ -223,7 +231,7 @@ jobs:
           }:null;
           const preflights=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
             const v=json('preflight-'+m+'.json');return [label,v?{
-              schema:'p04-int2-w016-preflight.v1',case:m,
+              schema:'p04-int2-w017-preflight.v1',case:m,
               configuredLimitBytes:Number.isSafeInteger(v.configuredLimitBytes)?v.configuredLimitBytes:null,
               generatedQueryBytes:Number.isSafeInteger(v.generatedQueryBytes)?v.generatedQueryBytes:null,
               safetyMarginBytes:1024,fullQueryKind:kind(v.fullQueryKind),
@@ -238,6 +246,40 @@ jobs:
               expectedQueryKind:kind(v.expectedQueryKind),actualQueryKind:kind(v.actualQueryKind),
               queryVisibility:visibility(v.queryVisibility),
               waiterPid:pid(v.waiterPid),blockerPid:pid(v.blockerPid),
+            }:null];
+          }));
+          const retryEligibility=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
+            const v=json('retry-eligibility-'+m+'.json');return [label,v?{
+              schema:'p04-int2-w017-retry-eligibility.v1',mode:m,
+              actualMode:typeof v.actualMode==='string'?v.actualMode:null,
+              eligible:v.eligible===true,fixedPortFallbackExpected:v.fixedPortFallbackExpected===true,
+            }:null];
+          }));
+          const retryHandshake=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
+            const v=json('retry-handshake-'+m+'.json');return [label,v?{
+              schema:'p04-int2-w017-retry-handshake.v1',mode:m,
+              actualMode:typeof v.actualMode==='string'?v.actualMode:null,
+              eligible:v.eligible===true,bindCheckEntered:v.bindCheckEntered===true,
+              collisionReleased:v.collisionReleased===true,
+              originalPortCollisionOwner:v.originalPortCollisionOwner===99001?99001:null,
+              spawnCount:Number.isSafeInteger(v.spawnCount)?v.spawnCount:null,
+              logCount:Number.isSafeInteger(v.logCount)?v.logCount:null,
+            }:null];
+          }));
+          const retryFailure=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
+            const v=json('retry-failure-'+m+'.json');return [label,v?{
+              schema:'p04-int2-w017-retry-failure.v1',mode:m,
+              phase:typeof v.phase==='string'?v.phase:null,
+              failureLabel:['first_starting_committed','private_bind_check_entered','retry_parent_locked_log_hook'].includes(v.failureLabel)?v.failureLabel:'other',
+              actualMode:typeof v.actualMode==='string'?v.actualMode:null,
+              eligible:v.eligible===true,bindCheckEntered:v.bindCheckEntered===true,
+              collisionReleased:v.collisionReleased===true,
+              writerTerminal:['settled','rejected'].includes(v.writerTerminal)?v.writerTerminal:null,
+              errorName:typeof v.errorName==='string'&&/^[A-Za-z0-9_.-]{1,128}$/.test(v.errorName)?v.errorName:null,
+              errorCode:typeof v.errorCode==='string'&&/^[A-Z0-9]{5}$/.test(v.errorCode)?v.errorCode:null,
+              spawnCount:Number.isSafeInteger(v.spawnCount)?v.spawnCount:null,
+              logCount:Number.isSafeInteger(v.logCount)?v.logCount:null,
+              pending:{d:typeof v.pending?.d==='string'?v.pending.d:null,writer:typeof v.pending?.writer==='string'?v.pending.writer:null,gate:typeof v.pending?.gate==='string'?v.pending.gate:null},
             }:null];
           }));
           const preassert=Object.fromEntries(Object.entries(mode).map(([label,m])=>{
@@ -306,10 +348,10 @@ jobs:
             adapterCalls:aba.adapterCalls,actualAdapterCalls:aba.actualAdapterCalls
           }:null;
           const out={
-            schema:'p04-int2-w016-classification.v1',base:'f9bf438c178be2439d3cc7a4285a91144dfbf65c',
+            schema:'p04-int2-w017-classification.v1',base:'efbed135ff2a7bc3c0126b6aba31379bbb743d26',
             sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,
             setup:{install:code('install'),sdk:code('sdk'),migrations:code('migrations'),typecheck:code('typecheck')},
-            cases,locks,preflights,invalidRepros,preassert,stages,cleanup,documentary,httpAba,lockOracle,
+            cases,locks,preflights,invalidRepros,retryEligibility,retryHandshake,retryFailure,preassert,stages,cleanup,documentary,httpAba,lockOracle,
             scopeRemaining:'reconcile/indirect/rollback NOT_RUN; P04 OPEN',
           };
           const visibilityOracle=Object.entries(preflights).every(([label,v])=>v!==null&&
@@ -318,6 +360,13 @@ jobs:
             v.fullQueryKind==='issues.select_for_update' &&
             v.prefix500QueryKind!=='issues.select_for_update' && invalidRepros[label]===null);
           out.visibilityOracle=visibilityOracle;
+          const retryFixtureOracle=['retry_writer_first','retry_d_first'].every(label=>{
+            const e=retryEligibility[label],h=retryHandshake[label],f=retryFailure[label];
+            return e?.actualMode==='isolated_workspace'&&e.eligible===true&&e.fixedPortFallbackExpected===true&&
+              h?.actualMode==='isolated_workspace'&&h.eligible===true&&h.bindCheckEntered===true&&
+              h.collisionReleased===true&&h.originalPortCollisionOwner===99001&&f===null;
+          });
+          out.retryFixtureOracle=retryFixtureOracle;
           const preassertOracle=Object.entries(preassert).every(([label,v])=>v!==null&&
             v.queryVisibility?.captureComplete===true &&
             v.queryVisibility?.clientTruncated===false &&
@@ -334,7 +383,7 @@ jobs:
           const docPass=documentary?.reviewerHttp===200&&documentary?.after==='done'&&documentary?.acceptedAuditRows===1;
           const abaPass=httpAba?.reviewerHttp===409&&httpAba?.finalStatus==='in_review'&&
             httpAba?.acceptedAuditRows===0&&httpAba?.preconditionsValid===true;
-          out.overall=infra&&passes&&lockOracle&&visibilityOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
+          out.overall=infra&&passes&&lockOracle&&visibilityOracle&&retryFixtureOracle&&preassertOracle&&cleanupPass&&docPass&&abaPass?'PASS_SCOPED':'FAIL_OR_NOT_RUN';
           write('classification.json',out);
           for(const [label,v] of Object.entries(stages))write('stages-'+label+'.json',v);
           if(read('identity.txt'))fs.copyFileSync(dir+'/identity.txt',safe+'/identity.txt');
@@ -345,7 +394,7 @@ jobs:
           }
           console.log(JSON.stringify({overall:out.overall,sha:out.sha,run:out.run,
             cases:Object.fromEntries(Object.entries(cases).map(([k,v])=>[k,v.classification])),
-            lockOracle,visibilityOracle,preassertOracle,cleanupPass,docPass,abaPass}));
+            lockOracle,visibilityOracle,retryFixtureOracle,preassertOracle,cleanupPass,docPass,abaPass}));
           if(out.overall!=='PASS_SCOPED')process.exitCode=1;
           NODE
 
@@ -361,7 +410,7 @@ jobs:
             if grep -Eiq 'params:|authorization:|bearer[[:space:]]|secret[[:space:]]*[:=]|password[[:space:]]*[:=]|BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY' "$path"; then
               printf 'WITHHELD_SAFETY_CHECK: %s\n' "$(basename "$path")" >> .int2-safe/withheld-evidence.txt
               # The unsafe evidence is never uploaded, regardless of test outcome.
-              mv -- "$path" "$RUNNER_TEMP/w01-016-withheld-$(basename "$path")"
+              mv -- "$path" "$RUNNER_TEMP/w01-017-withheld-$(basename "$path")"
               unsafe=1
             fi
           done < <(find .int2-safe -maxdepth 1 -type f ! -name withheld-evidence.txt -print0)
@@ -369,11 +418,11 @@ jobs:
           find .int2-safe -maxdepth 1 -type f ! -name evidence-sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > .int2-safe/evidence-sha256.txt
           test "$unsafe" -eq 0
 
-      - name: Always upload sanitized W016 evidence (no raw test logs or SQL params)
+      - name: Always upload sanitized W017 evidence (no raw test logs or SQL params)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: w01-016-six-safe-evidence
+          name: w01-017-six-safe-evidence
           path: .int2-safe/
           include-hidden-files: true
           if-no-files-found: warn
