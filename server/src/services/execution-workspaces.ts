@@ -3466,7 +3466,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // Canonical issue -> parent PW -> EW -> runtime services lock order.
         // The inspected row is only a lock-set hint. Refuse drift after EW lock;
         // never take a newly discovered parent lock after acquiring EW.
-        if (input.mode === "quarantine_restore" && existingRow.sourceIssueId) {
+        if (existingRow.sourceIssueId) {
           const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
             eq(issues.id, existingRow.sourceIssueId),
             eq(issues.companyId, existingRow.companyId),

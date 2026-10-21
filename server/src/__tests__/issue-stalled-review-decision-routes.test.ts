@@ -3987,11 +3987,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       else releaseForeignCollision();
       const early = await w009ObserveWait(observer,"w009-writer","w009-D",stage,a.captureLimitBytes);
       lockEvidence.push(early);
-      if(!reconcile) {
-        recordW015Preassert("w015_d_first_early_issue_wait","issues.select_for_key_share",early);
-        requireW016Visibility("w015_d_first_early_issue_wait","issues.select_for_key_share",early);
-      }
-      expect(early.waitSqlKind).toBe("issues.select_for_key_share");
+      const expectedDFirstIssueWait: W014PgQueryKind =
+        reconcile ? "issues.select_for_update" : "issues.select_for_key_share";
+      recordW015Preassert("w015_d_first_early_issue_wait",expectedDFirstIssueWait,early);
+      requireW016Visibility("w015_d_first_early_issue_wait",expectedDFirstIssueWait,early);
+      expect(early.waitSqlKind).toBe(expectedDFirstIssueWait);
       expect(early.blockingLockTypes).toContain("transactionid");
       expect(early.blockingLockModes).toContain("ShareLock");
       // Observe this before releasing D's gate. The second runtime TX
@@ -4034,13 +4034,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       launchD();
       const issueWait = await w009ObserveWait(observer,"w009-D","w009-writer",stage,a.captureLimitBytes);
       lockEvidence.push(issueWait);
-      if (!reconcile) {
-        recordW015Preassert("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
-        requireW016Visibility("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
-        expect(issueWait.waitSqlKind).toBe("issues.select_for_update");
-        expect(issueWait.blockingLockTypes).toContain("transactionid");
-        expect(issueWait.blockingLockModes).toContain("ShareLock");
-      }
+      recordW015Preassert("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
+      requireW016Visibility("w015_writer_first_receipt_lock","issues.select_for_update",issueWait);
+      expect(issueWait.waitSqlKind).toBe("issues.select_for_update");
+      expect(issueWait.blockingLockTypes).toContain("transactionid");
+      expect(issueWait.blockingLockModes).toContain("ShareLock");
       diagnosticPhase="writer_barrier_release";
       stage("writer_barrier_release",{reconcile});
       if(reconcile)releaseGate.resolve();else releaseLog.resolve();
@@ -4137,6 +4135,10 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     const issueScopedRuns=runs.filter(r=>r.contextSnapshot?.issueId===a.issueId);
     expect(issueScopedRuns.map(r=>r.id),JSON.stringify(finding)).toEqual([a.runId]);
     expect(a.originalAdapterCalls.filter(id=>id===a.runId),JSON.stringify(finding)).toHaveLength(1);
+    if(reconcile) {
+      expect(writerResult.ok,JSON.stringify(finding)).toBe(true);
+      expect(spawnCount,JSON.stringify(finding)).toBe(0);
+    }
     if(reconcile&&!dFirst){
       expect(dResult.status,JSON.stringify(finding)).toBe(409);
       expect(afterIssue?.status,JSON.stringify(finding)).toBe("in_review");
