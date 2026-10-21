@@ -3333,6 +3333,12 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   let dSettled=false,writerSettled=false,gateSettled=false;
   let primaryError:unknown=null;
   const cleanupErrors:unknown[]=[];
+  let diagnosticPhase="contention_setup";
+  const capturedErrors:Array<Record<string,unknown>>=[];
+  const postReleaseSamples:Array<Record<string,unknown>>=[];
+  let postReleaseSampler:Promise<void>|null=null;
+  let stopPostReleaseSampler=false;
+  let issueFkEvidence:Array<Record<string,unknown>>=[];
   let runtimeForStop:typeof import("../services/workspace-runtime.js")|null=null;
   let probe:import("node:net").Server|null=null,probeClosed=true;
   let spawnCount=0,logCount=0,port=0,foreignReleased=false,mocksInstalled=false;
@@ -3358,6 +3364,52 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     stage("watchdog_timeout",{label,pending,catalog});
     return {label,pending,catalog};
   };
+  const persistW013Json=(name:string,value:unknown)=>{
+    const dir=process.env.INT2_W013_EVIDENCE_DIR;
+    if(!dir)return;
+    try {
+      writeFileSync(dir+"/"+name,JSON.stringify(value,null,2)+"\n",{encoding:"utf8"});
+    } catch(error) {
+      stage("diagnostic_write_failed",{
+        name,
+        error:error instanceof Error?error.message:String(error),
+      });
+    }
+  };
+  const startPostReleaseSampler=()=>{
+    if(postReleaseSampler)return;
+    postReleaseSampler=(async()=>{
+      const deadline=Date.now()+3_000;
+      let sequence=0;
+      while(!stopPostReleaseSampler&&Date.now()<deadline) {
+        if(dSettled&&writerSettled)break;
+        try {
+          const snapshot=await w013ReadFixtureLockSnapshot(
+            observer,
+            ["w009-D","w009-writer","w009-gate","w009-observer"],
+            a.ewId,
+          );
+          const sample={sequence:++sequence,at:new Date().toISOString(),phase:diagnosticPhase,...snapshot};
+          postReleaseSamples.push(sample);
+          stage("post_release_pg_sample",sample);
+        } catch(error) {
+          stage("post_release_pg_sample_error",{
+            error:error instanceof Error?error.message:String(error),
+          });
+          break;
+        }
+        if(dSettled&&writerSettled)break;
+        await new Promise<void>(resolve=>setTimeout(resolve,10));
+      }
+      stage("post_release_pg_sampler_complete",{
+        sampleCount:postReleaseSamples.length,dSettled,writerSettled,
+      });
+      persistW013Json("post-release-"+mode+".json",{
+        schema:"p04-int2-w013-post-release.v1",mode,
+        samples:postReleaseSamples,
+      });
+    })();
+  };
   const fakeGitOutput=(binary:unknown,argv:unknown):string=>{
     if(binary!=="git"||!Array.isArray(argv)||argv[0]!=="-C"||
        typeof argv[1]!=="string"||!(argv[1] as string).startsWith("/tmp/w009-nongit-")) {
@@ -3378,6 +3430,12 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
   };
   try {
     stage("contention_helper_enter",{mode});
+    issueFkEvidence=await w013ReadRuntimeIssueForeignKey(observer);
+    stage("runtime_issue_fk_observed",{constraints:issueFkEvidence});
+    persistW013Json("fk-"+mode+".json",{
+      schema:"p04-int2-w013-runtime-issue-fk.v1",mode,constraints:issueFkEvidence,
+    });
+    expect(issueFkEvidence.length).toBe(1);
     process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS="off";
     vi.resetModules();
     mocksInstalled=true;
@@ -3495,8 +3553,43 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
     api.use("/api",dynamicRoutes(reviewerDb,{} as any,{
       stalledReviewDecisionEnqueueWakeup:vi.fn(async()=>undefined) as any,
     }));
+    // W01-013 test-only tap: observe the raw error, then preserve the genuine
+    // standard error handler and HTTP response semantics by always calling next(err).
+    api.use((err:unknown,req:Request,_res:Response,next:NextFunction)=>{
+      try {
+        const diagnostic={
+          schema:"p04-int2-w013-error-capture.v1",
+          at:new Date().toISOString(),
+          mode,
+          phase:diagnosticPhase,
+          request:{method:req.method,path:req.originalUrl},
+          fixture:{issueId:a.issueId,projectWorkspaceId:a.pwId,executionWorkspaceId:a.ewId,runId:a.runId},
+          lockPids:lockEvidence.map(lock=>({
+            waiterName:lock.waiterName,waiterPid:lock.waiterPid,
+            blockerName:lock.blockerName,blockerPid:lock.blockerPid,
+          })),
+          error:w013SerializeError(err),
+        };
+        capturedErrors.push(diagnostic);
+        stage("error_tap_captured",{
+          mode,phase:diagnosticPhase,
+          captureIndex:capturedErrors.length,
+          lockPids:diagnostic.lockPids,
+          error:diagnostic.error,
+        });
+        persistW013Json("error-"+mode+".json",{
+          schema:"p04-int2-w013-error-captures.v1",mode,captures:capturedErrors,
+        });
+      } catch(captureError) {
+        stage("error_tap_capture_failed",{
+          error:captureError instanceof Error?captureError.message:String(captureError),
+        });
+      }
+      next(err);
+    });
     api.use(errorHandler);
     const launchD=()=>{
+      diagnosticPhase="D_launched";
       stage("D_launch",{reviewerPoolMaxConnections:2});
       const req=request(api).patch("/api/issues/"+a.issueId).send(a.decisionPayload);
       dRequest=req as unknown as {abort?:()=>unknown};
@@ -3651,8 +3744,11 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       }
       launchD();
       lockEvidence.push(await w009ObserveWait(observer,"w009-D","w009-writer",stage));
+      diagnosticPhase="writer_barrier_release";
       stage("writer_barrier_release",{reconcile});
       if(reconcile)releaseGate.resolve();else releaseLog.resolve();
+      diagnosticPhase="writer_barrier_released_waiting_settlement";
+      startPostReleaseSampler();
     }
     if(!dTask||!writerTask)throw new Error("W009_INVALID_LAUNCH: missing real contender");
     stage("settlement_enter",{pending:pendingState()});
@@ -3662,6 +3758,8 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
         code:(e as {details?:{code?:unknown}})?.details?.code??null,
       })),
     ]);
+    diagnosticPhase="contenders_settled";
+    if(postReleaseSampler)await postReleaseSampler;
     stage("settlement_complete",{pending:pendingState(),dHttp:dResult.status,writerOk:writerResult.ok});
     const [afterIssue]=await a.db.select().from(issues).where(eq(issues.id,a.issueId));
     const accepted=await a.db.select().from(activityLog).where(and(
@@ -3677,7 +3775,13 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       runIds:runs.map(r=>r.id),finalStatus:afterIssue?.status,finalVersion:afterIssue?.statusVersion,
       acceptedAuditRows:accepted.length,spawnCount,
       serviceRows:serviceRows.map(r=>({id:r.id,status:r.status,port:r.port})),
-      lockEvidence,events};
+      lockEvidence,events,
+      issueFkEvidence,
+      errorCaptureCount:capturedErrors.length,
+      errorCodes:capturedErrors.map(entry=>
+        ((entry.error as {code?:unknown}|undefined)?.code??null)
+      ),
+      postReleaseSampleCount:postReleaseSamples.length};
     console.info("INT2_W009_LOCK_"+mode+" "+JSON.stringify(finding));
     if(process.env.INT2_W009_EVIDENCE_DIR) {
       writeFileSync(process.env.INT2_W009_EVIDENCE_DIR+"/lock-"+mode+".json",
@@ -3722,6 +3826,9 @@ async function w009ExerciseGenuineContention(a: W009ContentionArgs) {
       events,
     });
   } finally {
+    diagnosticPhase="cleanup";
+    stopPostReleaseSampler=true;
+    if(postReleaseSampler)await postReleaseSampler.catch(()=>undefined);
     stage("contention_cleanup_begin",{pending:pendingState(),hadPrimaryError:Boolean(primaryError)});
     releaseLog.resolve();
     releaseGate.resolve();
